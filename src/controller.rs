@@ -4,11 +4,11 @@ use crate::{
 use crate::parser::command::Command;
 use crate::parser::resp::Resp;
 
-pub struct Worker {
+pub struct Controller {
     dictionary: Dictionary<String>,
 }
 
-impl Worker {
+impl Controller {
     pub fn new(dictionary: Dictionary<String>) -> Self {
         Self {
             dictionary,

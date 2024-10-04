@@ -1,4 +1,40 @@
 use std::fmt::Display;
+use std::io;
+use std::io::Read;
+
+pub enum ParseError {
+    Empty,
+    Malformed(Resp),
+    Io(io::Error),
+}
+
+pub struct RespParser<T> {
+    remaining: Vec<u8>,
+    reader: T,
+}
+
+impl<T> RespParser<T>
+    where T: io::Read {
+    pub fn new(reader: T) -> Self {
+        Self { remaining: Vec::new(), reader }
+    }
+
+    pub fn next(&mut self) -> Result<Resp, ParseError> {
+        self.reader
+            .read_to_end(&mut self.remaining)
+            .map_err(|err| ParseError::Io(err))?;
+        let old_len = self.remaining.len();
+        match parse_resp(&self.remaining) {
+            (Some(resp), r) => {
+                self.remaining = r.to_vec();
+                Ok(resp)
+            }
+            (None, r) if r.len() == old_len => Err(ParseError::Empty),
+            (None, r) if r.is_empty() => Err(ParseError::Empty),
+            (None, r) => Err(ParseError::Malformed(Resp::unknown_command(&String::from_utf8_lossy(r))))
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Resp {
@@ -14,8 +50,8 @@ impl Resp {
     pub fn ok() -> Resp {
         Resp::SimpleString(String::from("OK"))
     }
-    pub fn unkown_command(command: &str) -> Resp {
-        Resp::SimpleError(format!("Unkown command '{command}'"))
+    pub fn unknown_command(command: &str) -> Resp {
+        Resp::SimpleError(format!("Unknown command '{command}'"))
     }
 
     pub fn wrong_number_of_arguments() -> Resp {
@@ -38,7 +74,7 @@ impl Resp {
                     if r.is_empty() {
                         return Ok(resps);
                     }
-                    return Err(Resp::unkown_command(&String::from_utf8_lossy(bytes)));
+                    return Err(Resp::unknown_command(&String::from_utf8_lossy(bytes)));
                 }
             }
         }
@@ -50,37 +86,38 @@ impl Display for Resp {
         write!(f, "{}", String::from(self))
     }
 }
+
 impl From<&Resp> for String {
     fn from(value: &Resp) -> Self {
         let mut string = String::new();
-        let clrf = "\r\n";
+        const CLRF: &str = "\r\n";
         match value {
             Resp::SimpleString(s) => {
                 string += "+";
                 string += s.as_str();
-                string += clrf;
+                string += CLRF;
             }
             Resp::SimpleError(e) => {
                 string += "-";
                 string += e.as_str();
-                string += clrf;
+                string += CLRF;
             }
             Resp::Integer(i) => {
                 string += ":";
                 string += i.to_string().as_str();
-                string += clrf;
+                string += CLRF;
             }
             Resp::BulkString(b) => {
                 string += "$";
                 string += b.len().to_string().as_str();
-                string += clrf;
+                string += CLRF;
                 string += b.as_str();
-                string += clrf;
+                string += CLRF;
             }
             Resp::Array(a) => {
                 string += "*";
                 string += a.len().to_string().as_str();
-                string += clrf;
+                string += CLRF;
                 for i in a {
                     string += String::from(i).as_str();
                 }
@@ -88,7 +125,7 @@ impl From<&Resp> for String {
             Resp::Null => {
                 string += "*";
                 string += "-1";
-                string += clrf;
+                string += CLRF;
             }
         }
         string
@@ -98,34 +135,34 @@ impl From<&Resp> for String {
 impl From<Resp> for Vec<u8> {
     fn from(value: Resp) -> Self {
         let mut bytes = Vec::new();
-        let clrf = b"\r\n";
+        const CRLF: &[u8; 2] = b"\r\n";
         match value {
             Resp::SimpleString(s) => {
                 bytes.push(b'+');
                 bytes.extend_from_slice(s.as_bytes());
-                bytes.extend_from_slice(clrf);
+                bytes.extend_from_slice(CRLF);
             }
             Resp::SimpleError(s) => {
                 bytes.push(b'-');
                 bytes.extend_from_slice(s.as_bytes());
-                bytes.extend_from_slice(clrf);
+                bytes.extend_from_slice(CRLF);
             }
             Resp::Integer(i) => {
                 bytes.push(b':');
                 bytes.extend_from_slice(&i.to_string().as_bytes());
-                bytes.extend_from_slice(clrf);
+                bytes.extend_from_slice(CRLF);
             }
             Resp::BulkString(b) => {
                 bytes.push(b'$');
                 bytes.extend_from_slice(b.len().to_string().as_bytes());
-                bytes.extend_from_slice(clrf);
+                bytes.extend_from_slice(CRLF);
                 bytes.extend_from_slice(b.as_bytes());
-                bytes.extend_from_slice(clrf);
+                bytes.extend_from_slice(CRLF);
             }
             Resp::Array(resps) => {
                 bytes.push(b'*');
                 bytes.extend_from_slice(resps.len().to_string().as_bytes());
-                bytes.extend_from_slice(clrf);
+                bytes.extend_from_slice(CRLF);
                 for resp in resps {
                     let serialized = Vec::from(resp);
                     bytes.extend_from_slice(&serialized);
@@ -151,6 +188,7 @@ fn parse_resp(value: &[u8]) -> (Option<Resp>, &[u8]) {
         _ => (None, value),
     }
 }
+
 fn parse_simple_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
     let pos = value.iter().position(|b| *b == b'\r');
     if pos.is_none() {
@@ -164,6 +202,7 @@ fn parse_simple_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
     let text = String::from_utf8_lossy(data).to_string();
     (Some(Resp::SimpleString(text)), &remaining[2..])
 }
+
 fn parse_simple_error(value: &[u8]) -> (Option<Resp>, &[u8]) {
     match parse_simple_string(value) {
         (Some(Resp::SimpleString(s)), r) => (Some(Resp::SimpleError(s)), r),
@@ -262,6 +301,9 @@ fn parse_null(value: &[u8]) -> (Option<Resp>, &[u8]) {
 }
 
 mod tests {
+    use std::io::Write;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+
     use super::*;
 
     #[test]
@@ -275,6 +317,7 @@ mod tests {
             _ => Err("Should be null"),
         }
     }
+
     #[test]
     fn parse_array() -> Result<(), &'static str> {
         let input = "*1\r\n$4\r\nping\r\n";
@@ -316,6 +359,7 @@ mod tests {
             _ => Err("Should be of type array"),
         }
     }
+
     #[test]
     fn parse_array3() -> Result<(), &'static str> {
         let input = "*2\r\n$3\r\nget\r\n$3\r\nkey\r\n";
@@ -336,9 +380,10 @@ mod tests {
             _ => Err("Should be of type array"),
         }
     }
+
     #[test]
     fn parse_array4() -> Result<(), &'static str> {
-        let input ="*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nsave\r\n*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n";
+        let input = "*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nsave\r\n*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n";
         match parse_resp(input.as_bytes()) {
             (Some(Resp::Array(arr)), r) => {
                 assert_eq!(arr.len(), 3);
@@ -379,6 +424,7 @@ mod tests {
             _ => Err("Should be of type array"),
         }
     }
+
     #[test]
     fn parse_simple_string() -> Result<(), &'static str> {
         let input = "+OK\r\n";
@@ -390,6 +436,7 @@ mod tests {
             _ => Err("Should be of type simple string"),
         }
     }
+
     #[test]
     fn parse_simple_error() -> Result<(), &'static str> {
         let input = "-ERROR message\r\n";
@@ -413,6 +460,7 @@ mod tests {
             _ => Err("Should be of type bulk string"),
         }
     }
+
     #[test]
     fn parse_simple_string2() -> Result<(), &'static str> {
         let input = "+hello world\r\n";
@@ -422,6 +470,64 @@ mod tests {
                 Ok(())
             }
             _ => Err("Should be of type simple string"),
+        }
+    }
+
+    struct MockStream {
+        receiver: Receiver<Vec<u8>>,
+    }
+
+    impl MockStream {
+        fn new() -> (MockStream, Sender<Vec<u8>>) {
+            let (sender, receiver) = channel();
+            (Self { receiver }, sender)
+        }
+    }
+
+    impl Read for MockStream {
+        fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+            let data = self.receiver.try_recv().unwrap_or(Vec::new());
+            buf.write(&data)
+        }
+    }
+
+    #[test]
+    fn parser_parse_null() -> Result<(), &'static str> {
+        let input = "$-1\r\n".as_bytes();
+        let mut parser = RespParser::new(input);
+        match parser.next() {
+            Ok(Resp::Null) => Ok(()),
+            _ => Err("Should be null"),
+        }
+    }
+
+    #[test]
+    fn parser_parse_null_split() -> Result<(), &'static str> {
+        let mut input = vec![b'$', b'-', b'1', b'\r', b'\n'];
+        let (stream, sender) = MockStream::new();
+        let mut parser = RespParser::new(stream);
+        match parser.next() {
+            Err(ParseError::Empty) => {}
+            _ => return Err("Should be null"),
+        }
+
+        sender.send(vec![input[0]]).map_err(|err| "Send error")?;
+        match parser.next() {
+            Err(ParseError::Empty) => {}
+            _ => return Err("Should be empty"),
+        }
+
+        sender.send(vec![input[1]]).map_err(|err| "Send error")?;
+        sender.send(vec![input[2]]).map_err(|err| "Send error")?;
+        match parser.next() {
+            Err(ParseError::Empty) => {}
+            _ => return Err("Should be empty"),
+        }
+        sender.send(vec![input[3]]).map_err(|err| "Send error")?;
+        sender.send(vec![input[4]]).map_err(|err| "Send error")?;
+        match parser.next() {
+            Ok(Resp::Null) => Ok(()),
+            _ => Err("Should be null"),
         }
     }
 }

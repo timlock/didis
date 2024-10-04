@@ -2,16 +2,16 @@ use std::io::Write;
 use didis::dictionary::Dictionary;
 use didis::parser;
 use didis::server::Server;
-use didis::worker::Worker;
+use didis::controller::Controller;
 
 fn main() -> Result<(), std::io::Error> {
     let address = "127.0.0.1:6379";
     let server = Server::new(address)?;
-    let worker = Worker::new(Dictionary::new());
+    let worker = Controller::new(Dictionary::new());
     run(server, worker)
 }
 
-fn run(mut server: Server, mut worker: Worker) -> Result<(), std::io::Error> {
+fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Error> {
     loop {
         server.accept_connections()?;
 
@@ -23,7 +23,7 @@ fn run(mut server: Server, mut worker: Worker) -> Result<(), std::io::Error> {
                         Ok(commands) => {
                             for command in commands {
                                 // println!("Received command {command:?}");
-                                let response = worker.handle_command(command);
+                                let response = controller.handle_command(command);
                                 // println!("Sending response {response}");
                                 let serialized = Vec::from(response);
                                 if let Err(err) = socket.get_mut().write_all(&serialized) {

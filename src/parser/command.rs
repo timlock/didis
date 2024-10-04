@@ -16,7 +16,7 @@ impl TryFrom<Resp> for Command {
     fn try_from(value: Resp) -> Result<Self, Self::Error> {
         match value {
             Resp::Array(arr) => Command::try_from(arr),
-            _ => Err(Resp::unkown_command(value.to_string().as_str())),
+            _ => Err(Resp::unknown_command(value.to_string().as_str())),
         }
     }
 }
@@ -38,7 +38,7 @@ fn create_command(mut arr: Vec<Resp>) -> Result<Command, Resp> {
         "SET" => create_set(arr),
         "CONFIG" => Ok(Command::ConfigGet),
         "CLIENT" => Ok(Command::Client),
-        _ => Err(Resp::unkown_command(&name)),
+        _ => Err(Resp::unknown_command(&name)),
     }
 }
 
