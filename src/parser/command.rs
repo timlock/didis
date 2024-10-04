@@ -1,4 +1,4 @@
-use crate::resp::Resp;
+use crate::parser::resp::Resp;
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Command {

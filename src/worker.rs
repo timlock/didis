@@ -1,8 +1,8 @@
 use crate::{
-    command::Command,
-    dictionary::{self, Dictionary},
-    resp::Resp,
+    dictionary::Dictionary,
 };
+use crate::parser::command::Command;
+use crate::parser::resp::Resp;
 
 pub struct Worker {
     dictionary: Dictionary<String>,
@@ -14,6 +14,7 @@ impl Worker {
             dictionary,
         }
     }
+
     pub fn handle_command(&mut self, command: Command) -> Resp {
         match command {
             Command::Ping => Resp::SimpleString("PONG".to_string()),
