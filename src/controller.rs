@@ -17,7 +17,8 @@ impl Controller {
 
     pub fn handle_command(&mut self, command: Command) -> Resp {
         match command {
-            Command::Ping => Resp::SimpleString("PONG".to_string()),
+            Command::Ping(None) => Resp::SimpleString("PONG".to_string()),
+            Command::Ping(Some(text)) => Resp::BulkString(text),
             Command::Echo(s) => Resp::BulkString(s),
             Command::Get(key) => match self.dictionary.get(&key) {
                 Some(value) => Resp::BulkString(value.to_string()),

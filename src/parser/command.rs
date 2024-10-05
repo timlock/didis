@@ -1,8 +1,78 @@
 use crate::parser::resp::Resp;
+use std::{collections::VecDeque, error, fmt, io};
+
+use super::resp;
+
+pub struct Decoder<T> {
+    resp_decoder: resp::Decoder<T>,
+    buf: VecDeque<resp::Resp>,
+}
+
+impl<T> Decoder<T>
+where
+    T: io::Read,
+{
+    pub fn new(resp_decoder: resp::Decoder<T>) -> Self {
+        Self {
+            resp_decoder,
+            buf: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> Iterator for Decoder<T>
+where
+    T: io::Read,
+{
+    type Item = Result<Command, super::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for n in self.resp_decoder.next() {
+            match n {
+                Ok(resp) => self.buf.push_back(resp),
+                Err(err) => return Some(Err(err)),
+            }
+        }
+
+        let array = match self.buf.pop_front() {
+            Some(array) => array,
+            None => return None,
+        };
+
+        match parse_command(array) {
+            Ok(command) => Some(Ok(command)),
+            Err(err) => Some(Err(super::Error::Parse(Box::new(err)))),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    UnknownCommand(String),
+    InvalidNumberOfArguments(usize),
+    InvalidStart,
+    MissingName,
+    UnexpectedResp,
+}
+
+impl error::Error for Error {}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::UnknownCommand(name) => write!(f, "Command {name} is unknown"),
+            Error::InvalidNumberOfArguments(amount) => {
+                write!(f, "Invalid amount of arguments {amount}")
+            }
+            Error::InvalidStart => write!(f, "Invalid begin for a command"),
+            Error::MissingName => write!(f, "Command lacks name"),
+            Error::UnexpectedResp => write!(f, "Unexpected format"),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Command {
-    Ping,
+    Ping(Option<String>),
     Echo(String),
     Get(String),
     Set { key: String, value: String },
@@ -29,10 +99,130 @@ impl TryFrom<Vec<Resp>> for Command {
     }
 }
 
+fn parse_command(resp: resp::Resp) -> Result<Command, Error> {
+    let mut segment_iter = match resp {
+        Resp::Array(vec) => vec.into_iter(),
+        _ => return Err(Error::InvalidStart),
+    };
+
+    let name = match segment_iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(name) => name,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Err(Error::MissingName),
+    };
+
+ match name.to_uppercase().as_str() {
+        "PING" => parse_ping(segment_iter),
+        "ECHO" => parse_echo(segment_iter),
+        "GET" => parse_get(segment_iter),
+        "SET" => parse_set(segment_iter),
+        "CONFIG" => parse_config_get(segment_iter),
+        "CLIENT" => parse_client(segment_iter),
+        _ => Err(Error::UnknownCommand(name.to_string())),
+    }
+}
+
+fn parse_ping(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+    let text = match iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(text) => text,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Ok(Command::Ping(None)),
+    };
+
+    let (remaining, _) = iter.size_hint();
+    if remaining > 0 {
+        return Err(Error::InvalidNumberOfArguments(remaining));
+    }
+
+    Ok(Command::Ping(Some(text)))
+}
+
+fn parse_echo(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+    let text = match iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(text) => text,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Err(Error::InvalidNumberOfArguments(0)),
+    };
+
+    let (remaining, _) = iter.size_hint();
+    if remaining > 0 {
+        return Err(Error::InvalidNumberOfArguments(remaining));
+    }
+
+    Ok(Command::Echo(text))
+}
+
+fn parse_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+    let key = match iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(text) => text,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Err(Error::InvalidNumberOfArguments(0)),
+    };
+
+    let (remaining, _) = iter.size_hint();
+    if remaining > 0 {
+        return Err(Error::InvalidNumberOfArguments(remaining));
+    }
+
+    Ok(Command::Get(key))
+}
+
+fn parse_set(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+    let key = match iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(text) => text,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Err(Error::InvalidNumberOfArguments(0)),
+    };
+
+    let value = match iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(text) => text,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Err(Error::InvalidNumberOfArguments(0)),
+    };
+
+    let (remaining, _) = iter.size_hint();
+    if remaining > 0 {
+        return Err(Error::InvalidNumberOfArguments(remaining));
+    }
+
+    Ok(Command::Set { key, value })
+}
+
+fn parse_config_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+    let (remaining, _) = iter.size_hint();
+    if remaining > 0 {
+        return Err(Error::InvalidNumberOfArguments(remaining));
+    }
+
+    Ok(Command::ConfigGet)
+}
+
+fn parse_client(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+    let (remaining, _) = iter.size_hint();
+    if remaining > 0 {
+        return Err(Error::InvalidNumberOfArguments(remaining));
+    }
+
+    Ok(Command::Client)
+}
+
+
 fn create_command(mut arr: Vec<Resp>) -> Result<Command, Resp> {
     let name = command_name(&mut arr)?;
     match name.to_uppercase().as_str() {
-        "PING" => Ok(Command::Ping),
+        "PING" => Ok(Command::Ping(None)),
         "ECHO" => create_echo(arr),
         "GET" => create_get(arr),
         "SET" => create_set(arr),
@@ -90,7 +280,7 @@ mod tests {
         let name = String::from("PING");
         let resp = vec![Resp::BulkString(name)];
         let command = Command::try_from(resp).map_err(|err| err.to_string())?;
-        assert_eq!(Command::Ping, command);
+        assert_eq!(Command::Ping(None), command);
         Ok(())
     }
     #[test]

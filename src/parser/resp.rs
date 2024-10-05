@@ -1,37 +1,67 @@
-use std::fmt::Display;
+use core::error;
+use std::fmt::{self, Display};
 use std::io;
 use std::io::Read;
 
-pub enum ParseError {
-    Empty,
-    Malformed(Resp),
-    Io(io::Error),
-}
-
-pub struct RespParser<T> {
-    remaining: Vec<u8>,
+pub struct Decoder<T> {
+    buf: Vec<u8>,
     reader: T,
 }
 
-impl<T> RespParser<T>
-    where T: io::Read {
+impl<T> Decoder<T>
+where
+    T: io::Read,
+{
     pub fn new(reader: T) -> Self {
-        Self { remaining: Vec::new(), reader }
+        Self {
+            buf: Vec::new(),
+            reader,
+        }
     }
+}
 
-    pub fn next(&mut self) -> Result<Resp, ParseError> {
-        self.reader
-            .read_to_end(&mut self.remaining)
-            .map_err(|err| ParseError::Io(err))?;
-        let old_len = self.remaining.len();
-        match parse_resp(&self.remaining) {
+impl<T> Iterator for Decoder<T>
+where
+    T: io::Read,
+{
+    type Item = Result<Resp, super::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Err(err) = self.reader.read_to_end(&mut self.buf) {
+            return Some(Err(super::Error::Io(err)));
+        }
+
+        let old_len = self.buf.len();
+        match parse_resp(&self.buf) {
             (Some(resp), r) => {
-                self.remaining = r.to_vec();
-                Ok(resp)
+                self.buf = r.to_vec();
+                Some(Ok(resp))
             }
-            (None, r) if r.len() == old_len => Err(ParseError::Empty),
-            (None, r) if r.is_empty() => Err(ParseError::Empty),
-            (None, r) => Err(ParseError::Malformed(Resp::unknown_command(&String::from_utf8_lossy(r))))
+            (None, r) if r.len() == old_len => None,
+            (None, []) => None,
+            (None, r) => Some(Err(super::Error::Parse(Box::new(Error::Misc(
+                String::from_utf8_lossy(r).into_owned(),
+            ))))),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    LengthMismatch(usize),
+    Parse(Box<dyn error::Error>),
+    Truncated,
+    Misc(String),
+}
+
+impl error::Error for Error {}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::LengthMismatch(len) => write!(f, "Length does not match: {len}"),
+            Error::Parse(err) => write!(f, "Parse error: {err}"),
+            Error::Truncated => write!(f, "Resp is truncated"),
+            Error::Misc(desc) => write!(f, "Unknown error {desc}"),
         }
     }
 }
@@ -178,24 +208,23 @@ fn parse_resp(value: &[u8]) -> (Option<Resp>, &[u8]) {
     if value.is_empty() {
         return (None, value);
     }
-    let body = &value[1..];
     match value[0] {
-        b'+' => parse_simple_string(body),
-        b'-' => parse_simple_error(body),
-        b':' => parse_integer(body),
-        b'$' => parse_bulk_string(body),
-        b'*' => parse_array(body),
+        b'+' => parse_simple_string(value),
+        b'-' => parse_simple_error(value),
+        b':' => parse_integer(value),
+        b'$' => parse_bulk_string(value),
+        b'*' => parse_array(value),
         _ => (None, value),
     }
 }
 
 fn parse_simple_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    let pos = value.iter().position(|b| *b == b'\r');
+    let pos = value[1..].iter().position(|b| *b == b'\r');
     if pos.is_none() {
         return (None, value);
     }
     let pos = pos.unwrap();
-    let (data, remaining) = value.split_at(pos);
+    let (data, remaining) = value[1..].split_at(pos);
     if remaining.len() < 2 || b"\r\n" != &remaining[..2] {
         return (None, value);
     }
@@ -269,12 +298,12 @@ fn parse_bulk_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
 }
 
 fn parse_length(value: &[u8]) -> (Option<i64>, &[u8]) {
-    let pos = value.iter().position(|b| *b == b'\r');
+    let pos = value[1..].iter().position(|b| *b == b'\r');
     if pos.is_none() {
         return (None, value);
     }
     let pos = pos.unwrap();
-    let (binary, remaining) = value.split_at(pos);
+    let (binary, remaining) = value[1..].split_at(pos);
     let binary_str = match std::str::from_utf8(binary) {
         Ok(s) => s,
         Err(_) => return (None, value),
@@ -283,19 +312,19 @@ fn parse_length(value: &[u8]) -> (Option<i64>, &[u8]) {
         Ok(l) => l,
         Err(_) => return (None, value),
     };
-    if value.len() <= pos + 1 || value[pos + 1] != b'\n' {
+    if value[1..].len() <= pos + 1 || value[1..][pos + 1] != b'\n' {
         return (None, value);
     }
     (Some(length), &remaining[2..])
 }
 
 fn parse_null(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    if value.len() < 4 {
+    if value.len() < 5 {
         return (None, value);
     }
-    let null = &value[..4];
+    let null = &value[1..5];
     match null {
-        b"-1\r\n" => (Some(Resp::Null), &value[4..]),
+        b"-1\r\n" => (Some(Resp::Null), &value[5..]),
         _ => (None, &value[4..]),
     }
 }
@@ -486,47 +515,40 @@ mod tests {
 
     impl Read for MockStream {
         fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-            let data = self.receiver.try_recv().unwrap_or(Vec::new());
+            let data = self.receiver.try_recv().unwrap_or_default();
             buf.write(&data)
         }
     }
 
     #[test]
-    fn parser_parse_null() -> Result<(), &'static str> {
+    fn decoder_parse_null() -> Result<(), &'static str> {
         let input = "$-1\r\n".as_bytes();
-        let mut parser = RespParser::new(input);
+        let mut parser = Decoder::new(input);
         match parser.next() {
-            Ok(Resp::Null) => Ok(()),
+            Some(Ok(Resp::Null)) => Ok(()),
             _ => Err("Should be null"),
         }
     }
 
     #[test]
-    fn parser_parse_null_split() -> Result<(), &'static str> {
-        let mut input = vec![b'$', b'-', b'1', b'\r', b'\n'];
+    fn decoder_parse_null_split() -> Result<(), &'static str> {
+        let input = [b'$', b'-', b'1', b'\r', b'\n'];
         let (stream, sender) = MockStream::new();
-        let mut parser = RespParser::new(stream);
-        match parser.next() {
-            Err(ParseError::Empty) => {}
-            _ => return Err("Should be null"),
-        }
+        let mut parser = Decoder::new(stream);
 
-        sender.send(vec![input[0]]).map_err(|err| "Send error")?;
-        match parser.next() {
-            Err(ParseError::Empty) => {}
-            _ => return Err("Should be empty"),
-        }
+        assert!(parser.next().is_none());
+        sender.send(vec![input[0]]).map_err(|_| "Send error")?;
+        assert!(parser.next().is_none());
+        sender.send(vec![input[1]]).map_err(|_| "Send error")?;
+        assert!(parser.next().is_none());
+        sender.send(vec![input[2]]).map_err(|_| "Send error")?;
+        assert!(parser.next().is_none());
+        sender.send(vec![input[3]]).map_err(|_| "Send error")?;
+        assert!(parser.next().is_none());
 
-        sender.send(vec![input[1]]).map_err(|err| "Send error")?;
-        sender.send(vec![input[2]]).map_err(|err| "Send error")?;
+        sender.send(vec![input[4]]).map_err(|_| "Send error")?;
         match parser.next() {
-            Err(ParseError::Empty) => {}
-            _ => return Err("Should be empty"),
-        }
-        sender.send(vec![input[3]]).map_err(|err| "Send error")?;
-        sender.send(vec![input[4]]).map_err(|err| "Send error")?;
-        match parser.next() {
-            Ok(Resp::Null) => Ok(()),
+            Some(Ok(Resp::Null)) => Ok(()),
             _ => Err("Should be null"),
         }
     }
