@@ -5,16 +5,16 @@ use std::{
 
     ,
 };
-use std::io::BufRead;
 use crate::server::listener::TcpListenerNonBlocking;
 use crate::server::socket::SocketNonBlocking;
+use crate::parser::{command, resp};
 
 mod listener;
 mod socket;
 
 pub struct Server {
     listener: TcpListenerNonBlocking,
-    pub connections: HashMap<SocketAddr, BufReader<SocketNonBlocking>>,
+    pub connections: HashMap<SocketAddr, command::Decoder<SocketNonBlocking>>,
 }
 
 impl Server {
@@ -32,7 +32,9 @@ impl Server {
                 Ok(None) => return Ok(()),
                 Ok(Some((stream, address))) => {
                     println!("new connection: {address}");
-                    self.connections.insert(address, BufReader::new(stream));
+                    let resp_decoder = resp::Decoder::new(stream);
+                    let command_decoder = command::Decoder::new(resp_decoder);
+                    self.connections.insert(address, command_decoder);
                 }
                 Err(err) => return Err(err),
             }
@@ -42,15 +44,4 @@ impl Server {
     pub fn disconnect(&mut self, client_address: SocketAddr) {
         self.connections.remove(&client_address);
     }
-}
-
-fn try_accept(listener: &TcpListener) -> Option<(TcpStream, SocketAddr)> {
-    listener
-        .accept()
-        .map_err(|err| {
-            if err.kind() != io::ErrorKind::WouldBlock {
-                println!("{err}")
-            }
-        })
-        .ok()
 }

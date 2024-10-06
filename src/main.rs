@@ -1,8 +1,8 @@
-use std::io::Write;
+use didis::controller::Controller;
 use didis::dictionary::Dictionary;
 use didis::parser;
 use didis::server::Server;
-use didis::controller::Controller;
+use std::io::{self, Write};
 
 fn main() -> Result<(), std::io::Error> {
     let address = "127.0.0.1:6379";
@@ -17,38 +17,36 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
 
         let mut disconnected = Vec::new();
         for (client_address, socket) in server.connections.iter_mut() {
-            match parser::try_read(socket) {
-                Ok(data) => {
-                    match parser::parse(&data) {
-                        Ok(commands) => {
-                            for command in commands {
-                                // println!("Received command {command:?}");
-                                let response = controller.handle_command(command);
-                                // println!("Sending response {response}");
-                                let serialized = Vec::from(response);
-                                if let Err(err) = socket.get_mut().write_all(&serialized) {
-                                    disconnected.push(client_address.clone());
-                                    println!("{err}");
-                                }
-                            }
-                        }
-                        Err(err_message) => {
-                            let serialized = Vec::from(err_message);
-                            if let Err(err) = socket.get_mut().write_all(&serialized) {
-                                disconnected.push(client_address.clone());
-                                println!("{err}");
-                            }
+            loop {
+                match socket.next() {
+                    Some(Ok(command)) => {
+                        let response = controller.handle_command(command);
+                        // println!("Sending response {response}");
+                        let serialized = Vec::from(response);
+                        if let Err(err) = socket.get_mut().write_all(&serialized) {
+                            disconnected.push(client_address.clone());
+                            println!("{err}");
+                            break;
                         }
                     }
-                }
-                Err(err) => {
-                    disconnected.push(client_address.clone());
-                    println!("{err}");
+                    Some(Err(parser::Error::Io(err))) => {
+                        disconnected.push(client_address.clone());
+                        println!("Closed");
+                        break;
+                    }
+                    Some(Err(err)) => {
+                        if let Err(err) = socket.get_mut().write_all(err.to_string().as_bytes()) {
+                            disconnected.push(client_address.clone());
+                            println!("{err}");
+                            break;
+                        }
+                    }
+                    None => break,
                 }
             }
         }
 
-        for address in disconnected{
+        for address in disconnected {
             server.connections.remove(&address);
         }
     }

@@ -5,18 +5,22 @@ use std::io::Read;
 
 pub struct Decoder<T> {
     buf: Vec<u8>,
-    reader: T,
+    reader: io::BufReader<T>,
 }
 
 impl<T> Decoder<T>
 where
-    T: io::Read,
+    T: io::Read + io::Write,
 {
     pub fn new(reader: T) -> Self {
         Self {
             buf: Vec::new(),
-            reader,
+            reader: io::BufReader::new(reader),
         }
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.reader.get_mut()
     }
 }
 
@@ -27,7 +31,7 @@ where
     type Item = Result<Resp, super::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Err(err) = self.reader.read_to_end(&mut self.buf) {
+        if let Err(err) = try_read(&mut self.reader, &mut self.buf) {
             return Some(Err(super::Error::Io(err)));
         }
 
@@ -44,6 +48,23 @@ where
             ))))),
         }
     }
+}
+
+pub fn try_read(reader: &mut impl io::Read, buffer: &mut Vec<u8>) -> io::Result<()> {
+    const CHUNK_SIZE: usize = 1024 * 4;
+    let mut buf = [0; CHUNK_SIZE];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(size) => {
+                buffer.extend_from_slice(&buf[..size]);
+                if size < CHUNK_SIZE {
+                    break;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -240,14 +261,14 @@ fn parse_simple_error(value: &[u8]) -> (Option<Resp>, &[u8]) {
 }
 
 fn parse_integer(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    match parse_length(value) {
+    match parse_length(&value[1..]) {
         (Some(i), r) => (Some(Resp::Integer(i)), r),
         _ => (None, value),
     }
 }
 
 fn parse_array(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    let (length, remaining) = parse_length(value);
+    let (length, remaining) = parse_length(&value[1..]);
     if length.is_none() {
         return (None, value);
     }
@@ -278,7 +299,7 @@ fn parse_array(value: &[u8]) -> (Option<Resp>, &[u8]) {
 }
 
 fn parse_bulk_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    let (length, remaining) = parse_length(value);
+    let (length, remaining) = parse_length(&value[1..]);
     if length.is_none() {
         return (None, value);
     }
@@ -298,12 +319,12 @@ fn parse_bulk_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
 }
 
 fn parse_length(value: &[u8]) -> (Option<i64>, &[u8]) {
-    let pos = value[1..].iter().position(|b| *b == b'\r');
+    let pos = value.iter().position(|b| *b == b'\r');
     if pos.is_none() {
         return (None, value);
     }
     let pos = pos.unwrap();
-    let (binary, remaining) = value[1..].split_at(pos);
+    let (binary, remaining) = value.split_at(pos);
     let binary_str = match std::str::from_utf8(binary) {
         Ok(s) => s,
         Err(_) => return (None, value),
@@ -312,7 +333,7 @@ fn parse_length(value: &[u8]) -> (Option<i64>, &[u8]) {
         Ok(l) => l,
         Err(_) => return (None, value),
     };
-    if value[1..].len() <= pos + 1 || value[1..][pos + 1] != b'\n' {
+    if value.len() <= pos + 1 || value[pos + 1] != b'\n' {
         return (None, value);
     }
     (Some(length), &remaining[2..])

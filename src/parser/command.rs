@@ -5,18 +5,18 @@ use super::resp;
 
 pub struct Decoder<T> {
     resp_decoder: resp::Decoder<T>,
-    buf: VecDeque<resp::Resp>,
 }
 
 impl<T> Decoder<T>
 where
-    T: io::Read,
+    T: io::Read + io::Write,
 {
     pub fn new(resp_decoder: resp::Decoder<T>) -> Self {
-        Self {
-            resp_decoder,
-            buf: VecDeque::new(),
-        }
+        Self { resp_decoder }
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.resp_decoder.get_mut()
     }
 }
 
@@ -27,19 +27,13 @@ where
     type Item = Result<Command, super::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for n in self.resp_decoder.next() {
-            match n {
-                Ok(resp) => self.buf.push_back(resp),
-                Err(err) => return Some(Err(err)),
-            }
-        }
-
-        let array = match self.buf.pop_front() {
-            Some(array) => array,
+        let resp = match self.resp_decoder.next() {
+            Some(Ok(resp)) => resp,
+            Some(Err(err)) => return Some(Err(err)),
             None => return None,
         };
 
-        match parse_command(array) {
+        match parse_command(resp) {
             Ok(command) => Some(Ok(command)),
             Err(err) => Some(Err(super::Error::Parse(Box::new(err)))),
         }
@@ -113,7 +107,7 @@ fn parse_command(resp: resp::Resp) -> Result<Command, Error> {
         None => return Err(Error::MissingName),
     };
 
- match name.to_uppercase().as_str() {
+    match name.to_uppercase().as_str() {
         "PING" => parse_ping(segment_iter),
         "ECHO" => parse_echo(segment_iter),
         "GET" => parse_get(segment_iter),
@@ -217,7 +211,6 @@ fn parse_client(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, E
 
     Ok(Command::Client)
 }
-
 
 fn create_command(mut arr: Vec<Resp>) -> Result<Command, Resp> {
     let name = command_name(&mut arr)?;
