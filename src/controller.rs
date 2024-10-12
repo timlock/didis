@@ -1,6 +1,4 @@
-use crate::{
-    dictionary::Dictionary,
-};
+use crate::dictionary::Dictionary;
 use crate::parser::command::Command;
 use crate::parser::resp::Resp;
 

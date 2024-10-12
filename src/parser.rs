@@ -1,21 +1,9 @@
 use core::error;
 use std::{fmt, io};
 
-use crate::parser::command::Command;
-use crate::parser::resp::Resp;
 
 pub mod command;
 pub mod resp;
-
-pub fn parse(data: &[u8]) -> Result<Vec<Command>, Resp> {
-    let resps = Resp::parse(data)?;
-    let mut commands = Vec::new();
-    for resp in resps {
-        let command = Command::try_from(resp)?;
-        commands.push(command);
-    }
-    Ok(commands)
-}
 
 #[derive(Debug)]
 pub enum Error {

@@ -10,17 +10,13 @@ pub struct Decoder<T> {
 
 impl<T> Decoder<T>
 where
-    T: io::Read + io::Write,
+    T: io::Read ,
 {
     pub fn new(reader: T) -> Self {
         Self {
             buf: Vec::new(),
             reader: io::BufReader::new(reader),
         }
-    }
-
-    pub fn get_mut(&mut self) -> &mut T {
-        self.reader.get_mut()
     }
 }
 
@@ -111,25 +107,6 @@ impl Resp {
     pub fn invalid_arguments() -> Resp {
         Resp::SimpleError(String::from("ERR wrong number of arguments for command"))
     }
-
-    pub fn parse(bytes: &[u8]) -> Result<Vec<Resp>, Resp> {
-        let mut remaining = bytes;
-        let mut resps = Vec::new();
-        loop {
-            match parse_resp(remaining) {
-                (Some(resp), r) => {
-                    remaining = r;
-                    resps.push(resp);
-                }
-                (None, r) => {
-                    if r.is_empty() {
-                        return Ok(resps);
-                    }
-                    return Err(Resp::unknown_command(&String::from_utf8_lossy(bytes)));
-                }
-            }
-        }
-    }
 }
 
 impl Display for Resp {
@@ -200,7 +177,7 @@ impl From<Resp> for Vec<u8> {
             }
             Resp::Integer(i) => {
                 bytes.push(b':');
-                bytes.extend_from_slice(&i.to_string().as_bytes());
+                bytes.extend_from_slice(i.to_string().as_bytes());
                 bytes.extend_from_slice(CRLF);
             }
             Resp::BulkString(b) => {
@@ -540,6 +517,7 @@ mod tests {
             buf.write(&data)
         }
     }
+
 
     #[test]
     fn decoder_parse_null() -> Result<(), &'static str> {

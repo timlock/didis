@@ -1,5 +1,5 @@
 use crate::parser::resp::Resp;
-use std::{collections::VecDeque, error, fmt, io};
+use std::{error, fmt, io};
 
 use super::resp;
 
@@ -9,14 +9,10 @@ pub struct Decoder<T> {
 
 impl<T> Decoder<T>
 where
-    T: io::Read + io::Write,
+    T: io::Read,
 {
     pub fn new(resp_decoder: resp::Decoder<T>) -> Self {
         Self { resp_decoder }
-    }
-
-    pub fn get_mut(&mut self) -> &mut T {
-        self.resp_decoder.get_mut()
     }
 }
 
