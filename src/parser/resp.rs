@@ -88,7 +88,7 @@ pub enum Resp {
     SimpleString(String),
     SimpleError(String),
     Integer(i64),
-    BulkString(String),
+    BulkString(Vec<u8>),
     Array(Vec<Resp>),
     Null,
 }
@@ -96,16 +96,6 @@ pub enum Resp {
 impl Resp {
     pub fn ok() -> Resp {
         Resp::SimpleString(String::from("OK"))
-    }
-    pub fn unknown_command(command: &str) -> Resp {
-        Resp::SimpleError(format!("Unknown command '{command}'"))
-    }
-
-    pub fn wrong_number_of_arguments() -> Resp {
-        Resp::SimpleError(String::from("ERR wrong number of arguments for command"))
-    }
-    pub fn invalid_arguments() -> Resp {
-        Resp::SimpleError(String::from("ERR wrong number of arguments for command"))
     }
 }
 
@@ -139,7 +129,7 @@ impl From<&Resp> for String {
                 string += "$";
                 string += b.len().to_string().as_str();
                 string += CLRF;
-                string += b.as_str();
+                string += String::from_utf8_lossy(b).into_owned().as_str();
                 string += CLRF;
             }
             Resp::Array(a) => {
@@ -184,7 +174,7 @@ impl From<Resp> for Vec<u8> {
                 bytes.push(b'$');
                 bytes.extend_from_slice(b.len().to_string().as_bytes());
                 bytes.extend_from_slice(CRLF);
-                bytes.extend_from_slice(b.as_bytes());
+                bytes.extend_from_slice(b.as_slice());
                 bytes.extend_from_slice(CRLF);
             }
             Resp::Array(resps) => {
@@ -288,7 +278,7 @@ fn parse_bulk_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
     }
     let length = length.unwrap() as usize;
     let (data, remaining) = remaining.split_at(length);
-    let text = String::from_utf8_lossy(data).to_string();
+    let text = data.to_vec();
     if text.len() != length || remaining.len() < 2 || b"\r\n" != &remaining[..2] {
         return (None, value);
     }
@@ -353,7 +343,7 @@ mod tests {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 1);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "ping"),
+                    Resp::BulkString(s) => assert_eq!(s, b"ping"),
                     _ => return Err("Array should contain a simple string"),
                 }
                 Ok(())
@@ -374,11 +364,11 @@ mod tests {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "echo"),
+                    Resp::BulkString(s) => assert_eq!(s, b"echo"),
                     _ => return Err("Array should contain a simple string"),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "hello world"),
+                    Resp::BulkString(s) => assert_eq!(s, b"hello world"),
                     _ => return Err("Array should contain a simple string"),
                 }
                 Ok(())
@@ -395,11 +385,11 @@ mod tests {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "get"),
+                    Resp::BulkString(s) => assert_eq!(s, b"get"),
                     _ => return Err("Array should contain a bulk string"),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "key"),
+                    Resp::BulkString(s) => assert_eq!(s, b"key"),
                     _ => return Err("Array should contain a bulk string"),
                 }
                 Ok(())
@@ -415,15 +405,15 @@ mod tests {
             (Some(Resp::Array(arr)), r) => {
                 assert_eq!(arr.len(), 3);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                    Resp::BulkString(s) => assert_eq!(s, b"CONFIG"),
                     _ => return Err("Expected bulk string"),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "GET"),
+                    Resp::BulkString(s) => assert_eq!(s, b"GET"),
                     _ => return Err("Expected bulk string"),
                 }
                 match &arr[2] {
-                    Resp::BulkString(s) => assert_eq!(s, "save"),
+                    Resp::BulkString(s) => assert_eq!(s, b"save"),
                     _ => return Err("Expected bulk string"),
                 }
                 assert!(!r.is_empty());
@@ -432,15 +422,15 @@ mod tests {
                         assert_eq!(arr.len(), 3);
                         assert!(r.is_empty());
                         match &arr[0] {
-                            Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                            Resp::BulkString(s) => assert_eq!(s, b"CONFIG"),
                             _ => return Err("Expected bulk string"),
                         }
                         match &arr[1] {
-                            Resp::BulkString(s) => assert_eq!(s, "GET"),
+                            Resp::BulkString(s) => assert_eq!(s, b"GET"),
                             _ => return Err("Expected bulk string"),
                         }
                         match &arr[2] {
-                            Resp::BulkString(s) => assert_eq!(s, "appendonly"),
+                            Resp::BulkString(s) => assert_eq!(s, b"appendonly"),
                             _ => return Err("Expected bulk string"),
                         }
                     }
@@ -481,7 +471,7 @@ mod tests {
         let input = "$0\r\n\r\n";
         match parse_resp(input.as_bytes()) {
             (Some(Resp::BulkString(s)), _) => {
-                assert_eq!(s, "");
+                assert_eq!(s, b"");
                 Ok(())
             }
             _ => Err("Should be of type bulk string"),

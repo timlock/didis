@@ -62,32 +62,14 @@ impl fmt::Display for Error {
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Command {
-    Ping(Option<String>),
-    Echo(String),
-    Get(String),
-    Set { key: String, value: String },
+    Ping(Option<Vec<u8>>),
+    Echo(Vec<u8>),
+    Get(Vec<u8>),
+    Set { key: Vec<u8>, value: Vec<u8> },
     ConfigGet,
     Client,
 }
 
-impl TryFrom<Resp> for Command {
-    type Error = Resp;
-
-    fn try_from(value: Resp) -> Result<Self, Self::Error> {
-        match value {
-            Resp::Array(arr) => Command::try_from(arr),
-            _ => Err(Resp::unknown_command(value.to_string().as_str())),
-        }
-    }
-}
-
-impl TryFrom<Vec<Resp>> for Command {
-    type Error = Resp;
-
-    fn try_from(value: Vec<Resp>) -> Result<Self, Self::Error> {
-        create_command(value)
-    }
-}
 
 fn parse_command(resp: resp::Resp) -> Result<Command, Error> {
     let mut segment_iter = match resp {
@@ -103,14 +85,14 @@ fn parse_command(resp: resp::Resp) -> Result<Command, Error> {
         None => return Err(Error::MissingName),
     };
 
-    match name.to_uppercase().as_str() {
-        "PING" => parse_ping(segment_iter),
-        "ECHO" => parse_echo(segment_iter),
-        "GET" => parse_get(segment_iter),
-        "SET" => parse_set(segment_iter),
-        "CONFIG" => parse_config_get(segment_iter),
-        "CLIENT" => parse_client(segment_iter),
-        _ => Err(Error::UnknownCommand(name.to_string())),
+    match name.to_ascii_uppercase().as_slice() {
+        b"PING" => parse_ping(segment_iter),
+        b"ECHO" => parse_echo(segment_iter),
+        b"GET" => parse_get(segment_iter),
+        b"SET" => parse_set(segment_iter),
+        b"CONFIG" => parse_config_get(segment_iter),
+        b"CLIENT" => parse_client(segment_iter),
+        _ => Err(Error::UnknownCommand(String::from_utf8_lossy(&name).into_owned())),
     }
 }
 
@@ -207,77 +189,23 @@ fn parse_client(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, E
 
     Ok(Command::Client)
 }
-
-fn create_command(mut arr: Vec<Resp>) -> Result<Command, Resp> {
-    let name = command_name(&mut arr)?;
-    match name.to_uppercase().as_str() {
-        "PING" => Ok(Command::Ping(None)),
-        "ECHO" => create_echo(arr),
-        "GET" => create_get(arr),
-        "SET" => create_set(arr),
-        "CONFIG" => Ok(Command::ConfigGet),
-        "CLIENT" => Ok(Command::Client),
-        _ => Err(Resp::unknown_command(&name)),
-    }
-}
-
-fn create_set(mut arr: Vec<Resp>) -> Result<Command, Resp> {
-    if arr.len() != 2 {
-        return Err(Resp::wrong_number_of_arguments());
-    }
-    let key = match arr.remove(0) {
-        Resp::BulkString(s) => s,
-        _ => return Err(Resp::invalid_arguments()),
-    };
-    let value = match arr.remove(0) {
-        Resp::BulkString(s) => s,
-        _ => return Err(Resp::invalid_arguments()),
-    };
-    Ok(Command::Set { key, value })
-}
-fn create_get(mut arr: Vec<Resp>) -> Result<Command, Resp> {
-    if arr.len() != 1 {
-        return Err(Resp::wrong_number_of_arguments());
-    }
-    match arr.remove(0) {
-        Resp::BulkString(s) => Ok(Command::Get(s)),
-        _ => Err(Resp::wrong_number_of_arguments()),
-    }
-}
-
-fn command_name(arr: &mut Vec<Resp>) -> Result<String, Resp> {
-    match arr.remove(0) {
-        Resp::BulkString(s) => Ok(s),
-        _ => return Err(Resp::wrong_number_of_arguments()),
-    }
-}
-
-fn create_echo(mut arr: Vec<Resp>) -> Result<Command, Resp> {
-    if arr.len() != 1 {
-        return Err(Resp::wrong_number_of_arguments());
-    }
-    match arr.remove(0) {
-        Resp::BulkString(s) => Ok(Command::Echo(s)),
-        _ => Err(Resp::wrong_number_of_arguments()),
-    }
-}
 mod tests {
     use super::*;
 
     #[test]
     fn parse_ping() -> Result<(), String> {
-        let name = String::from("PING");
-        let resp = vec![Resp::BulkString(name)];
-        let command = Command::try_from(resp).map_err(|err| err.to_string())?;
+        let name = b"PING".to_vec();
+        let resp = Resp::Array(vec![Resp::BulkString(name)]);
+        let command = parse_command(resp).map_err(|err|err.to_string())?;
         assert_eq!(Command::Ping(None), command);
         Ok(())
     }
     #[test]
     fn parse_echo() -> Result<(), String> {
-        let name = String::from("ECHO");
-        let arg = String::from("test");
-        let resp = vec![Resp::BulkString(name), Resp::BulkString(arg.clone())];
-        let command = Command::try_from(resp).map_err(|err| err.to_string())?;
+        let name = b"ECHO".to_vec();
+        let arg = b"test".to_vec();
+        let resp = Resp::Array(vec![Resp::BulkString(name), Resp::BulkString(arg.clone())]);
+        let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(Command::Echo(arg), command);
         Ok(())
     }

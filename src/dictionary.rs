@@ -4,7 +4,7 @@ use std::{
 };
 
 pub struct Dictionary<V> {
-    inner: HashMap<String, Entry<V>>,
+    inner: HashMap<Vec<u8>, Entry<V>>,
 }
 impl<V> Dictionary<V> {
     pub fn new() -> Self {
@@ -12,7 +12,7 @@ impl<V> Dictionary<V> {
             inner: HashMap::new(),
         }
     }
-    pub fn get(&self, key: &str) -> Option<&V> {
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
         self.inner
             .get(key)
             .map(|value| match value.expires_at {
@@ -24,7 +24,7 @@ impl<V> Dictionary<V> {
     }
     pub fn set(
         &mut self,
-        key: String,
+        key: Vec<u8>,
         value: V,
         remove_rule: Option<RemoveRule>,
         get: bool,
