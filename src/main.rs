@@ -2,7 +2,7 @@ use didis::controller::Controller;
 use didis::dictionary::Dictionary;
 use didis::parser;
 use didis::server::Server;
-use std::io::{self, Write};
+use std::io::Write;
 
 fn main() -> Result<(), std::io::Error> {
     let address = "127.0.0.1:6379";
@@ -16,27 +16,27 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
         server.accept_connections()?;
 
         let mut disconnected = Vec::new();
-        for (client_address, socket) in server.connections.iter_mut() {
+        for (address, connection) in server.connections.iter_mut() {
             loop {
-                match socket.next() {
+                match connection.incoming.next() {
                     Some(Ok(command)) => {
                         let response = controller.handle_command(command);
                         // println!("Sending response {response}");
                         let serialized = Vec::from(response);
-                        if let Err(err) = socket.get_mut().write_all(&serialized) {
-                            disconnected.push(client_address.clone());
+                        if let Err(err) = connection.outgoing.write_all(&serialized) {
+                            disconnected.push(address.clone());
                             println!("{err}");
                             break;
                         }
                     }
                     Some(Err(parser::Error::Io(err))) => {
-                        disconnected.push(client_address.clone());
+                        disconnected.push(address.clone());
                         println!("Closed");
                         break;
                     }
                     Some(Err(err)) => {
-                        if let Err(err) = socket.get_mut().write_all(err.to_string().as_bytes()) {
-                            disconnected.push(client_address.clone());
+                        if let Err(err) = connection.outgoing.write_all(err.to_string().as_bytes()) {
+                            disconnected.push(address.clone());
                             println!("{err}");
                             break;
                         }

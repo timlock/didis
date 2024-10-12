@@ -1,5 +1,5 @@
 use std::{net, io};
-use crate::server::socket::SocketNonBlocking;
+use crate::server::socket::TcpStreamNonBlocking;
 
 pub struct TcpListenerNonBlocking {
     inner: net::TcpListener,
@@ -12,10 +12,10 @@ impl TcpListenerNonBlocking {
         Ok(Self { inner })
     }
 
-    pub fn accept(&self) -> io::Result<Option<(SocketNonBlocking, net::SocketAddr)>> {
+    pub fn accept(&self) -> io::Result<Option<(TcpStreamNonBlocking, net::SocketAddr)>> {
         match self.inner.accept() {
             Ok((stream, address)) => {
-                let socket = SocketNonBlocking::new(stream)?;
+                let socket = TcpStreamNonBlocking::try_from(stream)?;
                 Ok(Some((socket, address)))
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
