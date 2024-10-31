@@ -1,7 +1,156 @@
-use core::error;
+use core::{error, str};
 use std::fmt::{self, Display};
-use std::io;
 use std::io::Read;
+use std::marker::PhantomData;
+use std::num::ParseIntError;
+use std::{cmp, io};
+
+use redis::parse_redis_url;
+
+#[derive(Debug)]
+pub enum Error {
+    LengthMismatch,
+    Parse(Box<dyn error::Error>),
+    Truncated,
+    NotEnoughBytes,
+    Misc(String),
+    Io(io::Error),
+    UnkownResp(u8),
+    UnallowedToken(u8),
+    MissingIdentifier,
+}
+
+impl error::Error for Error {}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::LengthMismatch => write!(f, "Length does not match"),
+            Error::Parse(err) => write!(f, "Parse error: {err}"),
+            Error::Truncated => write!(f, "Resp is truncated"),
+            Error::Misc(desc) => write!(f, "Unknown error: {desc}"),
+            Error::NotEnoughBytes => write!(f, "Not enough bytes"),
+            Error::Io(error) => write!(f, "IO error: {error}"),
+            Error::UnkownResp(byte) => write!(f, "Unknown resp type: {}", &byte),
+            Error::UnallowedToken(byte) => write!(f, "Resp must not contain byte: {}", &byte),
+            Error::MissingIdentifier => write!(f, "Resp must start with an identifier"),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Error::Io(value)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resp {
+    SimpleString(Vec<u8>),
+    SimpleError(Vec<u8>),
+    Integer(i64),
+    BulkString(Vec<u8>),
+    Array(Vec<Resp>),
+    Null,
+}
+
+impl Resp {
+    pub fn ok() -> Resp {
+        Resp::SimpleString(b"OK".to_vec())
+    }
+}
+
+impl Display for Resp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", String::from(self))
+    }
+}
+
+impl From<&Resp> for String {
+    fn from(value: &Resp) -> Self {
+        let mut string = String::new();
+        const CLRF: &str = "\r\n";
+        match value {
+            Resp::SimpleString(s) => {
+                string += "+";
+                string += String::from_utf8_lossy(s).into_owned().as_str();
+                string += CLRF;
+            }
+            Resp::SimpleError(e) => {
+                string += "-";
+                string += String::from_utf8_lossy(e).into_owned().as_str();
+                string += CLRF;
+            }
+            Resp::Integer(i) => {
+                string += ":";
+                string += i.to_string().as_str();
+                string += CLRF;
+            }
+            Resp::BulkString(b) => {
+                string += "$";
+                string += b.len().to_string().as_str();
+                string += CLRF;
+                string += String::from_utf8_lossy(b).into_owned().as_str();
+                string += CLRF;
+            }
+            Resp::Array(a) => {
+                string += "*";
+                string += a.len().to_string().as_str();
+                string += CLRF;
+                for i in a {
+                    string += String::from(i).as_str();
+                }
+            }
+            Resp::Null => {
+                string += "*";
+                string += "-1";
+                string += CLRF;
+            }
+        }
+        string
+    }
+}
+
+impl From<Resp> for Vec<u8> {
+    fn from(value: Resp) -> Self {
+        let mut bytes = Vec::new();
+        const CRLF: &[u8; 2] = b"\r\n";
+        match value {
+            Resp::SimpleString(s) => {
+                bytes.push(b'+');
+                bytes.extend_from_slice(s.as_slice());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::SimpleError(s) => {
+                bytes.push(b'-');
+                bytes.extend_from_slice(s.as_slice());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::Integer(i) => {
+                bytes.push(b':');
+                bytes.extend_from_slice(i.to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::BulkString(b) => {
+                bytes.push(b'$');
+                bytes.extend_from_slice(b.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                bytes.extend_from_slice(b.as_slice());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::Array(resps) => {
+                bytes.push(b'*');
+                bytes.extend_from_slice(resps.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                for resp in resps {
+                    let serialized = Vec::from(resp);
+                    bytes.extend_from_slice(&serialized);
+                }
+            }
+            Resp::Null => bytes.extend_from_slice(b"*-1\r\n"),
+        }
+        bytes
+    }
+}
 
 pub struct Decoder<T> {
     buf: Vec<u8>,
@@ -10,7 +159,7 @@ pub struct Decoder<T> {
 
 impl<T> Decoder<T>
 where
-    T: io::Read ,
+    T: io::Read,
 {
     pub fn new(reader: T) -> Self {
         Self {
@@ -63,134 +212,11 @@ pub fn try_read(reader: &mut impl io::Read, buffer: &mut Vec<u8>) -> io::Result<
     Ok(())
 }
 
-#[derive(Debug)]
-pub enum Error {
-    LengthMismatch(usize),
-    Parse(Box<dyn error::Error>),
-    Truncated,
-    Misc(String),
-}
-
-impl error::Error for Error {}
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::LengthMismatch(len) => write!(f, "Length does not match: {len}"),
-            Error::Parse(err) => write!(f, "Parse error: {err}"),
-            Error::Truncated => write!(f, "Resp is truncated"),
-            Error::Misc(desc) => write!(f, "Unknown error {desc}"),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Resp {
-    SimpleString(String),
-    SimpleError(String),
-    Integer(i64),
-    BulkString(Vec<u8>),
-    Array(Vec<Resp>),
-    Null,
-}
-
-impl Resp {
-    pub fn ok() -> Resp {
-        Resp::SimpleString(String::from("OK"))
-    }
-}
-
-impl Display for Resp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", String::from(self))
-    }
-}
-
-impl From<&Resp> for String {
-    fn from(value: &Resp) -> Self {
-        let mut string = String::new();
-        const CLRF: &str = "\r\n";
-        match value {
-            Resp::SimpleString(s) => {
-                string += "+";
-                string += s.as_str();
-                string += CLRF;
-            }
-            Resp::SimpleError(e) => {
-                string += "-";
-                string += e.as_str();
-                string += CLRF;
-            }
-            Resp::Integer(i) => {
-                string += ":";
-                string += i.to_string().as_str();
-                string += CLRF;
-            }
-            Resp::BulkString(b) => {
-                string += "$";
-                string += b.len().to_string().as_str();
-                string += CLRF;
-                string += String::from_utf8_lossy(b).into_owned().as_str();
-                string += CLRF;
-            }
-            Resp::Array(a) => {
-                string += "*";
-                string += a.len().to_string().as_str();
-                string += CLRF;
-                for i in a {
-                    string += String::from(i).as_str();
-                }
-            }
-            Resp::Null => {
-                string += "*";
-                string += "-1";
-                string += CLRF;
-            }
-        }
-        string
-    }
-}
-
-impl From<Resp> for Vec<u8> {
-    fn from(value: Resp) -> Self {
-        let mut bytes = Vec::new();
-        const CRLF: &[u8; 2] = b"\r\n";
-        match value {
-            Resp::SimpleString(s) => {
-                bytes.push(b'+');
-                bytes.extend_from_slice(s.as_bytes());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::SimpleError(s) => {
-                bytes.push(b'-');
-                bytes.extend_from_slice(s.as_bytes());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::Integer(i) => {
-                bytes.push(b':');
-                bytes.extend_from_slice(i.to_string().as_bytes());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::BulkString(b) => {
-                bytes.push(b'$');
-                bytes.extend_from_slice(b.len().to_string().as_bytes());
-                bytes.extend_from_slice(CRLF);
-                bytes.extend_from_slice(b.as_slice());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::Array(resps) => {
-                bytes.push(b'*');
-                bytes.extend_from_slice(resps.len().to_string().as_bytes());
-                bytes.extend_from_slice(CRLF);
-                for resp in resps {
-                    let serialized = Vec::from(resp);
-                    bytes.extend_from_slice(&serialized);
-                }
-            }
-            Resp::Null => bytes.extend_from_slice(b"*-1\r\n"),
-        }
-        bytes
-    }
-}
+// enum SimpleValidator {
+//     SimpleString(SimpleStringValidator),
+//     SimpleError(SimpleErrorValidator),
+//     Integer(IntegerValidator),
+// }
 
 fn parse_resp(value: &[u8]) -> (Option<Resp>, &[u8]) {
     if value.is_empty() {
@@ -206,6 +232,542 @@ fn parse_resp(value: &[u8]) -> (Option<Resp>, &[u8]) {
     }
 }
 
+// fn chain_parsers(parsers: Vec<Box<dyn Parse>>) -> impl FnMut(&mut dyn io::Read)->Result<bool, Error>{
+//     return move |reader|{
+
+//     }
+// }
+
+// struct ChainedParser {
+//     parsers: Vec<Box<dyn Parse>>,
+// }
+// impl ChainedParser
+// {
+//     fn new(parsers: Vec<Box<dyn Parse>>) -> Self {
+//         Self { parsers }
+//     }
+// }
+
+// impl Parse for ChainedParser {
+//     fn parse(&mut self, reader: &mut dyn io::Read) -> Result<bool, Error> {
+//         todo!()
+//     }
+
+//     fn consume(self) -> Result<Resp, Error> {
+//         todo!()
+//     }
+// }
+
+// fn test() {
+//     let chainedParser =
+//         ChainedParser::new(vec![Box::new(ArrayParser::default()), Box::new(BulkStringParser::default())]);
+// }
+
+// enum RespParser {
+//     SimpleString(SimpleStringParser),
+//     SimpleError(SimpleStringParser),
+//     Integer(IntegerParser),
+//     BulkString(BulkStringParser),
+//     Array(Vec<RespParser>),
+// }
+
+// #[derive(Default)]
+// struct ArrayParser {
+//     buf: Vec<Resp>,
+//     length_parser: Option<LenghtParser>,
+//     length: usize,
+//     current: Option<RespParser>,
+// }
+
+// impl Parse for ArrayParser {
+//     fn parse(&mut self, reader: &mut dyn io::Read) -> Result<bool, Error> {
+//         if let Some(mut length_parser) = self.length_parser.take() {
+//             let done = length_parser.parse(reader)?;
+//             match done {
+//                 true => self.length = length_parser.consume()?,
+//                 false => {
+//                     self.length_parser = Some(length_parser);
+//                     return Ok(false);
+//                 }
+//             };
+//         }
+
+//         Ok(false)
+//     }
+
+//     fn consume(self) -> Result<Resp, Error> {
+//         todo!()
+//     }
+// }
+
+// trait Parse {
+//     fn parse(&mut self, reader: &mut dyn io::Read) -> Result<bool, Error>;
+//     fn consume(self) -> Result<Resp, Error>;
+// }
+// #[derive(Default)]
+// struct BulkStringParser {
+//     buf: Vec<u8>,
+//     index: usize,
+//     length_parser: Option<LenghtParser>,
+// }
+
+// impl Parse for BulkStringParser {
+//     fn parse(&mut self, reader: &mut dyn io::Read) -> Result<bool, Error> {
+//         if let Some(mut length_parser) = self.length_parser.take() {
+//             let done = length_parser.parse(reader)?;
+//             match done {
+//                 true => {
+//                     let length = length_parser.consume()?;
+//                     self.buf.resize(length, 0u8);
+//                 }
+//                 false => {
+//                     self.length_parser = Some(length_parser);
+//                     return Ok(false);
+//                 }
+//             }
+//         }
+
+//         match reader.read(&mut self.buf[self.index..]) {
+//             Ok(read_bytes) => self.index += read_bytes,
+//             Err(err) => return Err(Error::Io(err)),
+//         }
+
+//         if self.index != self.buf.len() {
+//             return Ok(false);
+//         }
+
+//         if &self.buf[self.buf.len() - 2..] != b"\r\n" {
+//             Err(Error::LengthMismatch)
+//         } else {
+//             Ok(true)
+//         }
+//     }
+
+//     fn consume(self) -> Result<Resp, Error> {
+//         if self.index != self.buf.len() {
+//             return Err(Error::LengthMismatch);
+//         }
+
+//         Ok(Resp::BulkString(self.buf))
+//     }
+// }
+
+// enum ParserResult<T>{
+//     Done((T, u8)),
+//     Incomplete
+// }
+
+fn read_line(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut cursor = 0;
+
+    while let Some(token) = reader.bytes().next() {
+        let token = token?;
+
+        buf[cursor] = token;
+        cursor += 1;
+
+        if buf[cursor - 1] == b'\r' && token == b'\n' {
+            break;
+        }
+
+        if buf.len() == cursor {
+            break;
+        }
+    }
+
+    Ok(cursor)
+}
+
+
+
+enum ParserResult<T, R> {
+    Ok((T, R)),
+    Incomplete,
+}
+trait Parse<R, A> {
+    fn new(arg: A) -> Result<Self, Error>
+    where
+        Self: std::marker::Sized;
+    fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<R>, Error> {
+        while let Some(token) = reader.bytes().next() {
+            let token = token?;
+            if let Some(result) = self.parse_token(token)? {
+                return Ok(Some(result));
+            }
+        }
+
+        Ok(None)
+    }
+    fn parse_token(&mut self, token: u8) -> Result<Option<R>, Error>;
+}
+struct DigitParser {
+    buf: [u8; 8],
+    cursor: usize,
+}
+
+impl DigitParser {
+    fn convert(&self) -> Result<usize, Error> {
+        let utf8 = std::str::from_utf8(&self.buf[..self.cursor])
+            .map_err(|err| Error::Misc(err.to_string()))?;
+        let length = utf8
+            .parse()
+            .map_err(|err: ParseIntError| Error::Misc(err.to_string()))?;
+        Ok(length)
+    }
+}
+
+impl Parse<(usize, u8), ()> for DigitParser {
+    fn new(_: ()) -> Result<Self, Error> {
+        Ok(Self {
+            buf: Default::default(),
+            cursor: Default::default(),
+        })
+    }
+
+    fn parse_token(&mut self, token: u8) -> Result<Option<(usize, u8)>, Error> {
+        if self.cursor == 8 || !token.is_ascii_digit() {
+            let digit = self.convert()?;
+            return Ok(Some((digit, token)));
+        }
+        self.buf[self.cursor] = token;
+        self.cursor += 1;
+        Ok(None)
+    }
+}
+
+struct CRLfParser<T> {
+    cr: bool,
+    inner: Option<T>,
+}
+impl<T> CRLfParser<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            cr: false,
+            inner: Some(inner),
+        }
+    }
+    fn inner_parse(&mut self, token: u8) -> Result<Option<T>, Error> {
+        match token {
+            b'\r' => match self.cr {
+                true => Err(Error::UnallowedToken(token)),
+                false => {
+                    self.cr = true;
+                    Ok(None)
+                }
+            },
+            b'\n' => match self.cr {
+                true => Ok(Some(self.inner.take().expect("inner should be present"))),
+                false => Err(Error::UnallowedToken(token)),
+            },
+            _ => Err(Error::UnallowedToken(token)),
+        }
+    }
+}
+
+impl<T> Parse<T, (T, u8)> for CRLfParser<T> {
+    fn new(arg: (T, u8)) -> Result<Self, Error> {
+        let mut s = Self {
+            cr: false,
+            inner: Some(arg.0),
+        };
+        let result = s.inner_parse(arg.1)?;
+        if result.is_some() {
+            panic!("CRLF parser should not be complete only one token has been parsed")
+        }
+
+        Ok(s)
+    }
+
+    fn parse_token(&mut self, token: u8) -> Result<Option<T>, Error> {
+        self.inner_parse(token)
+    }
+}
+
+impl<T> Parse<T, T> for CRLfParser<T> {
+    fn new(arg: T) -> Result<Self, Error> {
+        Ok(Self {
+            cr: false,
+            inner: Some(arg),
+        })
+    }
+
+    fn parse_token(&mut self, token: u8) -> Result<Option<T>, Error> {
+        self.inner_parse(token)
+    }
+}
+
+struct ChainedParser<P1, R1, A1, P2, R2> {
+    first: Option<P1>,
+    second: Option<P2>,
+
+    first_result_type: PhantomData<R1>,
+    first_arg_type: PhantomData<A1>,
+    second_result_type: PhantomData<R2>,
+}
+
+impl<T1, R1, A1, T2, R2> Parse<R2, A1> for ChainedParser<T1, R1, A1, T2, R2>
+where
+    T1: Parse<R1, A1>,
+    T2: Parse<R2, R1>,
+{
+    fn new(arg: A1) -> Result<Self, Error> {
+        let first = T1::new(arg)?;
+        Ok(Self {
+            first: Some(first),
+            second: None,
+            first_result_type: PhantomData,
+            first_arg_type: PhantomData,
+            second_result_type: PhantomData,
+        })
+    }
+
+    fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<R2>, Error> {
+        if let Some(ref mut first) = self.first {
+            if let Some(result) = first.parse(reader)? {
+                let second = T2::new(result)?;
+                self.second = Some(second);
+                self.first = None;
+            }
+        }
+
+        if let Some(ref mut second) = self.second {
+            if let Some(result) = second.parse(reader)? {
+                return Ok(Some(result));
+            }
+        }
+
+        Ok(None)
+    }
+    fn parse_token(&mut self, token: u8) -> Result<Option<R2>, Error> {
+        if let Some(ref mut first) = self.first {
+            if let Some(result) = first.parse_token(token)? {
+                let second = T2::new(result)?;
+                self.second = Some(second);
+                self.first = None;
+            }
+            return Ok(None);
+        }
+
+        if let Some(ref mut second) = self.second {
+            if let Some(result) = second.parse_token(token)? {
+                return Ok(Some(result));
+            }
+        }
+
+        Ok(None)
+    }
+}
+type LengthPars = ChainedParser<DigitParser, (usize, u8), (), CRLfParser<usize>, usize>;
+type BytePars = ChainedParser<ByteParser, Vec<u8>, usize, CRLfParser<Vec<u8>>, Vec<u8>>;
+struct BulkStringPars {
+    inner: ChainedParser<LengthPars, usize, (), BytePars, Vec<u8>>,
+}
+impl Parse<Resp, ()> for BulkStringPars {
+    fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<Resp>, Error> {
+        match self.inner.parse(reader)? {
+            Some(bytes) => Ok(Some(Resp::BulkString(bytes))),
+            None => Ok(None),
+        }
+    }
+
+    fn new(_: ()) -> Result<Self, Error> {
+        let parser = ChainedParser::new(())?;
+        Ok(Self { inner: parser })
+    }
+
+    fn parse_token(&mut self, token: u8) -> Result<Option<Resp>, Error> {
+        match self.inner.parse_token(token)? {
+            Some(bytes) => Ok(Some(Resp::BulkString(bytes))),
+            None => Ok(None),
+        }
+    }
+}
+
+struct ByteParser {
+    buf: Option<Vec<u8>>,
+    cursor: usize,
+}
+
+impl Parse<Vec<u8>, usize> for ByteParser {
+    fn new(arg: usize) -> Result<Self, Error>
+    where
+        Self: std::marker::Sized,
+    {
+        Ok(Self {
+            buf: Some(vec![0; arg]),
+            cursor: 0,
+        })
+    }
+
+    fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<Vec<u8>>, Error> {
+        match self.buf {
+            Some(ref mut buf) => {
+                let n = reader.read(&mut buf[self.cursor..])?;
+                self.cursor += n;
+                if self.cursor == buf.len() {
+                    Ok(self.buf.take())
+                } else {
+                    Ok(None)
+                }
+            }
+            None => panic!("Parser is already done"),
+        }
+    }
+
+    fn parse_token(&mut self, token: u8) -> Result<Option<Vec<u8>>, Error> {
+        match self.buf {
+            Some(ref mut buf) => {
+                buf[self.cursor] = token;
+                self.cursor += 1;
+                if self.cursor == buf.len() {
+                    Ok(self.buf.take())
+                } else {
+                    Ok(None)
+                }
+            }
+            None => panic!("Parser is already done"),
+        }
+    }
+}
+
+struct LenghtParser {
+    cr: bool,
+    buf: [u8; 8],
+    index: usize,
+}
+
+impl LenghtParser {
+    fn parse(&mut self, reader: &mut dyn io::Read) -> Result<Option<usize>, Error> {
+        for byte in reader.bytes() {
+            let token = match byte {
+                Ok(byte) => byte,
+                Err(err) => return Err(Error::Io(err)),
+            };
+
+            match token {
+                b'\r' => self.cr = true,
+                b'\n' if !self.cr => return Err(Error::UnallowedToken(token)),
+                b'\n' => {
+                    let offset = self.buf.len() - self.index;
+
+                    let mut buf = [0u8; 8];
+                    buf[offset..].copy_from_slice(&self.buf[..self.index]);
+
+                    let length_i64 = i64::from_be_bytes(buf);
+                    let length =
+                        usize::try_from(length_i64).map_err(|err| Error::Misc(err.to_string()))?;
+                    return Ok(Some(length));
+                }
+                b'0'..=b'9' if self.cr => return Err(Error::UnallowedToken(token)),
+                b'0'..=b'9' => {
+                    self.buf[self.index] = token;
+                    self.index += 1;
+                }
+                _ => {
+                    return Err(Error::UnallowedToken(token));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+struct IntegerParser {
+    cr: bool,
+    lf: bool,
+    buf: [u8; 8],
+    index: usize,
+}
+
+impl IntegerParser {
+    fn parse(&mut self, reader: &mut impl io::Read) -> Result<bool, Error> {
+        for byte in reader.bytes() {
+            let token = match byte {
+                Ok(byte) => byte,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            match token {
+                b'\r' => self.cr = true,
+                b'\n' => {
+                    if !self.cr {
+                        return Err(Error::UnallowedToken(token));
+                    }
+
+                    return Ok(true);
+                }
+                b'+' | b'-' => {
+                    if self.index != 0 {
+                        return Err(Error::UnallowedToken(token));
+                    }
+
+                    self.buf[0] = token;
+                    self.index += 1;
+                }
+                b'0'..=b'9' => {
+                    if self.cr {
+                        return Err(Error::UnallowedToken(token));
+                    } else {
+                        self.buf[self.index] = token;
+                        self.index += 1;
+                    }
+                }
+                _ => {
+                    return Err(Error::UnallowedToken(token));
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+struct SimpleStringParser {
+    cr: bool,
+    lf: bool,
+    buf: Vec<u8>,
+}
+impl SimpleStringParser {
+    fn new() -> Self {
+        Self {
+            buf: Default::default(),
+            cr: Default::default(),
+            lf: Default::default(),
+        }
+    }
+
+    fn parse(&mut self, reader: &mut impl io::Read) -> Result<bool, Error> {
+        for byte in reader.bytes() {
+            let token = match byte {
+                Ok(byte) => byte,
+                Err(err) => return Err(Error::Io(err)),
+            };
+
+            match token {
+                b'\r' => self.cr = true,
+                b'\n' => {
+                    if !self.cr {
+                        return Err(Error::UnallowedToken(b'\n'));
+                    }
+
+                    return Ok(true);
+                }
+                _ => {
+                    if self.cr {
+                        return Err(Error::UnallowedToken(b'\r'));
+                    } else {
+                        self.buf.push(token);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn consume(self) -> Result<Resp, Error> {
+        Ok(Resp::SimpleString(self.buf))
+    }
+}
+
 fn parse_simple_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
     let pos = value[1..].iter().position(|b| *b == b'\r');
     if pos.is_none() {
@@ -216,8 +778,8 @@ fn parse_simple_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
     if remaining.len() < 2 || b"\r\n" != &remaining[..2] {
         return (None, value);
     }
-    let text = String::from_utf8_lossy(data).to_string();
-    (Some(Resp::SimpleString(text)), &remaining[2..])
+
+    (Some(Resp::SimpleString(data.into())), &remaining[2..])
 }
 
 fn parse_simple_error(value: &[u8]) -> (Option<Resp>, &[u8]) {
@@ -320,6 +882,8 @@ fn parse_null(value: &[u8]) -> (Option<Resp>, &[u8]) {
 mod tests {
     use std::io::Write;
     use std::sync::mpsc::{channel, Receiver, Sender};
+
+    use fmt::format;
 
     use super::*;
 
@@ -447,7 +1011,7 @@ mod tests {
         let input = "+OK\r\n";
         match parse_resp(input.as_bytes()) {
             (Some(Resp::SimpleString(s)), _) => {
-                assert_eq!(s, "OK");
+                assert_eq!(s, b"OK");
                 Ok(())
             }
             _ => Err("Should be of type simple string"),
@@ -459,7 +1023,7 @@ mod tests {
         let input = "-ERROR message\r\n";
         match parse_resp(input.as_bytes()) {
             (Some(Resp::SimpleError(s)), _) => {
-                assert_eq!(s, "ERROR message");
+                assert_eq!(s, b"ERROR message");
                 Ok(())
             }
             _ => Err("Should be of type simple error"),
@@ -479,11 +1043,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_bulk_string() -> Result<(), Box<dyn error::Error>> {
+        let mut input = b"2\r\nab\r\n".as_slice();
+        let mut parser = BulkStringPars::new(()).map_err(|err| err.to_string())?;
+        match parser.parse(&mut input)? {
+            Some(Resp::BulkString(s)) => {
+                assert_eq!(b"ab", s.as_slice());
+                Ok(())
+            }
+            Some(resp) => Err(Box::from(format!("got wrong resp {resp}"))),
+            None => Err(Box::from("there should be a parsed resp")),
+        }
+    }
+
+    #[test]
     fn parse_simple_string2() -> Result<(), &'static str> {
         let input = "+hello world\r\n";
         match parse_resp(input.as_bytes()) {
             (Some(Resp::SimpleString(s)), _) => {
-                assert_eq!(s, "hello world");
+                assert_eq!(s, b"hello world");
                 Ok(())
             }
             _ => Err("Should be of type simple string"),
@@ -507,7 +1085,6 @@ mod tests {
             buf.write(&data)
         }
     }
-
 
     #[test]
     fn decoder_parse_null() -> Result<(), &'static str> {
