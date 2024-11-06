@@ -1,4 +1,4 @@
-use core::{error, str};
+use std::{error, str};
 use std::fmt::{self, Display};
 use std::io::Read;
 use std::marker::PhantomData;
@@ -558,215 +558,32 @@ where
     }
 }
 type LengthPars = ChainedParser<DigitParser, (usize, u8), (), CRLfParser<usize>, usize>;
-type BytePars = ChainedParser<ByteParser, Vec<u8>, usize, CRLfParser<Vec<u8>>, Vec<u8>>;
-struct BulkStringPars {
-    inner: ChainedParser<LengthPars, usize, (), BytePars, Vec<u8>>,
-}
-impl Parse<Resp, ()> for BulkStringPars {
-    fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<Resp>, Error> {
-        match self.inner.parse(reader)? {
-            Some(bytes) => Ok(Some(Resp::BulkString(bytes))),
-            None => Ok(None),
-        }
-    }
+// type BytePars = ChainedParser<ByteParser, Vec<u8>, usize, CRLfParser<Vec<u8>>, Vec<u8>>;
+// struct BulkStringPars {
+//     inner: ChainedParser<LengthPars, usize, (), BytePars, Vec<u8>>,
+// }
+// impl Parse<Resp, ()> for BulkStringPars {
+//     fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<Resp>, Error> {
+//         match self.inner.parse(reader)? {
+//             Some(bytes) => Ok(Some(Resp::BulkString(bytes))),
+//             None => Ok(None),
+//         }
+//     }
 
-    fn new(_: ()) -> Result<Self, Error> {
-        let parser = ChainedParser::new(())?;
-        Ok(Self { inner: parser })
-    }
+//     fn new(_: ()) -> Result<Self, Error> {
+//         let parser = ChainedParser::new(())?;
+//         Ok(Self { inner: parser })
+//     }
 
-    fn parse_token(&mut self, token: u8) -> Result<Option<Resp>, Error> {
-        match self.inner.parse_token(token)? {
-            Some(bytes) => Ok(Some(Resp::BulkString(bytes))),
-            None => Ok(None),
-        }
-    }
-}
+//     fn parse_token(&mut self, token: u8) -> Result<Option<Resp>, Error> {
+//         match self.inner.parse_token(token)? {
+//             Some(bytes) => Ok(Some(Resp::BulkString(bytes))),
+//             None => Ok(None),
+//         }
+//     }
+// }
 
-struct ByteParser {
-    buf: Option<Vec<u8>>,
-    cursor: usize,
-}
 
-impl Parse<Vec<u8>, usize> for ByteParser {
-    fn new(arg: usize) -> Result<Self, Error>
-    where
-        Self: std::marker::Sized,
-    {
-        Ok(Self {
-            buf: Some(vec![0; arg]),
-            cursor: 0,
-        })
-    }
-
-    fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<Vec<u8>>, Error> {
-        match self.buf {
-            Some(ref mut buf) => {
-                let n = reader.read(&mut buf[self.cursor..])?;
-                self.cursor += n;
-                if self.cursor == buf.len() {
-                    Ok(self.buf.take())
-                } else {
-                    Ok(None)
-                }
-            }
-            None => panic!("Parser is already done"),
-        }
-    }
-
-    fn parse_token(&mut self, token: u8) -> Result<Option<Vec<u8>>, Error> {
-        match self.buf {
-            Some(ref mut buf) => {
-                buf[self.cursor] = token;
-                self.cursor += 1;
-                if self.cursor == buf.len() {
-                    Ok(self.buf.take())
-                } else {
-                    Ok(None)
-                }
-            }
-            None => panic!("Parser is already done"),
-        }
-    }
-}
-
-struct LenghtParser {
-    cr: bool,
-    buf: [u8; 8],
-    index: usize,
-}
-
-impl LenghtParser {
-    fn parse(&mut self, reader: &mut dyn io::Read) -> Result<Option<usize>, Error> {
-        for byte in reader.bytes() {
-            let token = match byte {
-                Ok(byte) => byte,
-                Err(err) => return Err(Error::Io(err)),
-            };
-
-            match token {
-                b'\r' => self.cr = true,
-                b'\n' if !self.cr => return Err(Error::UnallowedToken(token)),
-                b'\n' => {
-                    let offset = self.buf.len() - self.index;
-
-                    let mut buf = [0u8; 8];
-                    buf[offset..].copy_from_slice(&self.buf[..self.index]);
-
-                    let length_i64 = i64::from_be_bytes(buf);
-                    let length =
-                        usize::try_from(length_i64).map_err(|err| Error::Misc(err.to_string()))?;
-                    return Ok(Some(length));
-                }
-                b'0'..=b'9' if self.cr => return Err(Error::UnallowedToken(token)),
-                b'0'..=b'9' => {
-                    self.buf[self.index] = token;
-                    self.index += 1;
-                }
-                _ => {
-                    return Err(Error::UnallowedToken(token));
-                }
-            }
-        }
-        Ok(None)
-    }
-}
-
-struct IntegerParser {
-    cr: bool,
-    lf: bool,
-    buf: [u8; 8],
-    index: usize,
-}
-
-impl IntegerParser {
-    fn parse(&mut self, reader: &mut impl io::Read) -> Result<bool, Error> {
-        for byte in reader.bytes() {
-            let token = match byte {
-                Ok(byte) => byte,
-                Err(err) => return Err(Error::Io(err)),
-            };
-            match token {
-                b'\r' => self.cr = true,
-                b'\n' => {
-                    if !self.cr {
-                        return Err(Error::UnallowedToken(token));
-                    }
-
-                    return Ok(true);
-                }
-                b'+' | b'-' => {
-                    if self.index != 0 {
-                        return Err(Error::UnallowedToken(token));
-                    }
-
-                    self.buf[0] = token;
-                    self.index += 1;
-                }
-                b'0'..=b'9' => {
-                    if self.cr {
-                        return Err(Error::UnallowedToken(token));
-                    } else {
-                        self.buf[self.index] = token;
-                        self.index += 1;
-                    }
-                }
-                _ => {
-                    return Err(Error::UnallowedToken(token));
-                }
-            }
-        }
-        Ok(false)
-    }
-}
-
-struct SimpleStringParser {
-    cr: bool,
-    lf: bool,
-    buf: Vec<u8>,
-}
-impl SimpleStringParser {
-    fn new() -> Self {
-        Self {
-            buf: Default::default(),
-            cr: Default::default(),
-            lf: Default::default(),
-        }
-    }
-
-    fn parse(&mut self, reader: &mut impl io::Read) -> Result<bool, Error> {
-        for byte in reader.bytes() {
-            let token = match byte {
-                Ok(byte) => byte,
-                Err(err) => return Err(Error::Io(err)),
-            };
-
-            match token {
-                b'\r' => self.cr = true,
-                b'\n' => {
-                    if !self.cr {
-                        return Err(Error::UnallowedToken(b'\n'));
-                    }
-
-                    return Ok(true);
-                }
-                _ => {
-                    if self.cr {
-                        return Err(Error::UnallowedToken(b'\r'));
-                    } else {
-                        self.buf.push(token);
-                    }
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
-    fn consume(self) -> Result<Resp, Error> {
-        Ok(Resp::SimpleString(self.buf))
-    }
-}
 
 fn parse_simple_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
     let pos = value[1..].iter().position(|b| *b == b'\r');
@@ -1042,19 +859,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_bulk_string() -> Result<(), Box<dyn error::Error>> {
-        let mut input = b"2\r\nab\r\n".as_slice();
-        let mut parser = BulkStringPars::new(()).map_err(|err| err.to_string())?;
-        match parser.parse(&mut input)? {
-            Some(Resp::BulkString(s)) => {
-                assert_eq!(b"ab", s.as_slice());
-                Ok(())
-            }
-            Some(resp) => Err(Box::from(format!("got wrong resp {resp}"))),
-            None => Err(Box::from("there should be a parsed resp")),
-        }
-    }
+    // #[test]
+    // fn parse_bulk_string() -> Result<(), Box<dyn error::Error>> {
+    //     let mut input = b"2\r\nab\r\n".as_slice();
+    //     let mut parser = BulkStringPars::new(()).map_err(|err| err.to_string())?;
+    //     match parser.parse(&mut input)? {
+    //         Some(Resp::BulkString(s)) => {
+    //             assert_eq!(b"ab", s.as_slice());
+    //             Ok(())
+    //         }
+    //         Some(resp) => Err(Box::from(format!("got wrong resp {resp}"))),
+    //         None => Err(Box::from("there should be a parsed resp")),
+    //     }
+    // }
 
     #[test]
     fn parse_simple_string2() -> Result<(), &'static str> {
