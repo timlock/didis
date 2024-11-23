@@ -4,7 +4,7 @@ use std::{fmt, io};
 
 pub mod command;
 pub mod resp;
-mod resp_consuming;
+pub mod resp_consuming;
 
 #[derive(Debug)]
 pub enum Error {

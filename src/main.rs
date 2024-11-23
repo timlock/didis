@@ -40,6 +40,7 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
                             println!("{err}");
                             break;
                         }
+                        println!("Could not obtain new connection: {err}")
                     }
                     None => break,
                 }

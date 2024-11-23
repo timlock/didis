@@ -1,7 +1,7 @@
 use crate::parser::resp::Resp;
 use std::{error, fmt, io};
 
-use super::resp;
+use super::{resp, resp_consuming};
 
 pub struct Decoder<T> {
     resp_decoder: resp::Decoder<T>,
@@ -17,6 +17,38 @@ where
 }
 
 impl<T> Iterator for Decoder<T>
+where
+    T: io::Read,
+{
+    type Item = Result<Command, super::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let resp = match self.resp_decoder.next() {
+            Some(Ok(resp)) => resp,
+            Some(Err(err)) => return Some(Err(err)),
+            None => return None,
+        };
+
+        match parse_command(resp) {
+            Ok(command) => Some(Ok(command)),
+            Err(err) => Some(Err(super::Error::Parse(Box::new(err)))),
+        }
+    }
+}
+pub struct ConsumingDecoder<T> {
+    resp_decoder: resp_consuming::Decoder<T>,
+}
+
+impl<T> ConsumingDecoder<T>
+where
+    T: io::Read,
+{
+    pub fn new(resp_decoder: resp_consuming::Decoder<T>) -> Self {
+        Self { resp_decoder }
+    }
+}
+
+impl<T> Iterator for ConsumingDecoder<T>
 where
     T: io::Read,
 {
