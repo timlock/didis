@@ -5,6 +5,7 @@ use std::{fmt, io};
 pub mod command;
 pub mod resp;
 pub mod resp_consuming;
+mod ring_buffer;
 
 #[derive(Debug)]
 pub enum Error {

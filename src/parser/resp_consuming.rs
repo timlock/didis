@@ -69,20 +69,20 @@ impl CRLFParser {
         match token {
             b'\r' => {
                 if self.cr {
-                    return Err(resp::Error::UnallowedToken(token));
+                    return Err(resp::Error::NotAllowedToken(token));
                 }
 
                 self.cr = true;
             }
             b'\n' => {
                 if !self.cr {
-                    return Err(resp::Error::UnallowedToken(token));
+                    return Err(resp::Error::NotAllowedToken(token));
                 }
 
                 self.lf = true;
                 return Ok(true);
             }
-            _ => return Err(resp::Error::UnallowedToken(token)),
+            _ => return Err(resp::Error::NotAllowedToken(token)),
         }
 
         Ok(false)
@@ -111,7 +111,7 @@ impl Parser {
             b':' => Parser::Integer(IntegerParser::new()),
             b'$' => Parser::BulkString(BulkStringParser::new()),
             b'*' => Parser::Array(ArrayParser::new()),
-            _ => return Err(resp::Error::UnkownResp(token)),
+            _ => return Err(resp::Error::UnknownResp(token)),
         };
 
         Ok(Some(parser))
@@ -273,7 +273,7 @@ impl LenghtParser {
         match token {
             b'\r' => match self.cr {
                 false => self.cr = true,
-                true => return Err(resp::Error::UnallowedToken(token)),
+                true => return Err(resp::Error::NotAllowedToken(token)),
             },
             b'\n' => match self.cr {
                 true => {
@@ -282,7 +282,7 @@ impl LenghtParser {
                     let number = convert(&buf[..self.index])?;
                     return Ok(Some(number));
                 }
-                false => return Err(resp::Error::UnallowedToken(token)),
+                false => return Err(resp::Error::NotAllowedToken(token)),
             },
             b'0'..=b'9' => match self.cr {
                 false => {
@@ -297,9 +297,9 @@ impl LenghtParser {
                     buf[self.index] = token;
                     self.index += 1;
                 }
-                true => return Err(resp::Error::UnallowedToken(token)),
+                true => return Err(resp::Error::NotAllowedToken(token)),
             },
-            _ => return Err(resp::Error::UnallowedToken(token)),
+            _ => return Err(resp::Error::NotAllowedToken(token)),
         }
         Ok(None)
     }
@@ -353,7 +353,7 @@ impl SimpleStringParser {
             match token {
                 b'\r' => match self.cr {
                     false => self.cr = true,
-                    true => return Err(resp::Error::UnallowedToken(token)),
+                    true => return Err(resp::Error::NotAllowedToken(token)),
                 },
                 b'\n' => match self.cr {
                     true => {
@@ -361,7 +361,7 @@ impl SimpleStringParser {
                             self.buf.take().expect("buf should not be None"),
                         )))
                     }
-                    false => return Err(resp::Error::UnallowedToken(token)),
+                    false => return Err(resp::Error::NotAllowedToken(token)),
                 },
                 _ => match self.cr {
                     false => self
@@ -369,7 +369,7 @@ impl SimpleStringParser {
                         .as_mut()
                         .expect("buffer should not be empty in init state")
                         .push(token),
-                    true => return Err(resp::Error::UnallowedToken(token)),
+                    true => return Err(resp::Error::NotAllowedToken(token)),
                 },
             }
         }
@@ -419,7 +419,7 @@ fn parse_resp(value: &[u8]) -> (Option<Resp>, &[u8]) {
         b':' => IntegerParser::new().parse(&mut bytes),
         b'$' => BulkStringParser::new().parse(&mut bytes),
         b'*' => ArrayParser::new().parse(&mut bytes),
-        _ => Err(resp::Error::UnkownResp(value[0])),
+        _ => Err(resp::Error::UnknownResp(value[0])),
     };
 
     match result {

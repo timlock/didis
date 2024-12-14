@@ -1,11 +1,9 @@
-use std::{error, str};
 use std::fmt::{self, Display};
+use std::io;
 use std::io::Read;
 use std::marker::PhantomData;
 use std::num::ParseIntError;
-use std::{cmp, io};
-
-use redis::parse_redis_url;
+use std::{error, str};
 
 #[derive(Debug)]
 pub enum Error {
@@ -15,8 +13,8 @@ pub enum Error {
     NotEnoughBytes,
     Misc(String),
     Io(io::Error),
-    UnkownResp(u8),
-    UnallowedToken(u8),
+    UnknownResp(u8),
+    NotAllowedToken(u8),
     MissingIdentifier,
 }
 
@@ -30,8 +28,8 @@ impl fmt::Display for Error {
             Error::Misc(desc) => write!(f, "Unknown error: {desc}"),
             Error::NotEnoughBytes => write!(f, "Not enough bytes"),
             Error::Io(error) => write!(f, "IO error: {error}"),
-            Error::UnkownResp(byte) => write!(f, "Unknown resp type: {}", &byte),
-            Error::UnallowedToken(byte) => write!(f, "Resp must not contain byte: {}", &byte),
+            Error::UnknownResp(byte) => write!(f, "Unknown resp type: {}", &byte),
+            Error::NotAllowedToken(byte) => write!(f, "Resp must not contain byte: {}", &byte),
             Error::MissingIdentifier => write!(f, "Resp must start with an identifier"),
         }
     }
@@ -154,24 +152,24 @@ impl From<Resp> for Vec<u8> {
 
 pub struct Decoder<T> {
     buf: Vec<u8>,
-    reader: io::BufReader<T>,
+    reader: T,
 }
 
 impl<T> Decoder<T>
 where
-    T: io::Read,
+    T: Read,
 {
     pub fn new(reader: T) -> Self {
         Self {
             buf: Vec::new(),
-            reader: io::BufReader::new(reader),
+            reader,
         }
     }
 }
 
 impl<T> Iterator for Decoder<T>
 where
-    T: io::Read,
+    T: Read,
 {
     type Item = Result<Resp, super::Error>;
 
@@ -378,8 +376,6 @@ fn read_line(reader: &mut impl io::Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(cursor)
 }
 
-
-
 enum ParserResult<T, R> {
     Ok((T, R)),
     Incomplete,
@@ -449,7 +445,7 @@ impl<T> CRLfParser<T> {
     fn inner_parse(&mut self, token: u8) -> Result<Option<T>, Error> {
         match token {
             b'\r' => match self.cr {
-                true => Err(Error::UnallowedToken(token)),
+                true => Err(Error::NotAllowedToken(token)),
                 false => {
                     self.cr = true;
                     Ok(None)
@@ -457,9 +453,9 @@ impl<T> CRLfParser<T> {
             },
             b'\n' => match self.cr {
                 true => Ok(Some(self.inner.take().expect("inner should be present"))),
-                false => Err(Error::UnallowedToken(token)),
+                false => Err(Error::NotAllowedToken(token)),
             },
-            _ => Err(Error::UnallowedToken(token)),
+            _ => Err(Error::NotAllowedToken(token)),
         }
     }
 }
@@ -583,8 +579,6 @@ type LengthPars = ChainedParser<DigitParser, (usize, u8), (), CRLfParser<usize>,
 //     }
 // }
 
-
-
 fn parse_simple_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
     let pos = value[1..].iter().position(|b| *b == b'\r');
     if pos.is_none() {
@@ -696,11 +690,10 @@ fn parse_null(value: &[u8]) -> (Option<Resp>, &[u8]) {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use std::io::Write;
     use std::sync::mpsc::{channel, Receiver, Sender};
-
-    use fmt::format;
 
     use super::*;
 
