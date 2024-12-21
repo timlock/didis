@@ -1,22 +1,23 @@
 use std::io;
 use std::io::{IoSlice, IoSliceMut, Read, Write};
-use std::iter::Cycle;
-use std::ops::Range;
 
 #[derive(Debug)]
 pub struct RingBuffer<const N: usize> {
     buf: [u8; N],
-    read_pos: RingBufferIndex,
-    write_pos: RingBufferIndex,
+    read_pos: usize,
+    write_pos: usize,
 }
 
 impl<const N: usize> RingBuffer<N> {
-    pub fn push(&mut self, value: u8) {
+    pub fn push(&mut self, value: u8) -> bool {
         if self.full() {
-            self.read_pos.next();
+            return false;
         }
-        self.buf[self.write_pos.peek() % N] = value;
-        self.write_pos.next();
+
+        let pos = self.write_pos % N;
+        self.buf[pos] = value;
+        self.write_pos = (self.write_pos + 1) % (N * 2);
+        return true;
     }
 
     pub fn pop(&mut self) -> Option<u8> {
@@ -24,14 +25,15 @@ impl<const N: usize> RingBuffer<N> {
             return None;
         }
 
-        let content = self.buf[self.read_pos.peek() % N];
-        self.read_pos.next();
+        let pos = self.read_pos % N;
+        let content = self.buf[pos];
+        self.read_pos = (self.read_pos + 1) % (N * 2);
 
         Some(content)
     }
 
     pub fn empty(&self) -> bool {
-        self.write_pos.peek() == self.read_pos.peek()
+        self.write_pos == self.read_pos
     }
 
     pub fn full(&self) -> bool {
@@ -39,14 +41,15 @@ impl<const N: usize> RingBuffer<N> {
     }
 
     pub fn size(&self) -> usize {
-        self.write_pos.peek() - self.read_pos.peek()
+        self.write_pos - self.read_pos
     }
     pub fn populate(&mut self, reader: &mut impl Read) -> io::Result<usize> {
         let (first, second) = self.writeable_ranges_ref();
         let mut slices = [IoSliceMut::new(first), IoSliceMut::new(second)];
 
         let n = reader.read_vectored(&mut slices)?;
-        self.write_pos.add(n - 1);
+        self.write_pos += n;
+        self.write_pos = self.write_pos % (N * 2);
 
         Ok(n)
     }
@@ -67,15 +70,18 @@ impl<const N: usize> RingBuffer<N> {
             return (self.buf.as_mut_slice(), &mut []);
         }
 
-        if (self.write_pos.peek() % N) < (self.read_pos.peek() % N) {
+        let read_pos = self.read_pos % N;
+        let write_pos = self.write_pos % N;
+
+        if write_pos < read_pos {
             return (
-                &mut self.buf[(self.write_pos.peek() % N)..(self.read_pos.peek() % N)],
+                &mut self.buf[write_pos..read_pos],
                 &mut [],
             );
         }
 
-        let (first, second) = self.buf.split_at_mut(self.write_pos.peek());
-        (first, &mut second[..self.read_pos.peek()])
+        let (first, second) = self.buf.split_at_mut(write_pos);
+        (&mut first[..read_pos], second)
     }
 
     fn readable_ranges_ref(&mut self) -> (&mut [u8], &mut [u8]) {
@@ -83,35 +89,23 @@ impl<const N: usize> RingBuffer<N> {
             return (&mut [], &mut []);
         }
 
-        if (self.read_pos.peek() % N) < (self.write_pos.peek() % N) {
+        let read_pos = self.read_pos % N;
+        let write_pos = self.write_pos % N;
+
+        if read_pos < write_pos {
             return (
-                &mut self.buf[(self.read_pos.peek() % N)..(self.write_pos.peek() % N)],
+                &mut self.buf[read_pos..write_pos],
                 &mut [],
             );
         }
 
         let is_full = self.full();
 
-        let (first, second) = self.buf.split_at_mut(self.read_pos.peek());
+        let (first, second) = self.buf.split_at_mut(read_pos);
         if is_full {
             return (second, first);
         }
-        (first, &mut second[..(self.write_pos.peek() % N)])
-    }
-
-    fn writeable_ranges(&self) -> (Option<Range<usize>>, Option<Range<usize>>) {
-        if self.full() {
-            return (None, None);
-        }
-
-        if self.write_pos.peek() < self.read_pos.peek() {
-            return (Some(self.write_pos.peek()..self.read_pos.peek()), None);
-        }
-
-        (
-            Some(self.write_pos.peek()..N),
-            Some(0..self.read_pos.peek()),
-        )
+        (first, &mut second[..write_pos])
     }
 }
 
@@ -119,34 +113,9 @@ impl<const N: usize> Default for RingBuffer<N> {
     fn default() -> Self {
         Self {
             buf: [0; N],
-            read_pos: RingBufferIndex::default(),
-            write_pos: RingBufferIndex::default(),
+            read_pos: Default::default(),
+            write_pos: Default::default(),
         }
-    }
-}
-
-impl<const N: usize> Write for RingBuffer<N> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.writeable_ranges() {
-            (None, None) => Ok(0),
-            (Some(range), None) | (None, Some(range)) => {
-                let n = self.buf[range].as_mut().write(buf)?;
-                self.write_pos.add(n);
-                Ok(n)
-            }
-            (Some(first), Some(second)) => {
-                let mut n = self.buf[first].as_mut().write(buf)?;
-                n += self.buf[second].as_mut().write(&buf[n..])?;
-
-                self.write_pos.add(n);
-
-                Ok(n)
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -156,57 +125,18 @@ impl<const N: usize> Read for RingBuffer<N> {
         let slices = [IoSlice::new(first), IoSlice::new(second)];
 
         let n = buf.write_vectored(&slices)?;
-        self.read_pos.add(n);
+        self.read_pos = (self.read_pos + n) % (N * 2);
 
         Ok(n)
     }
 }
 
-#[derive(Debug)]
-struct RingBufferIndex {
-    range: Cycle<Range<usize>>,
-    index: usize,
-}
-
-impl RingBufferIndex {
-    fn peek(&self) -> usize {
-        self.index
-    }
-
-    fn next(&mut self) -> usize {
-        self.index = self
-            .range
-            .next()
-            .expect("There should always be a next item because Cycle never returns None");
-
-        self.index
-    }
-
-    fn add(&mut self, n: usize) -> usize {
-        self.index = self
-            .range
-            .nth(n)
-            .expect("There should always be a next item because Cycle never returns None");
-
-        self.index
-    }
-}
-
-impl Default for RingBufferIndex {
-    fn default() -> Self {
-        let mut range_iter = (0..usize::MAX).cycle();
-        let _ = range_iter.next(); // we want to start at 0 and the first call to next should return 1
-        Self {
-            range: range_iter,
-            index: 0,
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::error::Error;
     use std::io::Cursor;
+
+    use super::*;
 
     #[test]
     fn populate() -> Result<(), Box<dyn Error>> {
@@ -221,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn populate_full_buffer() -> Result<(), Box<dyn Error>> {
+    fn over_populate() -> Result<(), Box<dyn Error>> {
         let mut input = Cursor::new(b"12345678".to_vec());
         let mut ringbuffer = RingBuffer::<4>::default();
 
@@ -235,47 +165,40 @@ mod tests {
     }
 
     #[test]
-    fn push() -> Result<(), Box<dyn Error>> {
-        let mut ringbuffer = RingBuffer::<2>::default();
+    fn write_cursor_overflow() -> Result<(), Box<dyn Error>> {
+        let mut input = Cursor::new(b"12345678".to_vec());
+        let mut ringbuffer = RingBuffer::<8>::default();
 
-        ringbuffer.push(1);
-        ringbuffer.push(2);
-        ringbuffer.push(3);
+        ringbuffer.populate(&mut input)?;
 
-        let output = ringbuffer.pop();
-        assert!(output.is_some());
-        assert_eq!(2, output.unwrap());
+        let mut output = vec![0;4];
+        ringbuffer.read(&mut output)?;
+        assert_eq!(b"1234", output.as_slice());
 
-        let output = ringbuffer.pop();
-        assert!(output.is_some());
-        assert_eq!(3, output.unwrap());
+        input = Cursor::new(b"abcd".to_vec());
+        ringbuffer.populate(&mut input)?;
+
+        output = ringbuffer.content();
+        assert_eq!(b"5678abcd", output.as_slice());
 
         Ok(())
     }
 
     #[test]
-    fn index_overflow() -> Result<(), Box<dyn Error>> {
-        let mut write_range = (0..usize::MAX).cycle();
-        write_range.nth(usize::MAX - 1);
-        let write_index = RingBufferIndex {
-            range: write_range,
-            index: usize::MAX,
-        };
-
+    fn push() -> Result<(), Box<dyn Error>> {
         let mut ringbuffer = RingBuffer::<2>::default();
-        ringbuffer.write_pos = write_index;
-        ringbuffer.buf = [1,0];
 
-        ringbuffer.push(2);
-        ringbuffer.push(3);
+        assert!(ringbuffer.push(1));
+        assert!(ringbuffer.push(2));
+        assert!(!ringbuffer.push(3));
+
+        let output = ringbuffer.pop();
+        assert!(output.is_some());
+        assert_eq!(1, output.unwrap());
 
         let output = ringbuffer.pop();
         assert!(output.is_some());
         assert_eq!(2, output.unwrap());
-
-        let output = ringbuffer.pop();
-        assert!(output.is_some());
-        assert_eq!(3, output.unwrap());
 
         Ok(())
     }

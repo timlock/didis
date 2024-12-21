@@ -4,6 +4,7 @@ use std::io::Read;
 use std::marker::PhantomData;
 use std::num::ParseIntError;
 use std::{error, str};
+use crate::parser::ring_buffer::RingBuffer;
 
 #[derive(Debug)]
 pub enum Error {
@@ -19,6 +20,7 @@ pub enum Error {
 }
 
 impl error::Error for Error {}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -150,14 +152,55 @@ impl From<Resp> for Vec<u8> {
     }
 }
 
+pub struct RingDecoder<T> {
+    buf: RingBuffer<4096>,
+    reader: T,
+}
+
+impl<T> crate::parser::resp::RingDecoder<T>
+    where
+        T: Read,
+{
+    pub fn new(reader: T) -> Self {
+        Self {
+            buf: Default::default(),
+            reader,
+        }
+    }
+}
+
+impl<T> Iterator for crate::parser::resp::RingDecoder<T>
+    where
+        T: Read,
+{
+    type Item = Result<Resp, super::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Err(err) = self.buf.populate(&mut self.reader) {
+            return Some(Err(super::Error::Io(err)));
+        }
+
+        let content = self.buf.content();
+        match parse_resp(content.as_slice()) {
+            (Some(resp), r) => {
+                Some(Ok(resp))
+            }
+            (None, []) => None,
+            (None, r) => Some(Err(super::Error::Parse(Box::new(Error::Misc(
+                String::from_utf8_lossy(r).into_owned(),
+            ))))),
+        }
+    }
+}
+
 pub struct Decoder<T> {
     buf: Vec<u8>,
     reader: T,
 }
 
 impl<T> Decoder<T>
-where
-    T: Read,
+    where
+        T: Read,
 {
     pub fn new(reader: T) -> Self {
         Self {
@@ -168,8 +211,8 @@ where
 }
 
 impl<T> Iterator for Decoder<T>
-where
-    T: Read,
+    where
+        T: Read,
 {
     type Item = Result<Resp, super::Error>;
 
@@ -380,10 +423,11 @@ enum ParserResult<T, R> {
     Ok((T, R)),
     Incomplete,
 }
+
 trait Parse<R, A> {
     fn new(arg: A) -> Result<Self, Error>
-    where
-        Self: std::marker::Sized;
+        where
+            Self: std::marker::Sized;
     fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<R>, Error> {
         while let Some(token) = reader.bytes().next() {
             let token = token?;
@@ -396,6 +440,7 @@ trait Parse<R, A> {
     }
     fn parse_token(&mut self, token: u8) -> Result<Option<R>, Error>;
 }
+
 struct DigitParser {
     buf: [u8; 8],
     cursor: usize,
@@ -435,6 +480,7 @@ struct CRLfParser<T> {
     cr: bool,
     inner: Option<T>,
 }
+
 impl<T> CRLfParser<T> {
     fn new(inner: T) -> Self {
         Self {
@@ -502,9 +548,9 @@ struct ChainedParser<P1, R1, A1, P2, R2> {
 }
 
 impl<T1, R1, A1, T2, R2> Parse<R2, A1> for ChainedParser<T1, R1, A1, T2, R2>
-where
-    T1: Parse<R1, A1>,
-    T2: Parse<R2, R1>,
+    where
+        T1: Parse<R1, A1>,
+        T2: Parse<R2, R1>,
 {
     fn new(arg: A1) -> Result<Self, Error> {
         let first = T1::new(arg)?;
@@ -553,6 +599,7 @@ where
         Ok(None)
     }
 }
+
 type LengthPars = ChainedParser<DigitParser, (usize, u8), (), CRLfParser<usize>, usize>;
 // type BytePars = ChainedParser<ByteParser, Vec<u8>, usize, CRLfParser<Vec<u8>>, Vec<u8>>;
 // struct BulkStringPars {

@@ -3,6 +3,39 @@ use std::{error, fmt, io};
 
 use super::{resp, resp_consuming};
 
+pub struct RingDecoder<T> {
+    resp_decoder: resp::RingDecoder<T>,
+}
+
+impl<T> crate::parser::command::RingDecoder<T>
+    where
+        T: io::Read,
+{
+    pub fn new(resp_decoder: resp::RingDecoder<T>) -> Self {
+        Self { resp_decoder }
+    }
+}
+
+impl<T> Iterator for crate::parser::command::RingDecoder<T>
+    where
+        T: io::Read,
+{
+    type Item = Result<Command, super::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let resp = match self.resp_decoder.next() {
+            Some(Ok(resp)) => resp,
+            Some(Err(err)) => return Some(Err(err)),
+            None => return None,
+        };
+
+        match parse_command(resp) {
+            Ok(command) => Some(Ok(command)),
+            Err(err) => Some(Err(super::Error::Parse(Box::new(err)))),
+        }
+    }
+}
+
 pub struct Decoder<T> {
     resp_decoder: resp::Decoder<T>,
 }

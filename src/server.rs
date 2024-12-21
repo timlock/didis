@@ -45,15 +45,19 @@ impl Server {
 }
 
 pub struct Connection {
-    pub incoming: command::Decoder<IoRef<TcpStreamNonBlocking>>,
+    pub incoming: command::RingDecoder<IoRef<TcpStreamNonBlocking>>,
+    // pub incoming: command::Decoder<IoRef<TcpStreamNonBlocking>>,
     // pub incoming: command::ConsumingDecoder<IoRef<TcpStreamNonBlocking>>,
     pub outgoing: IoRef<TcpStreamNonBlocking>,
 }
 impl Connection {
     pub fn new(stream: TcpStreamNonBlocking) -> Self {
         let socket_ref = IoRef::from(stream);
-        let resp_decoder = resp::Decoder::new(socket_ref.clone());
-        let command_decoder = command::Decoder::new(resp_decoder);
+        let resp_decoder = resp::RingDecoder::new(socket_ref.clone());
+        let command_decoder = command::RingDecoder::new(resp_decoder);
+
+        // let resp_decoder = resp::Decoder::new(socket_ref.clone());
+        // let command_decoder = command::Decoder::new(resp_decoder);
 
         // let consuming_resp_decoder = resp_consuming::Decoder::new(socket_ref.clone());
         // let command_decoder = command::ConsumingDecoder::new(consuming_resp_decoder);
