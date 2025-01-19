@@ -17,7 +17,7 @@ impl<const N: usize> RingBuffer<N> {
         let pos = self.write_pos % N;
         self.buf[pos] = value;
         self.write_pos = (self.write_pos + 1) % (N * 2);
-        return true;
+        true
     }
 
     pub fn pop(&mut self) -> Option<u8> {
@@ -41,7 +41,12 @@ impl<const N: usize> RingBuffer<N> {
     }
 
     pub fn size(&self) -> usize {
-        self.write_pos - self.read_pos
+        let (size, _) = self.write_pos.overflowing_sub(self.read_pos);
+        size % (N * 2)
+        // if self.write_pos < self.read_pos {
+        //     return self.read_pos - self.write_pos;
+        // }
+        // self.write_pos - self.read_pos
     }
     pub fn populate(&mut self, reader: &mut impl Read) -> io::Result<usize> {
         let (first, second) = self.writeable_ranges_ref();
@@ -74,14 +79,11 @@ impl<const N: usize> RingBuffer<N> {
         let write_pos = self.write_pos % N;
 
         if write_pos < read_pos {
-            return (
-                &mut self.buf[write_pos..read_pos],
-                &mut [],
-            );
+            return (&mut self.buf[write_pos..read_pos], &mut []);
         }
 
         let (first, second) = self.buf.split_at_mut(write_pos);
-        (&mut first[..read_pos], second)
+        (second, &mut first[..read_pos])
     }
 
     fn readable_ranges_ref(&mut self) -> (&mut [u8], &mut [u8]) {
@@ -93,10 +95,7 @@ impl<const N: usize> RingBuffer<N> {
         let write_pos = self.write_pos % N;
 
         if read_pos < write_pos {
-            return (
-                &mut self.buf[read_pos..write_pos],
-                &mut [],
-            );
+            return (&mut self.buf[read_pos..write_pos], &mut []);
         }
 
         let is_full = self.full();
@@ -105,7 +104,7 @@ impl<const N: usize> RingBuffer<N> {
         if is_full {
             return (second, first);
         }
-        (first, &mut second[..write_pos])
+        (second, &mut first[..write_pos])
     }
 }
 
@@ -143,7 +142,8 @@ mod tests {
         let mut input = Cursor::new(b"12345678".to_vec());
         let mut ringbuffer = RingBuffer::<8>::default();
 
-        ringbuffer.populate(&mut input)?;
+        let n = ringbuffer.populate(&mut input)?;
+        assert_eq!(8, n);
 
         let output = ringbuffer.content();
         assert_eq!(b"12345678", output.as_slice());
@@ -151,7 +151,77 @@ mod tests {
     }
 
     #[test]
-    fn over_populate() -> Result<(), Box<dyn Error>> {
+    fn write_pos_after_read_pos() -> Result<(), Box<dyn Error>> {
+        let mut input = Cursor::new(b"123456".to_vec());
+        let mut ringbuffer = RingBuffer::<8>::default();
+
+        let mut n = ringbuffer.populate(&mut input)?;
+        assert_eq!(6, n);
+
+        let mut output = vec![0; 2];
+        n = ringbuffer.read(&mut output)?;
+        assert_eq!(2, n);
+        assert_eq!(b"12", output.as_slice());
+
+        input = Cursor::new(b"789A".to_vec());
+        n = ringbuffer.populate(&mut input)?;
+        assert_eq!(4, n);
+
+        let output = ringbuffer.content();
+        assert_eq!(b"3456789A", output.as_slice());
+        Ok(())
+    }
+    #[test]
+    fn read_pos_after_write_pos() -> Result<(), Box<dyn Error>> {
+        let mut input = Cursor::new(b"1234".to_vec());
+        let mut ringbuffer = RingBuffer::<4>::default();
+
+        let mut n = ringbuffer.populate(&mut input)?;
+        assert_eq!(4, n);
+
+        let mut output = vec![0; 4];
+        n = ringbuffer.read(&mut output)?;
+        assert_eq!(4, n);
+        assert_eq!(b"1234", output.as_slice());
+
+        input = Cursor::new(b"5678".to_vec());
+        n = ringbuffer.populate(&mut input)?;
+        assert_eq!(4, n);
+        
+        output = vec![0; 3];
+        n = ringbuffer.read(&mut output)?;
+        assert_eq!(3, n);
+        assert_eq!(b"567", output.as_slice());
+
+        let output = ringbuffer.content();
+        assert_eq!(1, output.len());
+        assert_eq!(b"8", output.as_slice());
+        Ok(())
+    }
+    
+    #[test]
+    fn overwrite_read_entries() -> Result<(), Box<dyn Error>> {
+        let mut input = Cursor::new(b"1234".to_vec());
+        let mut ringbuffer = RingBuffer::<4>::default();
+
+        let mut n = ringbuffer.populate(&mut input)?;
+        assert_eq!(4, n);
+
+        let mut output = vec![0; 4];
+        n = ringbuffer.read(&mut output)?;
+        assert_eq!(4, n);
+        assert_eq!(b"1234", output.as_slice());
+
+        input = Cursor::new(b"789A".to_vec());
+        n = ringbuffer.populate(&mut input)?;
+        assert_eq!(4, n);
+
+        let output = ringbuffer.content();
+        assert_eq!(b"789A", output.as_slice());
+        Ok(())
+    }
+    #[test]
+    fn greater_input_than_capacity() -> Result<(), Box<dyn Error>> {
         let mut input = Cursor::new(b"12345678".to_vec());
         let mut ringbuffer = RingBuffer::<4>::default();
 
@@ -165,13 +235,41 @@ mod tests {
     }
 
     #[test]
+    fn populate_full_buffer() -> Result<(), Box<dyn Error>> {
+        let mut input = Cursor::new(b"1234".to_vec());
+        let mut ringbuffer = RingBuffer::<4>::default();
+
+        ringbuffer.populate(&mut input)?;
+
+        input = Cursor::new(b"5678".to_vec());
+        let n = ringbuffer.populate(&mut input)?;
+
+        assert_eq!(0, n);
+
+        let output = ringbuffer.content();
+        assert_eq!(b"1234", output.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn read_empty_buffer() -> Result<(), Box<dyn Error>> {
+        let mut ringbuffer = RingBuffer::<4>::default();
+
+        let output = ringbuffer.content();
+        assert_eq!(0, output.len());
+        assert!(ringbuffer.empty());
+        assert_eq!(b"", output.as_slice());
+        
+        Ok(())
+    }
+    #[test]
     fn write_cursor_overflow() -> Result<(), Box<dyn Error>> {
         let mut input = Cursor::new(b"12345678".to_vec());
         let mut ringbuffer = RingBuffer::<8>::default();
 
         ringbuffer.populate(&mut input)?;
 
-        let mut output = vec![0;4];
+        let mut output = vec![0; 4];
         ringbuffer.read(&mut output)?;
         assert_eq!(b"1234", output.as_slice());
 
