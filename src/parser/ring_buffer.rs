@@ -59,6 +59,18 @@ impl<const N: usize> RingBuffer<N> {
         Ok(n)
     }
 
+    // TODO make self non mutable
+    pub fn peek(&mut self) -> Vec<u8>{
+        let old_read_pos = self.read_pos; 
+        let content = self.content();
+        self.read_pos = old_read_pos;
+        content
+    } 
+    
+    pub fn add_read_pos(&mut self, amount: usize){
+        self.read_pos = (self.read_pos + amount) % (N * 2);
+    }
+    
     pub fn content(&mut self) -> Vec<u8> {
         let mut buf = vec![0; self.size()];
         self.read(&mut buf)
