@@ -59,6 +59,18 @@ impl<const N: usize> RingBuffer<N> {
         Ok(n)
     }
 
+    // TODO make self non mutable
+    pub fn peek(&mut self) -> Vec<u8> {
+        let old_read_pos = self.read_pos;
+        let content = self.content();
+        self.read_pos = old_read_pos;
+        content
+    }
+
+    pub fn add_read_pos(&mut self, amount: usize) {
+        self.read_pos = (self.read_pos + amount) % (N * 2);
+    }
+
     pub fn content(&mut self) -> Vec<u8> {
         let mut buf = vec![0; self.size()];
         self.read(&mut buf)
@@ -71,12 +83,13 @@ impl<const N: usize> RingBuffer<N> {
             return (&mut [], &mut []);
         }
 
-        if self.empty() {
-            return (self.buf.as_mut_slice(), &mut []);
-        }
-
         let read_pos = self.read_pos % N;
         let write_pos = self.write_pos % N;
+
+        if self.empty() {
+            let (first, second) = self.buf.split_at_mut(write_pos);
+            return (second, first);
+        }
 
         if write_pos < read_pos {
             return (&mut self.buf[write_pos..read_pos], &mut []);
@@ -87,12 +100,13 @@ impl<const N: usize> RingBuffer<N> {
     }
 
     fn readable_ranges_ref(&mut self) -> (&mut [u8], &mut [u8]) {
-        if self.empty() {
-            return (&mut [], &mut []);
-        }
-
         let read_pos = self.read_pos % N;
         let write_pos = self.write_pos % N;
+
+        if self.empty() {
+            let (first, second) = self.buf.split_at_mut(read_pos);
+            return (second, first);
+        }
 
         if read_pos < write_pos {
             return (&mut self.buf[read_pos..write_pos], &mut []);
@@ -187,7 +201,7 @@ mod tests {
         input = Cursor::new(b"5678".to_vec());
         n = ringbuffer.populate(&mut input)?;
         assert_eq!(4, n);
-        
+
         output = vec![0; 3];
         n = ringbuffer.read(&mut output)?;
         assert_eq!(3, n);
@@ -198,7 +212,7 @@ mod tests {
         assert_eq!(b"8", output.as_slice());
         Ok(())
     }
-    
+
     #[test]
     fn overwrite_read_entries() -> Result<(), Box<dyn Error>> {
         let mut input = Cursor::new(b"1234".to_vec());
@@ -259,7 +273,7 @@ mod tests {
         assert_eq!(0, output.len());
         assert!(ringbuffer.empty());
         assert_eq!(b"", output.as_slice());
-        
+
         Ok(())
     }
     #[test]

@@ -180,9 +180,10 @@ impl<T> Iterator for crate::parser::resp::RingDecoder<T>
             return Some(Err(super::Error::Io(err)));
         }
 
-        let content = self.buf.content();
+        let content = self.buf.peek();
         match parse_resp(content.as_slice()) {
             (Some(resp), r) => {
+                self.buf.add_read_pos(content.len() - r.len());
                 Some(Ok(resp))
             }
             (None, []) => None,
