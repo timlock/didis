@@ -7,20 +7,20 @@ pub struct RingDecoder<T> {
     resp_decoder: resp::RingDecoder<T>,
 }
 
-impl<T> crate::parser::command::RingDecoder<T>
-    where
-        T: io::Read,
+impl<T> RingDecoder<T>
+where
+    T: io::Read,
 {
     pub fn new(resp_decoder: resp::RingDecoder<T>) -> Self {
         Self { resp_decoder }
     }
 }
 
-impl<T> Iterator for crate::parser::command::RingDecoder<T>
-    where
-        T: io::Read,
+impl<T> Iterator for RingDecoder<T>
+where
+    T: io::Read,
 {
-    type Item = Result<Command, super::Error>;
+    type Item = Result<Command, Box<dyn error::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let resp = match self.resp_decoder.next() {
@@ -31,7 +31,7 @@ impl<T> Iterator for crate::parser::command::RingDecoder<T>
 
         match parse_command(resp) {
             Ok(command) => Some(Ok(command)),
-            Err(err) => Some(Err(super::Error::Parse(Box::new(err)))),
+            Err(err) => Some(Err(Box::new(err))),
         }
     }
 }
@@ -53,7 +53,7 @@ impl<T> Iterator for Decoder<T>
 where
     T: io::Read,
 {
-    type Item = Result<Command, super::Error>;
+    type Item = Result<Command, Box<dyn error::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let resp = match self.resp_decoder.next() {
@@ -64,7 +64,7 @@ where
 
         match parse_command(resp) {
             Ok(command) => Some(Ok(command)),
-            Err(err) => Some(Err(super::Error::Parse(Box::new(err)))),
+            Err(err) => Some(Err(Box::new(err))),
         }
     }
 }
@@ -131,12 +131,11 @@ pub enum Command {
     Echo(Vec<u8>),
     Get(Vec<u8>),
     Set { key: Vec<u8>, value: Vec<u8> },
-    ConfigGet,
+    ConfigGet(Vec<u8>),
     Client,
 }
 
-
-fn parse_command(resp: resp::Resp) -> Result<Command, Error> {
+fn parse_command(resp: Resp) -> Result<Command, Error> {
     let mut segment_iter = match resp {
         Resp::Array(vec) => vec.into_iter(),
         _ => return Err(Error::InvalidStart),
@@ -157,7 +156,9 @@ fn parse_command(resp: resp::Resp) -> Result<Command, Error> {
         b"SET" => parse_set(segment_iter),
         b"CONFIG" => parse_config_get(segment_iter),
         b"CLIENT" => parse_client(segment_iter),
-        _ => Err(Error::UnknownCommand(String::from_utf8_lossy(&name).into_owned())),
+        _ => Err(Error::UnknownCommand(
+            String::from_utf8_lossy(&name).into_owned(),
+        )),
     }
 }
 
@@ -246,7 +247,7 @@ fn parse_config_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Comman
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
     };
-    
+
     let key = match iter.next() {
         Some(resp) => match resp {
             Resp::BulkString(text) => text,
@@ -254,7 +255,7 @@ fn parse_config_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Comman
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
     };
-    
+
     let (remaining, _) = iter.size_hint();
     if remaining > 0 {
         return Err(Error::InvalidNumberOfArguments(remaining));
@@ -278,7 +279,7 @@ mod tests {
     fn parse_ping() -> Result<(), String> {
         let name = b"PING".to_vec();
         let resp = Resp::Array(vec![Resp::BulkString(name)]);
-        let command = parse_command(resp).map_err(|err|err.to_string())?;
+        let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(Command::Ping(None), command);
         Ok(())
     }

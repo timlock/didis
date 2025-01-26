@@ -1,6 +1,7 @@
 use didis::controller::Controller;
 use didis::dictionary::Dictionary;
 use didis::parser;
+use didis::parser::resp::Resp;
 use didis::server::Server;
 use std::io::Write;
 
@@ -8,7 +9,11 @@ fn main() -> Result<(), std::io::Error> {
     let address = "127.0.0.1:6379";
     let server = Server::new(address)?;
     let worker = Controller::new(Dictionary::new());
-    run(server, worker)
+
+    println!("Starting server on {}", address);
+    let result = run(server, worker);
+    println!("Server stopped");
+    result
 }
 
 fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Error> {
@@ -18,7 +23,7 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
         let mut disconnected = Vec::new();
         for (address, connection) in server.connections.iter_mut() {
             loop {
-                match connection.commands.next() {
+                match connection.incoming.next() {
                     Some(Ok(command)) => {
                         println!("Received command: {:?}", command);
                         let response = controller.handle_command(command);
@@ -30,14 +35,16 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
                             break;
                         }
                     }
-                    Some(Err(parser::Error::Io(err))) => {
-                        println!("Closed connection {address} due to IO error: {err}");
-                        disconnected.push(address.clone());
-                        break;
-                    }
                     Some(Err(err)) => {
+                        if err.is::<std::io::Error>() {
+                            println!("Closed connection {address} due to IO error: {err}");
+                            disconnected.push(address.clone());
+                            break;
+                        }
+
                         println!("Closed connection {address}: {err}");
-                        if let Err(err) = connection.outgoing.write_all(err.to_string().as_bytes()) {
+                        let resp_error = Resp::SimpleError(err.to_string().as_bytes().to_vec());
+                        if let Err(err) = connection.outgoing.write_all(&Vec::from(resp_error)) {
                             disconnected.push(address.clone());
                             println!("{err}");
                             break;

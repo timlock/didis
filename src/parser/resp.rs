@@ -1,10 +1,10 @@
+use crate::parser::ring_buffer::RingBuffer;
 use std::fmt::{self, Display};
 use std::io;
 use std::io::Read;
 use std::marker::PhantomData;
 use std::num::ParseIntError;
 use std::{error, str};
-use crate::parser::ring_buffer::RingBuffer;
 
 #[derive(Debug)]
 pub enum Error {
@@ -157,9 +157,9 @@ pub struct RingDecoder<T> {
     reader: T,
 }
 
-impl<T> crate::parser::resp::RingDecoder<T>
-    where
-        T: Read,
+impl<T> RingDecoder<T>
+where
+    T: Read,
 {
     pub fn new(reader: T) -> Self {
         Self {
@@ -169,27 +169,25 @@ impl<T> crate::parser::resp::RingDecoder<T>
     }
 }
 
-impl<T> Iterator for crate::parser::resp::RingDecoder<T>
-    where
-        T: Read,
+impl<T> Iterator for RingDecoder<T>
+where
+    T: Read,
 {
-    type Item = Result<Resp, super::Error>;
+    type Item = Result<Resp, Box<dyn error::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Err(err) = self.buf.populate(&mut self.reader) {
-            return Some(Err(super::Error::Io(err)));
+            return Some(Err(Box::new(err)));
         }
 
         let content = self.buf.peek();
         match parse_resp(content.as_slice()) {
-            (Some(resp), r) => {
+            Ok((Some(resp), r)) => {
                 self.buf.add_read_pos(content.len() - r.len());
                 Some(Ok(resp))
             }
-            (None, []) => None,
-            (None, r) => Some(Err(super::Error::Parse(Box::new(Error::Misc(
-                String::from_utf8_lossy(r).into_owned(),
-            ))))),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
         }
     }
 }
@@ -200,8 +198,8 @@ pub struct Decoder<T> {
 }
 
 impl<T> Decoder<T>
-    where
-        T: Read,
+where
+    T: Read,
 {
     pub fn new(reader: T) -> Self {
         Self {
@@ -212,32 +210,28 @@ impl<T> Decoder<T>
 }
 
 impl<T> Iterator for Decoder<T>
-    where
-        T: Read,
+where
+    T: Read,
 {
-    type Item = Result<Resp, super::Error>;
+    type Item = Result<Resp, Box<dyn error::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Err(err) = try_read(&mut self.reader, &mut self.buf) {
-            return Some(Err(super::Error::Io(err)));
+            return Some(Err(Box::new(err)));
         }
 
-        let old_len = self.buf.len();
         match parse_resp(&self.buf) {
-            (Some(resp), r) => {
+            Ok((Some(resp), r)) => {
                 self.buf = r.to_vec();
                 Some(Ok(resp))
             }
-            (None, r) if r.len() == old_len => None,
-            (None, []) => None,
-            (None, r) => Some(Err(super::Error::Parse(Box::new(Error::Misc(
-                String::from_utf8_lossy(r).into_owned(),
-            ))))),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
         }
     }
 }
 
-pub fn try_read(reader: &mut impl io::Read, buffer: &mut Vec<u8>) -> io::Result<()> {
+pub fn try_read(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<()> {
     const CHUNK_SIZE: usize = 1024 * 4;
     let mut buf = [0; CHUNK_SIZE];
     loop {
@@ -260,18 +254,20 @@ pub fn try_read(reader: &mut impl io::Read, buffer: &mut Vec<u8>) -> io::Result<
 //     Integer(IntegerValidator),
 // }
 
-fn parse_resp(value: &[u8]) -> (Option<Resp>, &[u8]) {
+fn parse_resp(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Box<dyn error::Error>> {
     if value.is_empty() {
-        return (None, value);
+        return Ok((None, value));
     }
-    match value[0] {
+    let result = match value[0] {
         b'+' => parse_simple_string(value),
         b'-' => parse_simple_error(value),
-        b':' => parse_integer(value),
-        b'$' => parse_bulk_string(value),
-        b'*' => parse_array(value),
-        _ => (None, value),
-    }
+        b':' => parse_integer(value)?,
+        b'$' => parse_bulk_string(value)?,
+        b'*' => parse_array(value)?,
+        _ => return Err(Box::new(Error::UnknownResp(value[0]))),
+    };
+
+    Ok(result)
 }
 
 // fn chain_parsers(parsers: Vec<Box<dyn Parse>>) -> impl FnMut(&mut dyn io::Read)->Result<bool, Error>{
@@ -427,8 +423,8 @@ enum ParserResult<T, R> {
 
 trait Parse<R, A> {
     fn new(arg: A) -> Result<Self, Error>
-        where
-            Self: std::marker::Sized;
+    where
+        Self: std::marker::Sized;
     fn parse(&mut self, reader: &mut impl io::Read) -> Result<Option<R>, Error> {
         while let Some(token) = reader.bytes().next() {
             let token = token?;
@@ -549,9 +545,9 @@ struct ChainedParser<P1, R1, A1, P2, R2> {
 }
 
 impl<T1, R1, A1, T2, R2> Parse<R2, A1> for ChainedParser<T1, R1, A1, T2, R2>
-    where
-        T1: Parse<R1, A1>,
-        T2: Parse<R2, R1>,
+where
+    T1: Parse<R1, A1>,
+    T2: Parse<R2, R1>,
 {
     fn new(arg: A1) -> Result<Self, Error> {
         let first = T1::new(arg)?;
@@ -648,93 +644,95 @@ fn parse_simple_error(value: &[u8]) -> (Option<Resp>, &[u8]) {
     }
 }
 
-fn parse_integer(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    match parse_length(&value[1..]) {
-        (Some(i), r) => (Some(Resp::Integer(i)), r),
-        _ => (None, value),
+fn parse_integer(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Box<dyn error::Error>> {
+    match parse_length(&value[1..])? {
+        (Some(i), r) => Ok((Some(Resp::Integer(i)), r)),
+        _ => Ok((None, value)),
     }
 }
 
-fn parse_array(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    let (length, remaining) = parse_length(&value[1..]);
+fn parse_array(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Box<dyn error::Error>> {
+    let (length, remaining) = parse_length(&value[1..])?;
     if length.is_none() {
-        return (None, value);
+        return Ok((None, value));
     }
+
     if length.unwrap() == -1 {
-        match parse_null(value) {
-            (Some(null), r) => return (Some(null), r),
-            _ => return (None, value),
+        match parse_null(value)? {
+            (Some(null), r) => return Ok((Some(null), r)),
+            _ => return Ok((None, value)),
         }
     }
+
     let length = length.unwrap() as usize;
     let mut array = Vec::with_capacity(length);
     let mut contents = remaining;
     for _ in 0..length {
-        match parse_resp(contents) {
+        match parse_resp(contents)? {
             (Some(resp), r) => {
                 array.push(resp);
                 contents = r;
             }
             (None, r) => {
                 if r.is_empty() && array.len() == length {
-                    return (Some(Resp::Array(array)), r);
+                    return Ok((Some(Resp::Array(array)), r));
                 }
-                return (None, r);
+                return Ok((None, r));
             }
         }
     }
-    (Some(Resp::Array(array)), contents)
+    Ok((Some(Resp::Array(array)), contents))
 }
 
-fn parse_bulk_string(value: &[u8]) -> (Option<Resp>, &[u8]) {
-    let (length, remaining) = parse_length(&value[1..]);
+fn parse_bulk_string(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Box<dyn error::Error>> {
+    let (length, remaining) = parse_length(&value[1..])?;
     if length.is_none() {
-        return (None, value);
+        return Ok((None, value));
     }
     if length.unwrap() == -1 {
-        match parse_null(value) {
-            (Some(null), r) => return (Some(null), r),
-            _ => return (None, value),
+        match parse_null(value)? {
+            (Some(null), r) => return Ok((Some(null), r)),
+            _ => return Ok((None, value)),
         }
     }
     let length = length.unwrap() as usize;
-    let (data, remaining) = remaining.split_at(length);
-    let text = data.to_vec();
-    if text.len() != length || remaining.len() < 2 || b"\r\n" != &remaining[..2] {
-        return (None, value);
+    if length > remaining.len() {
+        return Ok((None, value));
     }
-    (Some(Resp::BulkString(text)), &remaining[2..])
+
+    let (data, remaining) = remaining.split_at(length);
+    if data.len() != length || remaining.len() < 2 || b"\r\n" != &remaining[..2] {
+        return Ok((None, value));
+    }
+    let text = data.to_vec();
+
+    Ok((Some(Resp::BulkString(text)), &remaining[2..]))
 }
 
-fn parse_length(value: &[u8]) -> (Option<i64>, &[u8]) {
+fn parse_length(value: &[u8]) -> Result<(Option<i64>, &[u8]), Box<dyn error::Error>> {
     let pos = value.iter().position(|b| *b == b'\r');
     if pos.is_none() {
-        return (None, value);
+        return Ok((None, value));
     }
+
     let pos = pos.unwrap();
-    let (binary, remaining) = value.split_at(pos);
-    let binary_str = match std::str::from_utf8(binary) {
-        Ok(s) => s,
-        Err(_) => return (None, value),
-    };
-    let length = match binary_str.parse() {
-        Ok(l) => l,
-        Err(_) => return (None, value),
-    };
+    let (length_bytes, remaining) = value.split_at(pos);
+    let length_str = str::from_utf8(length_bytes)?;
+    let length = length_str.parse()?;
     if value.len() <= pos + 1 || value[pos + 1] != b'\n' {
-        return (None, value);
+        return Ok((None, value));
     }
-    (Some(length), &remaining[2..])
+    Ok((Some(length), &remaining[2..]))
 }
 
-fn parse_null(value: &[u8]) -> (Option<Resp>, &[u8]) {
+fn parse_null(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
     if value.len() < 5 {
-        return (None, value);
+        return Ok((None, value));
     }
     let null = &value[1..5];
     match null {
-        b"-1\r\n" => (Some(Resp::Null), &value[5..]),
-        _ => (None, &value[4..]),
+        b"-1\r\n" => Ok((Some(Resp::Null), &value[5..])),
+        _ => Err(Error::LengthMismatch),
     }
 }
 
