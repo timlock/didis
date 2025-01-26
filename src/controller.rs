@@ -26,7 +26,18 @@ impl Controller {
                 self.dictionary.set(key, value, None, false, None);
                 Resp::ok()
             }
-            Command::ConfigGet => Resp::Integer(0),
+            Command::ConfigGet(key) => {
+                if key == b"appendonly" {
+                    return Resp::Array(vec![
+                        Resp::BulkString(b"appendonly".to_vec()),
+                        Resp::BulkString(b"no".to_vec())
+                    ]);
+                }
+                Resp::Array(vec![
+                    Resp::BulkString(b"save".to_vec()),
+                    Resp::BulkString(b"".to_vec())
+                ])
+            },
             Command::Client => Resp::ok(),
         }
     }

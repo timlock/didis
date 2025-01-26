@@ -238,12 +238,29 @@ fn parse_set(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Erro
 }
 
 fn parse_config_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+    // Sub command like GET or SET
+    let _ = match iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(text) => text,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Err(Error::InvalidNumberOfArguments(0)),
+    };
+    
+    let key = match iter.next() {
+        Some(resp) => match resp {
+            Resp::BulkString(text) => text,
+            _ => return Err(Error::UnexpectedResp),
+        },
+        None => return Err(Error::InvalidNumberOfArguments(0)),
+    };
+    
     let (remaining, _) = iter.size_hint();
     if remaining > 0 {
         return Err(Error::InvalidNumberOfArguments(remaining));
     }
 
-    Ok(Command::ConfigGet)
+    Ok(Command::ConfigGet(key))
 }
 
 fn parse_client(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
