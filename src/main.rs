@@ -18,10 +18,11 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
         let mut disconnected = Vec::new();
         for (address, connection) in server.connections.iter_mut() {
             loop {
-                match connection.incoming.next() {
+                match connection.commands.next() {
                     Some(Ok(command)) => {
+                        println!("Received command: {:?}", command);
                         let response = controller.handle_command(command);
-                        // println!("Sending response {response}");
+                        println!("Sending response {response}");
                         let serialized = Vec::from(response);
                         if let Err(err) = connection.outgoing.write_all(&serialized) {
                             disconnected.push(address.clone());
@@ -30,17 +31,17 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
                         }
                     }
                     Some(Err(parser::Error::Io(err))) => {
+                        println!("Closed connection {address} due to IO error: {err}");
                         disconnected.push(address.clone());
-                        println!("Closed");
                         break;
                     }
                     Some(Err(err)) => {
+                        println!("Closed connection {address}: {err}");
                         if let Err(err) = connection.outgoing.write_all(err.to_string().as_bytes()) {
                             disconnected.push(address.clone());
                             println!("{err}");
                             break;
                         }
-                        println!("Could not obtain new connection: {err}")
                     }
                     None => break,
                 }
