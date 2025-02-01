@@ -1,7 +1,7 @@
 use crate::parser::resp::Resp;
 use std::{error, fmt, io};
 
-use super::{resp, resp_consuming};
+use super::{resp};
 
 pub struct RingDecoder<T> {
     resp_decoder: resp::RingDecoder<T>,
@@ -20,18 +20,19 @@ impl<T> Iterator for RingDecoder<T>
 where
     T: io::Read,
 {
-    type Item = Result<Command, Box<dyn error::Error>>;
+    type Item = Result<Command, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let resp = match self.resp_decoder.next() {
             Some(Ok(resp)) => resp,
-            Some(Err(err)) => return Some(Err(err)),
+            Some(Err(resp::Error::Io(err))) => return Some(Err(Error::Io(err))),
+            Some(Err(err)) => return Some(Err(Error::Parse(err))),
             None => return None,
         };
 
         match parse_command(resp) {
             Ok(command) => Some(Ok(command)),
-            Err(err) => Some(Err(Box::new(err))),
+            Err(err) => Some(Err(err)),
         }
     }
 }
@@ -53,50 +54,18 @@ impl<T> Iterator for Decoder<T>
 where
     T: io::Read,
 {
-    type Item = Result<Command, Box<dyn error::Error>>;
+    type Item = Result<Command, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let resp = match self.resp_decoder.next() {
             Some(Ok(resp)) => resp,
-            Some(Err(err)) => return Some(Err(err)),
+            Some(Err(err)) => return Some(Err(err.into())),
             None => return None,
         };
 
         match parse_command(resp) {
             Ok(command) => Some(Ok(command)),
-            Err(err) => Some(Err(Box::new(err))),
-        }
-    }
-}
-pub struct ConsumingDecoder<T> {
-    resp_decoder: resp_consuming::Decoder<T>,
-}
-
-impl<T> ConsumingDecoder<T>
-where
-    T: io::Read,
-{
-    pub fn new(resp_decoder: resp_consuming::Decoder<T>) -> Self {
-        Self { resp_decoder }
-    }
-}
-
-impl<T> Iterator for ConsumingDecoder<T>
-where
-    T: io::Read,
-{
-    type Item = Result<Command, super::Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let resp = match self.resp_decoder.next() {
-            Some(Ok(resp)) => resp,
-            Some(Err(err)) => return Some(Err(err)),
-            None => return None,
-        };
-
-        match parse_command(resp) {
-            Ok(command) => Some(Ok(command)),
-            Err(err) => Some(Err(super::Error::Parse(Box::new(err)))),
+            Err(err) => Some(Err(err)),
         }
     }
 }
@@ -108,11 +77,13 @@ pub enum Error {
     InvalidStart,
     MissingName,
     UnexpectedResp,
+    Parse(resp::Error),
+    Io(io::Error),
 }
 
 impl error::Error for Error {}
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnknownCommand(name) => write!(f, "Command {name} is unknown"),
             Error::InvalidNumberOfArguments(amount) => {
@@ -121,6 +92,16 @@ impl fmt::Display for Error {
             Error::InvalidStart => write!(f, "Invalid begin for a command"),
             Error::MissingName => write!(f, "Command lacks name"),
             Error::UnexpectedResp => write!(f, "Unexpected format"),
+            Error::Parse(err) => write!(f, "Parse error: {}", err),
+            Error::Io(err) => write!(f, "IO error: {}", err),
+        }
+    }
+}
+impl From<resp::Error> for Error {
+    fn from(value: resp::Error) -> Self {
+        match value {
+            resp::Error::Io(err) => Error::Io(err),
+            _ => Error::Parse(value),
         }
     }
 }

@@ -1,6 +1,6 @@
 use socket::TcpStreamNonBlocking;
 
-use crate::parser::{command, resp, resp_consuming};
+use crate::parser::{command, resp};
 use crate::server::listener::TcpListenerNonBlocking;
 use std::{cell, rc};
 use std::{
@@ -47,7 +47,6 @@ impl Server {
 pub struct Connection {
     pub incoming: command::RingDecoder<IoRef<TcpStreamNonBlocking>>,
     // pub incoming: command::Decoder<IoRef<TcpStreamNonBlocking>>,
-    // pub incoming: command::ConsumingDecoder<IoRef<TcpStreamNonBlocking>>,
     pub outgoing: IoRef<TcpStreamNonBlocking>,
 }
 impl Connection {
@@ -58,9 +57,6 @@ impl Connection {
 
         // let resp_decoder = resp::Decoder::new(socket_ref.clone());
         // let command_decoder = command::Decoder::new(resp_decoder);
-
-        // let consuming_resp_decoder = resp_consuming::Decoder::new(socket_ref.clone());
-        // let command_decoder = command::ConsumingDecoder::new(consuming_resp_decoder);
 
         Self {
             incoming: command_decoder,

@@ -4,6 +4,7 @@ use didis::parser;
 use didis::parser::resp::Resp;
 use didis::server::Server;
 use std::io::Write;
+use didis::parser::command;
 
 fn main() -> Result<(), std::io::Error> {
     let address = "127.0.0.1:6379";
@@ -36,7 +37,7 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
                         }
                     }
                     Some(Err(err)) => {
-                        if err.is::<std::io::Error>() {
+                        if let command::Error::Io(err) = err {
                             println!("Closed connection {address} due to IO error: {err}");
                             disconnected.push(address.clone());
                             break;
