@@ -1,5 +1,5 @@
-use std::{net, io};
 use crate::server::socket::TcpStreamNonBlocking;
+use std::{io, net};
 
 pub struct TcpListenerNonBlocking {
     inner: net::TcpListener,
@@ -23,4 +23,3 @@ impl TcpListenerNonBlocking {
         }
     }
 }
-

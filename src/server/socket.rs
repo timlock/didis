@@ -1,17 +1,19 @@
-use std::{io, net};
+use std::io;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
 pub struct TcpStreamNonBlocking {
-    inner: net::TcpStream,
+    inner: TcpStream,
 }
 
 impl TcpStreamNonBlocking {
-    pub fn new(stream: net::TcpStream) -> io::Result<Self> {
+    pub fn new(stream: TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         Ok(Self { inner: stream })
     }
 }
 
-impl io::Read for TcpStreamNonBlocking {
+impl Read for TcpStreamNonBlocking {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.inner.read(buf) {
             Ok(0) => Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
@@ -22,7 +24,7 @@ impl io::Read for TcpStreamNonBlocking {
     }
 }
 
-impl io::Write for TcpStreamNonBlocking {
+impl Write for TcpStreamNonBlocking {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
     }
@@ -32,10 +34,10 @@ impl io::Write for TcpStreamNonBlocking {
     }
 }
 
-impl TryFrom<net::TcpStream> for TcpStreamNonBlocking {
+impl TryFrom<TcpStream> for TcpStreamNonBlocking {
     type Error = io::Error;
 
-    fn try_from(value: net::TcpStream) -> Result<Self, Self::Error> {
+    fn try_from(value: TcpStream) -> Result<Self, Self::Error> {
         TcpStreamNonBlocking::new(value)
     }
 }

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     time::{Duration, SystemTime},
 };
+use crate::parser::command::{ExpireRule, OverwriteRule};
 
 pub struct Dictionary<V> {
     inner: HashMap<Vec<u8>, Entry<V>>,
@@ -26,13 +27,13 @@ impl<V> Dictionary<V> {
         &mut self,
         key: Vec<u8>,
         value: V,
-        remove_rule: Option<RemoveRule>,
+        overwrite_rule: Option<OverwriteRule>,
         get: bool,
         expire_rule: Option<ExpireRule>,
     ) -> Option<V> {
-        let can_set = match remove_rule {
-            Some(RemoveRule::NX) => !self.inner.contains_key(&key),
-            Some(RemoveRule::PX) => self.inner.contains_key(&key),
+        let can_set = match overwrite_rule {
+            Some(OverwriteRule::NotExists) => !self.inner.contains_key(&key),
+            Some(OverwriteRule::Exists) => self.inner.contains_key(&key),
             None => true,
         };
         if can_set {
@@ -66,26 +67,3 @@ impl<V> Entry<V> {
     }
 }
 
-pub enum RemoveRule {
-    NX,
-    PX,
-}
-
-pub enum ExpireRule {
-    EX(Duration),
-    PX(Duration),
-    EXAT(std::time::SystemTime),
-    PXAT(std::time::SystemTime),
-    KEEPTTL,
-}
-impl ExpireRule {
-    pub fn calculate_expire_time(&self) -> Option<SystemTime> {
-        match self {
-            ExpireRule::EX(s) => SystemTime::now().checked_add(*s),
-            ExpireRule::PX(ms) => SystemTime::now().checked_add(*ms),
-            ExpireRule::EXAT(t) => Some(*t),
-            ExpireRule::PXAT(t) => Some(*t),
-            ExpireRule::KEEPTTL => None,
-        }
-    }
-}

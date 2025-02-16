@@ -17,7 +17,7 @@ pub enum Error {
 
 impl error::Error for Error {}
 
-impl fmt::Display for Error {
+impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Utf8(e) => e.fmt(f),

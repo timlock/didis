@@ -8,9 +8,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(dictionary: Dictionary<Vec<u8>>) -> Self {
-        Self {
-            dictionary,
-        }
+        Self { dictionary }
     }
 
     pub fn handle_command(&mut self, command: Command) -> Resp {
@@ -22,22 +20,22 @@ impl Controller {
                 Some(value) => Resp::BulkString(value.clone()),
                 None => Resp::Null,
             },
-            Command::Set { key, value } => {
-                self.dictionary.set(key, value, None, false, None);
+            Command::Set { key, value, overwrite_rule, get, expire_rule } => {
+                self.dictionary.set(key, value, overwrite_rule, false, expire_rule);
                 Resp::ok()
             }
             Command::ConfigGet(key) => {
                 if key == b"appendonly" {
                     return Resp::Array(vec![
                         Resp::BulkString(b"appendonly".to_vec()),
-                        Resp::BulkString(b"no".to_vec())
+                        Resp::BulkString(b"no".to_vec()),
                     ]);
                 }
                 Resp::Array(vec![
                     Resp::BulkString(b"save".to_vec()),
-                    Resp::BulkString(b"".to_vec())
+                    Resp::BulkString(b"".to_vec()),
                 ])
-            },
+            }
             Command::Client => Resp::ok(),
         }
     }

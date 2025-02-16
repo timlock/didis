@@ -2,7 +2,9 @@ use socket::TcpStreamNonBlocking;
 
 use crate::parser::{command, resp};
 use crate::server::listener::TcpListenerNonBlocking;
-use std::{cell, rc};
+use std::cell::RefCell;
+use std::io::{Read, Write};
+use std::rc::Rc;
 use std::{
     collections::HashMap,
     io::{self},
@@ -72,41 +74,41 @@ impl From<TcpStreamNonBlocking> for Connection {
 }
 
 pub struct IoRef<T> {
-    inner: rc::Rc<cell::RefCell<T>>,
+    inner: Rc<RefCell<T>>,
 }
 
 impl<T> IoRef<T>
 where
-    T: io::Read + io::Write,
+    T: Read + Write,
 {
     pub fn new(stream: T) -> Self {
         Self {
-            inner: rc::Rc::new(cell::RefCell::new(stream)),
+            inner: Rc::new(RefCell::new(stream)),
         }
     }
 }
 
 impl<T> From<T> for IoRef<T>
 where
-    T: io::Read + io::Write,
+    T: Read + Write,
 {
     fn from(value: T) -> Self {
         IoRef::new(value)
     }
 }
 
-impl<T> io::Read for IoRef<T>
+impl<T> Read for IoRef<T>
 where
-    T: io::Read + io::Write,
+    T: Read + Write,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.borrow_mut().read(buf)
     }
 }
 
-impl<T> io::Write for IoRef<T>
+impl<T> Write for IoRef<T>
 where
-    T: io::Read + io::Write,
+    T: Read + Write,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.borrow_mut().write(buf)

@@ -1,10 +1,9 @@
 use didis::controller::Controller;
 use didis::dictionary::Dictionary;
-use didis::parser;
+use didis::parser::command;
 use didis::parser::resp::Resp;
 use didis::server::Server;
 use std::io::Write;
-use didis::parser::command;
 
 fn main() -> Result<(), std::io::Error> {
     let address = "127.0.0.1:6379";
