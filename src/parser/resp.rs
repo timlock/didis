@@ -64,7 +64,7 @@ impl Resp {
 }
 
 impl Display for Resp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", String::from(self))
     }
 }
@@ -303,9 +303,9 @@ fn parse_array(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
     }
 
     if length.unwrap() == -1 {
-        match parse_null(value)? {
-            (Some(null), r) => return Ok((Some(null), r)),
-            _ => return Ok((None, value)),
+        return match parse_null(value)? {
+            (Some(null), r) => Ok((Some(null), r)),
+            _ => Ok((None, value)),
         }
     }
 
@@ -335,9 +335,9 @@ fn parse_bulk_string(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
         return Ok((None, value));
     }
     if length.unwrap() == -1 {
-        match parse_null(value)? {
-            (Some(null), r) => return Ok((Some(null), r)),
-            _ => return Ok((None, value)),
+        return match parse_null(value)? {
+            (Some(null), r) => Ok((Some(null), r)),
+            _ => Ok((None, value)),
         }
     }
     let length = length.unwrap() as usize;

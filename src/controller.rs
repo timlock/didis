@@ -20,9 +20,22 @@ impl Controller {
                 Some(value) => Resp::BulkString(value.clone()),
                 None => Resp::Null,
             },
-            Command::Set { key, value, overwrite_rule, get, expire_rule } => {
-                self.dictionary.set(key, value, overwrite_rule, false, expire_rule);
-                Resp::ok()
+            Command::Set {
+                key,
+                value,
+                overwrite_rule,
+                get,
+                expire_rule,
+            } => {
+                match self
+                    .dictionary
+                    .set(key, value, overwrite_rule, get, expire_rule)
+                {
+                    Ok(Some(old_value)) => Resp::BulkString(old_value),
+                    Ok(None) if !get => Resp::ok(),
+                    Ok(None) => Resp::Null,
+                    Err(_) => Resp::Null,
+                }
             }
             Command::ConfigGet(key) => {
                 if key == b"appendonly" {

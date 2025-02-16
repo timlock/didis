@@ -1,6 +1,5 @@
 use super::resp;
 use crate::parser::resp::Resp;
-use std::ascii::AsciiExt;
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
 use std::{error, fmt, io};
@@ -152,7 +151,7 @@ fn parse_command(resp: Resp) -> Result<Command, Error> {
     }
 }
 
-fn parse_ping(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+fn parse_ping(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
             Resp::BulkString(text) => text,
@@ -169,7 +168,7 @@ fn parse_ping(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Err
     Ok(Command::Ping(Some(text)))
 }
 
-fn parse_echo(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+fn parse_echo(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
             Resp::BulkString(text) => text,
@@ -186,7 +185,7 @@ fn parse_echo(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Err
     Ok(Command::Echo(text))
 }
 
-fn parse_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+fn parse_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
             Resp::BulkString(text) => text,
@@ -279,7 +278,7 @@ impl TryFrom<&[u8]> for OverwriteRule {
     }
 }
 
-fn parse_set(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+fn parse_set(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
             Resp::BulkString(text) => text,
@@ -324,7 +323,7 @@ fn parse_set(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Erro
     })
 }
 
-fn parse_config_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+fn parse_config_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     // Sub command like GET or SET
     let _ = match iter.next() {
         Some(resp) => match resp {
@@ -350,7 +349,7 @@ fn parse_config_get(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Comman
     Ok(Command::ConfigGet(key))
 }
 
-fn parse_client(mut iter: impl Iterator<Item = resp::Resp>) -> Result<Command, Error> {
+fn parse_client(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     let (remaining, _) = iter.size_hint();
     if remaining > 0 {
         return Err(Error::InvalidNumberOfArguments(remaining));
