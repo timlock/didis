@@ -121,6 +121,7 @@ pub enum Command {
     },
     ConfigGet(String),
     Client,
+    Exists(Vec<String>),
 }
 
 fn parse_command(resp: Resp) -> Result<Command, Error> {
@@ -144,6 +145,7 @@ fn parse_command(resp: Resp) -> Result<Command, Error> {
         "SET" => parse_set(segment_iter),
         "CONFIG" => parse_config_get(segment_iter),
         "CLIENT" => parse_client(segment_iter),
+        "EXISTS" => parse_exists(segment_iter),
         _ => Err(Error::UnknownCommand(name)),
     }
 }
@@ -346,7 +348,7 @@ fn parse_config_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Err
     Ok(Command::ConfigGet(key))
 }
 
-fn parse_client(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_client(iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     let (remaining, _) = iter.size_hint();
     if remaining > 0 {
         return Err(Error::InvalidNumberOfArguments(remaining));
@@ -354,6 +356,21 @@ fn parse_client(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> 
 
     Ok(Command::Client)
 }
+fn parse_exists(iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+    let mut keys = Vec::new();
+
+    for next in iter {
+        match next {
+            Resp::BulkString(text) => {
+                keys.push(text);
+            }
+            _ => return Err(Error::UnexpectedResp),
+        }
+    }
+
+    Ok(Command::Exists(keys))
+}
+
 mod tests {
     use super::*;
 

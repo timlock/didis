@@ -50,6 +50,16 @@ impl Controller {
                 ])
             }
             Command::Client => Resp::ok(),
+            Command::Exists(keys) => {
+                let mut count = 0;
+                for key in keys {
+                    if self.dictionary.get(&key).is_some() {
+                        count += 1;
+                    }
+                }
+
+                Resp::Integer(count)
+            }
         }
     }
 }
