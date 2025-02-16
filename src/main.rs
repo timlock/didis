@@ -43,7 +43,7 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
                         }
 
                         println!("Closed connection {address}: {err}");
-                        let resp_error = Resp::SimpleError(err.to_string().as_bytes().to_vec());
+                        let resp_error = Resp::SimpleError(err.to_string());
                         if let Err(err) = connection.outgoing.write_all(&Vec::from(resp_error)) {
                             disconnected.push(address.clone());
                             println!("{err}");

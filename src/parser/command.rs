@@ -31,7 +31,6 @@ where
             None => return None,
         };
 
-        println!("resp: {}", resp);
         match parse_command(resp) {
             Ok(command) => Some(Ok(command)),
             Err(err) => Some(Err(err)),
@@ -110,17 +109,17 @@ impl From<resp::Error> for Error {
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Command {
-    Ping(Option<Vec<u8>>),
-    Echo(Vec<u8>),
-    Get(Vec<u8>),
+    Ping(Option<String>),
+    Echo(String),
+    Get(String),
     Set {
-        key: Vec<u8>,
-        value: Vec<u8>,
+        key: String,
+        value: String,
         overwrite_rule: Option<OverwriteRule>,
         get: bool,
         expire_rule: Option<ExpireRule>,
     },
-    ConfigGet(Vec<u8>),
+    ConfigGet(String),
     Client,
 }
 
@@ -138,16 +137,14 @@ fn parse_command(resp: Resp) -> Result<Command, Error> {
         None => return Err(Error::MissingName),
     };
 
-    match name.to_ascii_uppercase().as_slice() {
-        b"PING" => parse_ping(segment_iter),
-        b"ECHO" => parse_echo(segment_iter),
-        b"GET" => parse_get(segment_iter),
-        b"SET" => parse_set(segment_iter),
-        b"CONFIG" => parse_config_get(segment_iter),
-        b"CLIENT" => parse_client(segment_iter),
-        _ => Err(Error::UnknownCommand(
-            String::from_utf8_lossy(&name).into_owned(),
-        )),
+    match name.to_uppercase().as_str() {
+        "PING" => parse_ping(segment_iter),
+        "ECHO" => parse_echo(segment_iter),
+        "GET" => parse_get(segment_iter),
+        "SET" => parse_set(segment_iter),
+        "CONFIG" => parse_config_get(segment_iter),
+        "CLIENT" => parse_client(segment_iter),
+        _ => Err(Error::UnknownCommand(name)),
     }
 }
 
@@ -304,7 +301,7 @@ fn parse_set(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
                 let uppercase = text.to_ascii_uppercase();
                 if let Ok(r) = OverwriteRule::try_from(uppercase.as_ref()) {
                     overwrite_rule = Some(r);
-                } else if uppercase == b"GET" {
+                } else if uppercase == "GET" {
                     get = true;
                 } else if let Ok(p) = ExpireRule::try_from(uppercase.as_ref()) {
                     expire_rule = Some(p);
@@ -362,7 +359,7 @@ mod tests {
 
     #[test]
     fn parse_ping() -> Result<(), String> {
-        let name = b"PING".to_vec();
+        let name = "PING".to_string();
         let resp = Resp::Array(vec![Resp::BulkString(name)]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(Command::Ping(None), command);
@@ -370,8 +367,8 @@ mod tests {
     }
     #[test]
     fn parse_echo() -> Result<(), String> {
-        let name = b"ECHO".to_vec();
-        let arg = b"test".to_vec();
+        let name = "ECHO".to_string();
+        let arg = "test".to_string();
         let resp = Resp::Array(vec![Resp::BulkString(name), Resp::BulkString(arg.clone())]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(Command::Echo(arg), command);
@@ -381,18 +378,18 @@ mod tests {
     #[test]
     fn parse_set() -> Result<(), String> {
         let resp = Resp::Array(vec![
-            Resp::BulkString(b"SET".to_vec()),
-            Resp::BulkString(b"key".to_vec()),
-            Resp::BulkString(b"value".to_vec()),
-            Resp::BulkString(b"XX".to_vec()),
-            Resp::BulkString(b"GET".to_vec()),
-            Resp::BulkString(b"EX 10".to_vec()),
+            Resp::BulkString("SET".to_string()),
+            Resp::BulkString("key".to_string()),
+            Resp::BulkString("value".to_string()),
+            Resp::BulkString("XX".to_string()),
+            Resp::BulkString("GET".to_string()),
+            Resp::BulkString("EX 10".to_string()),
         ]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(
             Command::Set {
-                key: b"key".to_vec(),
-                value: b"value".to_vec(),
+                key: "key".to_string(),
+                value: "value".to_string(),
                 overwrite_rule: Some(OverwriteRule::Exists),
                 get: true,
                 expire_rule: Some(ExpireRule::ExpiresInSecs(Duration::from_secs(10))),
@@ -405,15 +402,15 @@ mod tests {
     #[test]
     fn parse_set_no_options() -> Result<(), String> {
         let resp = Resp::Array(vec![
-            Resp::BulkString(b"SET".to_vec()),
-            Resp::BulkString(b"key".to_vec()),
-            Resp::BulkString(b"value".to_vec()),
+            Resp::BulkString("SET".to_string()),
+            Resp::BulkString("key".to_string()),
+            Resp::BulkString("value".to_string()),
         ]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(
             Command::Set {
-                key: b"key".to_vec(),
-                value: b"value".to_vec(),
+                key: "key".to_string(),
+                value: "value".to_string(),
                 overwrite_rule: None,
                 get: false,
                 expire_rule: None,

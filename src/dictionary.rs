@@ -2,33 +2,33 @@ use crate::parser::command::{ExpireRule, OverwriteRule};
 use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, error, time::SystemTime};
 
-pub struct Dictionary<V> {
-    inner: HashMap<Vec<u8>, Entry<V>>,
+pub struct Dictionary {
+    inner: HashMap<String, Entry>,
 }
-impl<V> Dictionary<V> {
+impl Dictionary {
     pub fn new() -> Self {
         Self {
             inner: HashMap::new(),
         }
     }
-    pub fn get(&self, key: &[u8]) -> Option<&V> {
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.inner
             .get(key)
             .map(|value| match value.expires_at {
-                Some(t) if t > SystemTime::now() => Some(&value.value),
+                Some(t) if t > SystemTime::now() => Some(value.value.as_str()),
                 Some(_) => None,
-                None => Some(&value.value),
+                None => Some(value.value.as_str()),
             })
             .flatten()
     }
     pub fn set(
         &mut self,
-        key: Vec<u8>,
-        value: V,
+        key: String,
+        value: String,
         overwrite_rule: Option<OverwriteRule>,
         get: bool,
         expire_rule: Option<ExpireRule>,
-    ) -> Result<Option<V>, Error> {
+    ) -> Result<Option<String>, Error> {
         match overwrite_rule {
             Some(OverwriteRule::NotExists) if self.inner.contains_key(&key) => {
                 return Err(Error::OverrideConflict)
@@ -75,13 +75,13 @@ impl Display for Error {
 
 impl error::Error for Error {}
 
-struct Entry<V> {
-    value: V,
+struct Entry {
+    value: String,
     expires_at: Option<SystemTime>,
 }
 
-impl<V> Entry<V> {
-    fn new(value: V, expires_at: Option<SystemTime>) -> Self {
+impl Entry {
+    fn new(value: String, expires_at: Option<SystemTime>) -> Self {
         Self { value, expires_at }
     }
 }

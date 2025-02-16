@@ -3,21 +3,21 @@ use crate::parser::command::Command;
 use crate::parser::resp::Resp;
 
 pub struct Controller {
-    dictionary: Dictionary<Vec<u8>>,
+    dictionary: Dictionary,
 }
 
 impl Controller {
-    pub fn new(dictionary: Dictionary<Vec<u8>>) -> Self {
+    pub fn new(dictionary: Dictionary) -> Self {
         Self { dictionary }
     }
 
     pub fn handle_command(&mut self, command: Command) -> Resp {
         match command {
-            Command::Ping(None) => Resp::SimpleString(b"PONG".to_vec()),
+            Command::Ping(None) => Resp::SimpleString("PONG".to_string()),
             Command::Ping(Some(text)) => Resp::BulkString(text),
             Command::Echo(s) => Resp::BulkString(s),
             Command::Get(key) => match self.dictionary.get(&key) {
-                Some(value) => Resp::BulkString(value.clone()),
+                Some(value) => Resp::BulkString(value.to_string()),
                 None => Resp::Null,
             },
             Command::Set {
@@ -38,15 +38,15 @@ impl Controller {
                 }
             }
             Command::ConfigGet(key) => {
-                if key == b"appendonly" {
+                if key == "appendonly" {
                     return Resp::Array(vec![
-                        Resp::BulkString(b"appendonly".to_vec()),
-                        Resp::BulkString(b"no".to_vec()),
+                        Resp::BulkString("appendonly".to_string()),
+                        Resp::BulkString("no".to_string()),
                     ]);
                 }
                 Resp::Array(vec![
-                    Resp::BulkString(b"save".to_vec()),
-                    Resp::BulkString(b"".to_vec()),
+                    Resp::BulkString("save".to_string()),
+                    Resp::BulkString("".to_string()),
                 ])
             }
             Command::Client => Resp::ok(),
