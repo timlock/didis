@@ -8,7 +8,7 @@ use std::io::Write;
 use didis::async_io;
 
 fn main() -> Result<(), std::io::Error> {
-    async_io::macos::test();
+    async_io::test();
     // return async_io::test_uring();
     let address = "127.0.0.1:6379";
     let server = Server::new(address)?;

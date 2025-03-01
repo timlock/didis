@@ -1,4 +1,9 @@
 #[cfg(target_os = "linux")]
-pub mod linux;
+mod linux;
+#[cfg(target_os = "linux")]
+pub use crate::async_io::linux::*;
+
 #[cfg(target_os = "macos")]
-pub mod macos;
+mod macos;
+#[cfg(target_os = "macos")]
+pub use crate::async_io::macos::*;

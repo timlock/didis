@@ -7,3 +7,5 @@ pub fn test() {
     }
     println!("kqueue created: {}", kq);
 }
+
+pub struct IO{}
