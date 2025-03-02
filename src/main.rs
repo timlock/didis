@@ -7,8 +7,8 @@ use didis::server::Server;
 use std::io::Write;
 use didis::async_io;
 
-fn main() -> Result<(), std::io::Error> {
-    async_io::test();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    async_io::IO::new()?;
     // return async_io::test_uring();
     let address = "127.0.0.1:6379";
     let server = Server::new(address)?;
@@ -17,7 +17,7 @@ fn main() -> Result<(), std::io::Error> {
     println!("Starting server on {}", address);
     let result = run(server, worker);
     println!("Server stopped");
-    result
+    result.map_err(|e| e.into())
 }
 
 fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Error> {
