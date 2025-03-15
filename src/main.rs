@@ -8,8 +8,6 @@ use std::io::Write;
 use didis::async_io;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    async_io::IO::new()?;
-    // return async_io::test_uring();
     let address = "127.0.0.1:6379";
     let server = Server::new(address)?;
     let worker = Controller::new(Dictionary::new());
