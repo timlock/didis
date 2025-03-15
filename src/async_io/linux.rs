@@ -16,7 +16,7 @@ const QUEUE_DEPTH: u32 = 256;
 const BUFFER_SIZE: usize = 1024;
 
 enum Task {
-    Accept((*mut sockaddr, *mut usize)),
+    Accept((*mut sockaddr, *mut socklen_t)),
     Close,
     Receive(*mut u8),
     Send(*const u8),
@@ -68,7 +68,7 @@ impl IO {
         })
     }
 
-    pub fn accept<C>(&mut self, fd: RawFd, callback :C) -> Result<(), io::Error>
+    pub fn accept<C>(&mut self, fd: RawFd, callback: C) -> Result<(), io::Error>
     where
         C: FnMut((*mut sockaddr, *mut usize)) + Send + 'static,
     {
@@ -78,11 +78,11 @@ impl IO {
         }
 
         let sock_address = Box::into_raw(Box::new(unsafe { zeroed() }));
-        let sock_address_len = Box::into_raw(Box::new(size_of::<sockaddr>()));
+        let sock_address_len = Box::into_raw(Box::new(size_of::<sockaddr>() as socklen_t));
 
         let task_id = self.add_task(Task::Accept((sock_address, sock_address_len)), fd);
         unsafe {
-            io_uring_prep_accept(sqe, fd, sock_address, sock_address_len as *mut _, 0);
+            io_uring_prep_accept(sqe, fd, sock_address, sock_address_len, 0);
             (*sqe).user_data = task_id;
         }
         Ok(())
@@ -143,12 +143,32 @@ impl IO {
         }
     }
 
+    pub fn poll(&mut self) {
+        if let Some(cqe) = self.peek_completion() {
+            let id = cqe.user_data as u64;
+            match self.tasks.remove(&id) {
+                Some(task) => {
+                    match task.task {
+                        Task::Accept((address, address_len)) => {
+                            
+                        }
+                        Task::Close => {}
+                        Task::Receive(_) => {}
+                        Task::Send(_) => {}
+                    }
+                }
+                None => {
+                    println!("Received completion for unknown task id {}", id);
+                }
+            };
+        }
+    }
+
     fn peek_completion(&mut self) -> Option<io_uring_cqe> {
         let mut cqe: *mut io_uring_cqe = null_mut();
         let ret = unsafe { io_uring_peek_cqe(&mut self.ring, &mut cqe) };
 
         if ret < 0 || cqe.is_null() {
-            let last_err = io::Error::last_os_error();
             None
         } else {
             let result = unsafe { ptr::read(cqe) };
@@ -179,26 +199,37 @@ impl Drop for IO {
 
 mod tests {
     use super::*;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
+    use std::str::FromStr;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn accept() -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = TcpListener::bind("127.0.0.1:8888")?;
+        listener.set_nonblocking(true)?;
+
         let mut io = IO::new(QUEUE_DEPTH)?;
         io.accept(listener.as_raw_fd(), |(address, len)| {
-
+            println!("accept client");
         })?;
         io.submit()?;
 
-        let handler = thread::spawn(||{
-            let mut stream = TcpStream::connect("127.0.0.1:0").unwrap();
-            return 
+        let address = SocketAddr::from_str("127.0.0.1:8888")?;
+        let handler = thread::spawn(move || {
+            println!("Connect to server");
+            let result = TcpStream::connect_timeout(&address, Duration::from_secs(5));
+            match result {
+                // match TcpStream::connect(&address) {
+                Ok(s) => println!("CONNECTED"),
+                Err(err) => println!("Could not conenct {err}"),
+            };
         });
-        
+
         io.peek_completion();
-        
+
+        // thread::sleep(Duration::from_secs(100));
         handler.join().unwrap();
 
         Ok(())
