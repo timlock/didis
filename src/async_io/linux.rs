@@ -15,44 +15,53 @@ const QUEUE_DEPTH: u32 = 256;
 
 const BUFFER_SIZE: usize = 1024;
 
-enum Task {
-    Accept((*mut sockaddr, *mut socklen_t)),
+struct Accept<'a> {
+    address: *mut sockaddr,
+    address_len: *mut socklen_t,
+    callback_fn: Box<dyn FnMut((sockaddr, socklen_t)) + Send + 'a>,
+}
+
+impl<'a> Accept<'a> {
+    fn new(
+        address: *mut sockaddr,
+        address_len: *mut socklen_t,
+        callback_fn: impl FnMut((sockaddr, socklen_t)) + Send + 'a,
+    ) -> Self {
+        Self {
+            address,
+            address_len,
+            callback_fn: Box::new(callback_fn),
+        }
+    }
+    fn complete(mut self) {
+        unsafe {
+            let address = Box::from_raw(self.address);
+            let address_len = Box::from_raw(self.address_len);
+            (self.callback_fn)((*address, *address_len));
+        }
+    }
+}
+
+enum Task<'a> {
+    Accept(Accept<'a>),
     Close,
     Receive(*mut u8),
     Send(*const u8),
 }
 
-impl Drop for Task {
-    fn drop(&mut self) {
-        match self {
-            Task::Accept((address, address_len)) => unsafe {
-                let _ = Box::from_raw(address);
-                let _ = Box::from_raw(address_len);
-            },
-            Task::Receive(buffer) => unsafe {
-                let _ = Box::from_raw(buffer);
-            },
-            Task::Send(buffer) => unsafe {
-                let _ = Box::from_raw(buffer);
-            },
-            _ => {}
-        }
-    }
-}
-
-struct TaskData {
-    task: Task,
+struct TaskData<'a> {
+    task: Task<'a>,
     file_descriptor: RawFd,
 }
 
-pub struct IO {
+pub struct IO<'a> {
     ring: io_uring,
-    task_queue: VecDeque<TaskData>,
-    tasks: HashMap<u64, TaskData>,
+    task_queue: VecDeque<TaskData<'a>>,
+    tasks: HashMap<u64, TaskData<'a>>,
     next_id: u64,
 }
 
-impl IO {
+impl<'a> IO<'a> {
     pub fn new(queue_depth: u32) -> Result<Self, io::Error> {
         let mut ring: io_uring = unsafe { zeroed() };
         let ret = unsafe { io_uring_queue_init(queue_depth, &mut ring, 0) };
@@ -68,23 +77,28 @@ impl IO {
         })
     }
 
-    pub fn accept<C>(&mut self, fd: RawFd, callback: C) -> Result<(), io::Error>
-    where
-        C: FnMut((*mut sockaddr, *mut usize)) + Send + 'static,
-    {
+    pub fn accept(
+        &mut self,
+        fd: RawFd,
+        callback_fn: impl FnMut((sockaddr, socklen_t)) + Send + 'a,
+    ) -> Result<(), io::Error> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
         }
 
-        let sock_address = Box::into_raw(Box::new(unsafe { zeroed() }));
-        let sock_address_len = Box::into_raw(Box::new(size_of::<sockaddr>() as socklen_t));
+        let sock_address: *mut sockaddr = Box::into_raw(Box::new(unsafe { zeroed() }));
+        let sock_address_len: *mut socklen_t = Box::into_raw(Box::new(size_of::<sockaddr>() as _));
 
-        let task_id = self.add_task(Task::Accept((sock_address, sock_address_len)), fd);
+        let task_id = self.add_task(
+            Task::Accept(Accept::new(sock_address, sock_address_len, callback_fn)),
+            fd,
+        );
         unsafe {
             io_uring_prep_accept(sqe, fd, sock_address, sock_address_len, 0);
             (*sqe).user_data = task_id;
         }
+
         Ok(())
     }
 
@@ -147,16 +161,14 @@ impl IO {
         if let Some(cqe) = self.peek_completion() {
             let id = cqe.user_data as u64;
             match self.tasks.remove(&id) {
-                Some(task) => {
-                    match task.task {
-                        Task::Accept((address, address_len)) => {
-                            
-                        }
-                        Task::Close => {}
-                        Task::Receive(_) => {}
-                        Task::Send(_) => {}
+                Some(task) => match task.task {
+                    Task::Accept(accept) => {
+                        accept.complete();
                     }
-                }
+                    Task::Close => {}
+                    Task::Receive(_) => {}
+                    Task::Send(_) => {}
+                },
                 None => {
                     println!("Received completion for unknown task id {}", id);
                 }
@@ -177,7 +189,7 @@ impl IO {
         }
     }
 
-    fn add_task(&mut self, task: Task, fd: RawFd) -> u64 {
+    fn add_task(&mut self, task: Task<'a>, fd: RawFd) -> u64 {
         let user_data = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.tasks.insert(
@@ -191,7 +203,7 @@ impl IO {
     }
 }
 
-impl Drop for IO {
+impl<'a> Drop for IO<'a> {
     fn drop(&mut self) {
         unsafe { io_uring_queue_exit(&mut self.ring) };
     }
@@ -211,8 +223,10 @@ mod tests {
         listener.set_nonblocking(true)?;
 
         let mut io = IO::new(QUEUE_DEPTH)?;
+        let mut a = 1;
         io.accept(listener.as_raw_fd(), |(address, len)| {
-            println!("accept client");
+            println!("accept client {:?} {}", address, len);
+            let b = 1 + a;
         })?;
         io.submit()?;
 
@@ -221,76 +235,16 @@ mod tests {
             println!("Connect to server");
             let result = TcpStream::connect_timeout(&address, Duration::from_secs(5));
             match result {
-                // match TcpStream::connect(&address) {
                 Ok(s) => println!("CONNECTED"),
                 Err(err) => println!("Could not conenct {err}"),
             };
         });
 
-        io.peek_completion();
-
-        // thread::sleep(Duration::from_secs(100));
         handler.join().unwrap();
 
+        io.poll();
+
+        println!("{}", a);
         Ok(())
     }
-}
-pub fn test_uring() -> io::Result<()> {
-    let queue_depth: u32 = 1;
-    let mut ring = setup_io_uring(queue_depth)?;
-
-    println!("Submitting NOP operation");
-    submit_noop(&mut ring)?;
-
-    println!("Waiting for completion");
-    wait_for_completion(&mut ring)?;
-
-    unsafe { io_uring_queue_exit(&mut ring) };
-    Ok(())
-}
-
-fn setup_io_uring(queue_depth: u32) -> io::Result<io_uring> {
-    let mut ring: io_uring = unsafe { zeroed() };
-    let ret = unsafe { io_uring_queue_init(queue_depth, &mut ring, 0) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(ring)
-}
-
-fn submit_noop(ring: &mut io_uring) -> io::Result<()> {
-    unsafe {
-        let sqe = io_uring_get_sqe(ring);
-        if sqe.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
-        }
-
-        io_uring_prep_nop(sqe);
-        (*sqe).user_data = 0x88;
-
-        let ret = io_uring_submit(ring);
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    Ok(())
-}
-
-fn wait_for_completion(ring: &mut io_uring) -> io::Result<()> {
-    let mut cqe: *mut io_uring_cqe = null_mut();
-    let ret = unsafe { io_uring_wait_cqe(ring, &mut cqe) };
-
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    unsafe {
-        println!("NOP completed with result: {}", (*cqe).res);
-        println!("User data: 0x{:x}", (*cqe).user_data);
-        io_uring_cqe_seen(ring, cqe);
-    }
-
-    Ok(())
 }
