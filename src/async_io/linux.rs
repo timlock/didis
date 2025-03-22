@@ -188,7 +188,8 @@ impl IO {
                 Some(task) => match task.task {
                     Task::Accept(accept) => {
                         let socket = unsafe { TcpStream::from_raw_fd(cqe.res) };
-                        results.push(Res::Accept(socket))
+                        
+                        results.push(Res::Accept(socket));
                     }
                     Task::Close => {}
                     Task::Receive(receive) => {
@@ -196,14 +197,16 @@ impl IO {
                             let slice = std::slice::from_raw_parts_mut(receive.buffer, cqe.res as usize);
                             Box::from_raw(slice)
                         };
-                        results.push(Res::Receive(buffer))
+                        
+                        results.push(Res::Receive(buffer));
                     }
                     Task::Send(send) => {
                         let buffer = unsafe {
                             let slice = std::slice::from_raw_parts_mut(send.buffer, send.capacity);
                             Box::from_raw(slice)
                         };
-                        results.push(Res::Send((buffer, cqe.res as usize));
+                        
+                        results.push(Res::Send((buffer, cqe.res as usize)));
                     }
                 },
                 None => {
@@ -211,7 +214,7 @@ impl IO {
                 }
             };
         }
-        
+
         results
     }
 
@@ -262,9 +265,7 @@ mod tests {
         listener.set_nonblocking(true)?;
 
         let mut io = IO::new(QUEUE_DEPTH)?;
-        io.accept(listener.as_raw_fd(), |socket| {
-            println!("accept client {} ", socket.local_addr().unwrap());
-        })?;
+        io.accept(listener.as_raw_fd())?;
         io.submit()?;
 
         let address = SocketAddr::from_str("127.0.0.1:8888")?;
@@ -279,7 +280,8 @@ mod tests {
 
         handler.join().unwrap();
 
-        io.poll();
+        let results = io.poll();
+        assert_eq!(1, results.len());
 
         Ok(())
     }
