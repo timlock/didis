@@ -33,13 +33,13 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
                         let serialized = Vec::from(response);
                         if let Err(err) = connection.outgoing.write_all(&serialized) {
                             disconnected.push(address.clone());
-                            println!("{err}");
+                            eprintln!("{err}");
                             break;
                         }
                     }
                     Some(Err(err)) => {
                         if let command::Error::Io(err) = err {
-                            println!("Closed connection {address} due to IO error: {err}");
+                            eprintln!("Closed connection {address} due to IO error: {err}");
                             disconnected.push(address.clone());
                             break;
                         }
@@ -48,7 +48,7 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), std::io::Er
                         let resp_error = Resp::SimpleError(err.to_string());
                         if let Err(err) = connection.outgoing.write_all(&Vec::from(resp_error)) {
                             disconnected.push(address.clone());
-                            println!("{err}");
+                            eprintln!("{err}");
                             break;
                         }
                     }
