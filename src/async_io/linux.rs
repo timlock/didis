@@ -8,8 +8,10 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 use std::collections::{HashMap, VecDeque};
 use std::mem::zeroed;
 use std::net::TcpStream;
+use std::ops::{Add, Sub};
 use std::os::fd::{FromRawFd, RawFd};
 use std::ptr::null_mut;
+use std::time::Duration;
 use std::{io, ptr};
 
 const QUEUE_DEPTH: u32 = 256;
@@ -227,6 +229,37 @@ impl IO {
             let result = unsafe { ptr::read(cqe) };
             unsafe { io_uring_cqe_seen(&mut self.ring, cqe) };
             Ok(result)
+        }
+    }
+
+    fn wait_for_completion_with_timeout(
+        &mut self,
+        duration: Duration,
+    ) -> io::Result<Option<io_uring_cqe>> {
+        let timespec = unsafe {
+            let time = null_mut();
+            let ret = clock_gettime(CLOCK_MONOTONIC as _, time);
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            *time
+        };
+
+        let mut timeout = __kernel_timespec {
+            tv_sec: (timespec.tv_sec as u64 + duration.as_secs()) as _,
+            tv_nsec: (timespec.tv_nsec as u32 + duration.subsec_nanos()) as _,
+        };
+
+        let mut cqe: *mut io_uring_cqe = null_mut();
+        let ret =
+            unsafe { io_uring_wait_cqe_timeout(&mut self.ring, &mut cqe, &mut timeout as *mut _) };
+
+        if ret < 0 || cqe.is_null() {
+            Err(io::Error::from_raw_os_error(-ret))
+        } else {
+            let result = unsafe { ptr::read(cqe) };
+            unsafe { io_uring_cqe_seen(&mut self.ring, cqe) };
+            Ok(Some(result))
         }
     }
 
