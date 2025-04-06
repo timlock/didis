@@ -1,32 +1,11 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
-use bindgen;
 
 fn main() {
     if cfg!(target_os = "linux") {
         generate_io_uring_bindings()
-    } else if cfg!(target_os = "macos") {
-        generate_kqueue_bindings()
     }
-}
-
-fn generate_kqueue_bindings() {
-    let bindings = bindgen::Builder::default()
-        .header("wrapper_kqueue.h")
-        .allowlist_function("kevent")
-        .allowlist_function("kqueue")
-        .allowlist_var("EVFILT_.*")
-        .allowlist_var("EV_.*")
-        .generate()
-        .map_err(|err| println!("{:?}", err))
-        .expect("Unable to generate bindings");
-
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Couldn't write bindings!");
-
 }
 
 fn generate_io_uring_bindings() {
