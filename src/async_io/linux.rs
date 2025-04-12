@@ -6,7 +6,7 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::collections::{HashMap, VecDeque};
-use std::mem::zeroed;
+use std::mem::{zeroed, MaybeUninit};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr::null_mut;
@@ -31,14 +31,10 @@ enum Task {
     Receive(TcpStream, Box<[u8; BUFFER_SIZE]>),
 }
 
-struct TaskData {
-    task: Task,
-}
-
 pub struct IO {
     ring: io_uring,
-    task_queue: VecDeque<TaskData>,
-    tasks: HashMap<u64, TaskData>,
+    task_queue: VecDeque<Task>,
+    tasks: HashMap<u64, Task>,
     next_id: u64,
 }
 
@@ -58,10 +54,10 @@ impl IO {
         })
     }
 
-    pub fn accept(&mut self, listener: TcpListener) -> Result<(), io::Error> {
+    pub fn accept(&mut self, listener: TcpListener) -> io::Result<()> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
+            return Err(io::Error::new(io::ErrorKind::Other, "Queue is full"));
         }
 
         let fd = listener.as_raw_fd();
@@ -74,10 +70,10 @@ impl IO {
         Ok(())
     }
 
-    pub fn close(&mut self, socket: TcpStream) -> Result<(), io::Error> {
+    pub fn close(&mut self, socket: TcpStream) -> io::Result<()> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
+            return Err(io::Error::new(io::ErrorKind::Other, "Queue is full"));
         }
 
         let fd = socket.as_raw_fd();
@@ -89,14 +85,10 @@ impl IO {
         Ok(())
     }
 
-    pub fn receive(
-        &mut self,
-        socket: TcpStream,
-        buffer: Box<[u8; BUFFER_SIZE]>,
-    ) -> io::Result<()> {
+    pub fn receive(&mut self, socket: TcpStream, buffer: Box<[u8; BUFFER_SIZE]>) -> io::Result<()> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
+            return Err(io::Error::new(io::ErrorKind::Other, "Queue is full"));
         }
 
         let fd = socket.as_raw_fd();
@@ -119,7 +111,7 @@ impl IO {
     ) -> io::Result<()> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
+            return Err(io::Error::new(io::ErrorKind::Other, "Queue is full"));
         }
 
         let fd = socket.as_raw_fd();
@@ -134,7 +126,32 @@ impl IO {
         Ok(())
     }
 
-    pub fn submit(&mut self) -> io::Result<usize> {
+    pub fn poll(&mut self) -> io::Result<Vec<Completion>> {
+        self.submit()?;
+        let mut results = Vec::new();
+        while let Some(cqe) = self.peek_for_completion()? {
+            if let Some(result) = self.handle(cqe) {
+                results.push(result);
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn poll_blocking(&mut self) -> io::Result<Vec<Completion>> {
+        self.submit()?;
+        let cqe = self.wait_for_completion()?;
+        let first_res = self.handle(cqe);
+        let mut results = self.poll()?;
+
+        if let Some(res) = first_res {
+            results.insert(0, res);
+        }
+
+        Ok(results)
+    }
+
+    fn submit(&mut self) -> io::Result<usize> {
         let ret = unsafe { io_uring_submit(&mut self.ring) };
 
         if ret < 0 {
@@ -144,44 +161,19 @@ impl IO {
         }
     }
 
-    pub fn poll(&mut self) -> Vec<Completion> {
-        let mut results = Vec::new();
-        while let Some(cqe) = self.peek_for_completion() {
-            if let Some(result) = self.handle(cqe) {
-                results.push(result);
-            }
-        }
-
-        results
-    }
-
-    pub fn poll_blocking(&mut self) -> io::Result<Vec<Completion>> {
-        let cqe = self.wait_for_completion()?;
-        let first_res = self.handle(cqe);
-        let mut results = self.poll();
-
-        if let Some(res) = first_res {
-            results.insert(0, res);
-        }
-
-        Ok(results)
-    }
-
     fn handle(&mut self, cqe: io_uring_cqe) -> Option<Completion> {
         let id = cqe.user_data as u64;
         match self.tasks.remove(&id) {
-            Some(task) => match task.task {
+            Some(task) => match task {
                 Task::Accept(listener) => {
                     let socket = unsafe { TcpStream::from_raw_fd(cqe.res) };
                     Some(Completion::Accept(listener, socket))
                 }
                 Task::Close(socket) => Some(Completion::Close(socket)),
                 Task::Receive(socket, received) => {
-                    Some(Completion::Receive(socket, received.into(), cqe.res as _))
+                    Some(Completion::Receive(socket, received, cqe.res as _))
                 }
-                Task::Send(socket, sent) => {
-                    Some(Completion::Send(socket, sent.into(), cqe.res as _))
-                }
+                Task::Send(socket, sent) => Some(Completion::Send(socket, sent, cqe.res as _)),
             },
             None => {
                 eprintln!("Received completion for unknown task id {}", id);
@@ -190,16 +182,20 @@ impl IO {
         }
     }
 
-    fn peek_for_completion(&mut self) -> Option<io_uring_cqe> {
+    fn peek_for_completion(&mut self) -> io::Result<Option<io_uring_cqe>> {
         let mut cqe: *mut io_uring_cqe = null_mut();
         let ret = unsafe { io_uring_peek_cqe(&mut self.ring, &mut cqe) };
 
         if ret < 0 || cqe.is_null() {
-            None
+            let err = io::Error::from_raw_os_error(-ret);
+            match err.kind() {
+                io::ErrorKind::WouldBlock => Ok(None),
+                _ => Err(err),
+            }
         } else {
             let result = unsafe { ptr::read(cqe) };
             unsafe { io_uring_cqe_seen(&mut self.ring, cqe) };
-            Some(result)
+            Ok(Some(result))
         }
     }
 
@@ -220,26 +216,19 @@ impl IO {
         &mut self,
         duration: Duration,
     ) -> io::Result<Option<io_uring_cqe>> {
-        let timespec = unsafe {
-            let time = null_mut();
-            let ret = clock_gettime(CLOCK_MONOTONIC as _, time);
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            *time
-        };
-
-        let mut timeout = __kernel_timespec {
-            tv_sec: (timespec.tv_sec as u64 + duration.as_secs()) as _,
-            tv_nsec: (timespec.tv_nsec as u32 + duration.subsec_nanos()) as _,
-        };
+        let mut timeout = create_timespec(duration)?;
+        
 
         let mut cqe: *mut io_uring_cqe = null_mut();
         let ret =
             unsafe { io_uring_wait_cqe_timeout(&mut self.ring, &mut cqe, &mut timeout as *mut _) };
 
         if ret < 0 || cqe.is_null() {
-            Err(io::Error::from_raw_os_error(-ret))
+            let err = io::Error::from_raw_os_error(-ret);
+            match err.kind() {
+                io::ErrorKind::WouldBlock => Ok(None),
+                _ => Err(err),
+            }
         } else {
             let result = unsafe { ptr::read(cqe) };
             unsafe { io_uring_cqe_seen(&mut self.ring, cqe) };
@@ -250,9 +239,26 @@ impl IO {
     fn add_task(&mut self, task: Task) -> u64 {
         let user_data = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.tasks.insert(user_data, TaskData { task });
+        self.tasks.insert(user_data, task);
         user_data
     }
+}
+
+fn create_timespec(duration: Duration) -> io::Result<__kernel_timespec> {
+    let timespec = unsafe {
+        let mut time = MaybeUninit::<timespec>::uninit();
+        let ret = clock_gettime(CLOCK_MONOTONIC as _, time.as_mut_ptr());
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        time.assume_init()
+    };
+
+    let timeout = __kernel_timespec {
+        tv_sec: (timespec.tv_sec as u64 + duration.as_secs()) as _,
+        tv_nsec: (timespec.tv_nsec as u32 + duration.subsec_nanos()) as _,
+    };
+    Ok(timeout)
 }
 
 impl Drop for IO {
@@ -277,7 +283,6 @@ mod test {
 
         let mut io = IO::new(QUEUE_DEPTH)?;
         io.accept(listener)?;
-        io.submit()?;
 
         let address = SocketAddr::from_str("127.0.0.1:8000")?;
         let handler = thread::spawn(move || {
@@ -291,7 +296,7 @@ mod test {
 
         handler.join().unwrap();
 
-        let results = io.poll();
+        let results = io.poll()?;
         assert_eq!(1, results.len());
 
         Ok(())
@@ -304,7 +309,6 @@ mod test {
 
         let mut io = IO::new(QUEUE_DEPTH)?;
         io.accept(listener)?;
-        io.submit()?;
 
         let address = SocketAddr::from_str("127.0.0.1:8001")?;
         let handler = thread::spawn(move || {
@@ -333,7 +337,6 @@ mod test {
 
         let buf = Box::new([0u8; BUFFER_SIZE]);
         io.receive(socket, buf)?;
-        io.submit()?;
         results = io.poll_blocking()?;
         let (socket, buf, len) = match results.remove(0) {
             Completion::Receive(socket, buf, len) => (socket, buf, len),
@@ -346,7 +349,6 @@ mod test {
         let mut buf = Box::new([0u8; BUFFER_SIZE]);
         buf[..5].copy_from_slice(b"hello");
         io.send(socket, buf, 5)?;
-        io.submit()?;
         results = io.poll_blocking()?;
         let (socket, buf, len) = match results.remove(0) {
             Completion::Send(socket, buf, len) => (socket, buf, len),
