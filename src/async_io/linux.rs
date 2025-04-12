@@ -7,9 +7,8 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::zeroed;
-use std::net::TcpStream;
-use std::ops::{Add, Sub};
-use std::os::fd::{FromRawFd, RawFd};
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr::null_mut;
 use std::time::Duration;
 use std::{io, ptr};
@@ -19,42 +18,39 @@ const QUEUE_DEPTH: u32 = 256;
 const BUFFER_SIZE: usize = 1024;
 
 pub enum Completion {
-    Accept(TcpStream),
-    Close(RawFd),
-    Send(BufPtr),
-    Receive(BufPtr),
+    Accept(TcpListener, TcpStream),
+    Close(TcpStream),
+    Send(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
+    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
 }
 
 #[derive(Debug)]
-struct BufPtr {
-    buffer: *mut u8,
-    len: usize,
+struct BufPtr<const N: usize> {
+    buffer: *mut [u8; N],
 }
-impl BufPtr {
-    fn new(buffer: Box<[u8; BUFFER_SIZE]>) -> Self {
-        let buffer = Box::into_raw(buffer) as *mut u8;
-        Self { buffer, len: 0 }
-    }
 
-    fn complete(self) -> (Box<[u8]>, usize) {
-        let buffer = unsafe {
-            let slice = std::slice::from_raw_parts_mut(self.buffer, BUFFER_SIZE);
-            Box::from_raw(slice)
-        };
-        (buffer, self.len)
+impl<const N: usize> From<Box<[u8; N]>> for BufPtr<N> {
+    fn from(value: Box<[u8; N]>) -> Self {
+        let buffer = Box::into_raw(value);
+        Self { buffer }
+    }
+}
+
+impl<const N: usize> From<BufPtr<N>> for Box<[u8; N]> {
+    fn from(value: BufPtr<N>) -> Self {
+        unsafe { Box::from_raw(value.buffer) }
     }
 }
 
 enum Task {
-    Accept,
-    Close,
-    Send(BufPtr),
-    Receive(BufPtr),
+    Accept(TcpListener),
+    Close(TcpStream),
+    Send(TcpStream, BufPtr<BUFFER_SIZE>),
+    Receive(TcpStream, BufPtr<BUFFER_SIZE>),
 }
 
 struct TaskData {
     task: Task,
-    file_descriptor: RawFd,
 }
 
 pub struct IO {
@@ -80,13 +76,14 @@ impl IO {
         })
     }
 
-    pub fn accept(&mut self, fd: RawFd) -> Result<(), io::Error> {
+    pub fn accept(&mut self, listener: TcpListener) -> Result<(), io::Error> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
         }
 
-        let task_id = self.add_task(Task::Accept, fd);
+        let fd = listener.as_raw_fd();
+        let task_id = self.add_task(Task::Accept(listener));
         unsafe {
             io_uring_prep_accept(sqe, fd, null_mut(), null_mut(), 0);
             (*sqe).user_data = task_id;
@@ -95,13 +92,14 @@ impl IO {
         Ok(())
     }
 
-    pub fn close(&mut self, fd: RawFd) -> Result<(), io::Error> {
+    pub fn close(&mut self, socket: TcpStream) -> Result<(), io::Error> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
         }
 
-        let task_id = self.add_task(Task::Close, fd);
+        let fd = socket.as_raw_fd();
+        let task_id = self.add_task(Task::Close(socket));
         unsafe {
             io_uring_prep_close(sqe, fd);
             (*sqe).user_data = task_id;
@@ -109,15 +107,16 @@ impl IO {
         Ok(())
     }
 
-    pub fn receive(&mut self, fd: RawFd, buffer: Box<[u8; BUFFER_SIZE]>) -> io::Result<()> {
+    pub fn receive(&mut self, socket: TcpStream, buffer: Box<[u8; BUFFER_SIZE]>) -> io::Result<()> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
         }
 
-        let wrapper = BufPtr::new(buffer);
+        let fd = socket.as_raw_fd();
+        let wrapper = BufPtr::from(buffer);
         let buf_ptr = wrapper.buffer as *mut _;
-        let task_id = self.add_task(Task::Receive(wrapper), fd);
+        let task_id = self.add_task(Task::Receive(socket, wrapper));
 
         unsafe {
             io_uring_prep_recv(sqe, fd, buf_ptr, BUFFER_SIZE, 0);
@@ -128,7 +127,7 @@ impl IO {
 
     pub fn send(
         &mut self,
-        fd: RawFd,
+        socket: TcpStream,
         buffer: Box<[u8; BUFFER_SIZE]>,
         len: usize,
     ) -> io::Result<()> {
@@ -137,9 +136,10 @@ impl IO {
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
         }
 
-        let wrapper = BufPtr::new(buffer);
+        let fd = socket.as_raw_fd();
+        let wrapper = BufPtr::from(buffer);
         let buf_ptr = wrapper.buffer as *mut _;
-        let task_id = self.add_task(Task::Send(wrapper), fd);
+        let task_id = self.add_task(Task::Send(socket, wrapper));
 
         unsafe {
             io_uring_prep_send(sqe, fd, buf_ptr, len, 0);
@@ -185,18 +185,16 @@ impl IO {
         let id = cqe.user_data as u64;
         match self.tasks.remove(&id) {
             Some(task) => match task.task {
-                Task::Accept => {
+                Task::Accept(listener) => {
                     let socket = unsafe { TcpStream::from_raw_fd(cqe.res) };
-                    Some(Completion::Accept(socket))
+                    Some(Completion::Accept(listener, socket))
                 }
-                Task::Close => Some(Completion::Close(task.file_descriptor)),
-                Task::Receive(mut receive) => {
-                    receive.len = cqe.res as usize;
-                    Some(Completion::Receive(receive))
+                Task::Close(socket) => Some(Completion::Close(socket)),
+                Task::Receive(socket, received) => {
+                    Some(Completion::Receive(socket, received.into(), cqe.res as _))
                 }
-                Task::Send(mut send) => {
-                    send.len = cqe.res as usize;
-                    Some(Completion::Send(send))
+                Task::Send(socket, sent) => {
+                    Some(Completion::Send(socket, sent.into(), cqe.res as _))
                 }
             },
             None => {
@@ -263,16 +261,10 @@ impl IO {
         }
     }
 
-    fn add_task(&mut self, task: Task, fd: RawFd) -> u64 {
+    fn add_task(&mut self, task: Task) -> u64 {
         let user_data = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.tasks.insert(
-            user_data,
-            TaskData {
-                task,
-                file_descriptor: fd,
-            },
-        );
+        self.tasks.insert(user_data, TaskData { task });
         user_data
     }
 }
@@ -283,11 +275,11 @@ impl Drop for IO {
     }
 }
 
-mod tests {
+#[cfg(test)]
+mod test {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::os::fd::AsRawFd;
     use std::str::FromStr;
     use std::thread;
     use std::time::Duration;
@@ -298,7 +290,7 @@ mod tests {
         listener.set_nonblocking(true)?;
 
         let mut io = IO::new(QUEUE_DEPTH)?;
-        io.accept(listener.as_raw_fd())?;
+        io.accept(listener)?;
         io.submit()?;
 
         let address = SocketAddr::from_str("127.0.0.1:8000")?;
@@ -325,7 +317,7 @@ mod tests {
         listener.set_nonblocking(true)?;
 
         let mut io = IO::new(QUEUE_DEPTH)?;
-        io.accept(listener.as_raw_fd())?;
+        io.accept(listener)?;
         io.submit()?;
 
         let address = SocketAddr::from_str("127.0.0.1:8001")?;
@@ -348,17 +340,17 @@ mod tests {
         let mut results = io.poll_blocking()?;
         assert_eq!(1, results.len());
         let socket = match results.remove(0) {
-            Completion::Accept(socket) => socket,
+            Completion::Accept(_, socket) => socket,
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Client connected");
 
         let buf = Box::new([0u8; BUFFER_SIZE]);
-        io.receive(socket.as_raw_fd(), buf)?;
+        io.receive(socket, buf)?;
         io.submit()?;
         results = io.poll_blocking()?;
-        let (buf, len) = match results.remove(0) {
-            Completion::Receive(buf) => buf.complete(),
+        let (socket, buf, len) = match results.remove(0) {
+            Completion::Receive(socket, buf, len) => (socket, buf, len),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Received {len} bytes from client");
@@ -367,11 +359,11 @@ mod tests {
 
         let mut buf = Box::new([0u8; BUFFER_SIZE]);
         buf[..5].copy_from_slice(b"hello");
-        io.send(socket.as_raw_fd(), buf, 5)?;
+        io.send(socket, buf, 5)?;
         io.submit()?;
         results = io.poll_blocking()?;
-        let (buf, len) = match results.remove(0) {
-            Completion::Send(buf) => buf.complete(),
+        let (socket, buf, len) = match results.remove(0) {
+            Completion::Send(socket, buf, len) => (socket, buf, len),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Sent {} bytes to client", len);
