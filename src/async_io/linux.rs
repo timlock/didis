@@ -24,29 +24,11 @@ pub enum Completion {
     Receive(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
 }
 
-#[derive(Debug)]
-struct BufPtr<const N: usize> {
-    buffer: *mut [u8; N],
-}
-
-impl<const N: usize> From<Box<[u8; N]>> for BufPtr<N> {
-    fn from(value: Box<[u8; N]>) -> Self {
-        let buffer = Box::into_raw(value);
-        Self { buffer }
-    }
-}
-
-impl<const N: usize> From<BufPtr<N>> for Box<[u8; N]> {
-    fn from(value: BufPtr<N>) -> Self {
-        unsafe { Box::from_raw(value.buffer) }
-    }
-}
-
 enum Task {
     Accept(TcpListener),
     Close(TcpStream),
-    Send(TcpStream, BufPtr<BUFFER_SIZE>),
-    Receive(TcpStream, BufPtr<BUFFER_SIZE>),
+    Send(TcpStream, Box<[u8; BUFFER_SIZE]>),
+    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>),
 }
 
 struct TaskData {
@@ -107,19 +89,23 @@ impl IO {
         Ok(())
     }
 
-    pub fn receive(&mut self, socket: TcpStream, buffer: Box<[u8; BUFFER_SIZE]>) -> io::Result<()> {
+    pub fn receive(
+        &mut self,
+        socket: TcpStream,
+        buffer: Box<[u8; BUFFER_SIZE]>,
+    ) -> io::Result<()> {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get SQE"));
         }
 
         let fd = socket.as_raw_fd();
-        let wrapper = BufPtr::from(buffer);
-        let buf_ptr = wrapper.buffer as *mut _;
-        let task_id = self.add_task(Task::Receive(socket, wrapper));
+        let mut buffer = buffer;
+        let buf_ptr = buffer.as_mut_ptr();
+        let task_id = self.add_task(Task::Receive(socket, buffer));
 
         unsafe {
-            io_uring_prep_recv(sqe, fd, buf_ptr, BUFFER_SIZE, 0);
+            io_uring_prep_recv(sqe, fd, buf_ptr as _, BUFFER_SIZE, 0);
             (*sqe).user_data = task_id;
         }
         Ok(())
@@ -137,12 +123,12 @@ impl IO {
         }
 
         let fd = socket.as_raw_fd();
-        let wrapper = BufPtr::from(buffer);
-        let buf_ptr = wrapper.buffer as *mut _;
-        let task_id = self.add_task(Task::Send(socket, wrapper));
+        let mut buffer = buffer;
+        let buf_ptr = buffer.as_mut_ptr();
+        let task_id = self.add_task(Task::Send(socket, buffer));
 
         unsafe {
-            io_uring_prep_send(sqe, fd, buf_ptr, len, 0);
+            io_uring_prep_send(sqe, fd, buf_ptr as _, len, 0);
             (*sqe).user_data = task_id;
         }
         Ok(())
