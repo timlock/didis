@@ -1,8 +1,7 @@
 use libc::{
-    close, kevent, kqueue, timespec, EVFILT_READ, EVFILT_WRITE,
-    EV_ADD, EV_CLEAR, EV_ONESHOT,
+    close, kevent, kqueue, timespec, EVFILT_READ, EVFILT_WRITE, EV_ADD, EV_CLEAR, EV_ONESHOT,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io;
 use std::io::{Read, Write};
@@ -51,8 +50,6 @@ pub struct IO<const N: usize> {
     kqueue: c_int,
     pending: VecDeque<kevent>,
     events: [kevent; N],
-    tasks: HashMap<u64, Task>,
-    next_id: u64,
 }
 
 impl<const N: usize> IO<N> {
@@ -66,14 +63,12 @@ impl<const N: usize> IO<N> {
             kqueue,
             pending: Default::default(),
             events: unsafe { [zeroed(); N] },
-            tasks: Default::default(),
-            next_id: 0,
         })
     }
 
     pub fn accept(&mut self, socket: TcpListener) {
         let fd = socket.as_raw_fd();
-        let operation_id = self.add_task(Task::Accept(socket));
+        let task_ptr = Box::into_raw(Box::new(Task::Accept(socket)));
 
         let event = kevent {
             ident: fd as usize,
@@ -81,7 +76,7 @@ impl<const N: usize> IO<N> {
             flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
             fflags: 0,
             data: 0,
-            udata: operation_id as _,
+            udata: task_ptr as _,
         };
 
         self.pending.push_back(event);
@@ -89,7 +84,7 @@ impl<const N: usize> IO<N> {
 
     pub fn receive(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>) {
         let fd = socket.as_raw_fd();
-        let operation_id = self.add_task(Task::Receive(socket, buf));
+        let task_ptr = unsafe { Box::into_raw(Box::new(Task::Receive(socket, buf))) };
 
         let event = kevent {
             ident: fd as usize,
@@ -97,7 +92,7 @@ impl<const N: usize> IO<N> {
             flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
             fflags: 0,
             data: 0,
-            udata: operation_id as _,
+            udata: task_ptr as _,
         };
 
         self.pending.push_back(event);
@@ -105,7 +100,7 @@ impl<const N: usize> IO<N> {
 
     pub fn send(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>, len: usize) {
         let fd = socket.as_raw_fd();
-        let operation_id = self.add_task(Task::Send(socket, buf, len));
+        let task_ptr = unsafe { Box::into_raw(Box::new(Task::Send(socket, buf, len))) };
 
         let event = kevent {
             ident: fd as usize,
@@ -113,7 +108,7 @@ impl<const N: usize> IO<N> {
             flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
             fflags: 0,
             data: 0,
-            udata: operation_id as _,
+            udata: task_ptr as _,
         };
 
         self.pending.push_back(event);
@@ -130,14 +125,10 @@ impl<const N: usize> IO<N> {
         let mut results = Vec::new();
 
         for event in self.events[..completed_events].iter() {
-            let task_id = event.udata as u64;
-            match self.tasks.remove(&task_id) {
-                Some(task) => {
-                    let result = task.complete()?;
-                    results.push(result);
-                }
-                None => eprintln!("retrieved event with unknown id {task_id}"),
-            }
+            let task_ptr: *mut Task = event.udata as _;
+            let task = unsafe { Box::from_raw(task_ptr) };
+            let result = task.complete()?;
+            results.push(result);
         }
 
         Ok(results)
@@ -178,13 +169,6 @@ impl<const N: usize> IO<N> {
         }
 
         self.events.len()
-    }
-
-    fn add_task(&mut self, task: Task) -> u64 {
-        let user_data = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        self.tasks.insert(user_data, task);
-        user_data
     }
 }
 
