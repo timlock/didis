@@ -2,7 +2,8 @@ use libc::{
     clock_gettime, close, kevent, kqueue, timespec, CLOCK_MONOTONIC, EVFILT_READ, EVFILT_WRITE,
     EV_ADD, EV_CLEAR, EV_ONESHOT,
 };
-use std::collections::HashMap;
+use std::cmp::min;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Display};
 use std::io::{Read, Write};
 use std::mem::{take, zeroed};
@@ -27,24 +28,47 @@ enum Task {
     Send(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
 }
 
-pub struct IO {
+impl Task {
+    fn complete(self) -> io::Result<Completion> {
+        let result = match self {
+            Task::Accept(socket) => {
+                let (stream, _) = socket.accept()?;
+                Completion::Accept(socket, stream)
+            }
+            Task::Receive(mut socket, mut buf) => {
+                let n = socket.read(buf.as_mut_slice())?;
+                Completion::Receive(socket, buf, n)
+            }
+            Task::Send(mut socket, mut buf, len) => {
+                let n = socket.write(&mut buf[..len])?;
+                Completion::Send(socket, buf, n)
+            }
+        };
+        Ok(result)
+    }
+}
+
+pub struct IO<const N: usize> {
     kqueue: c_int,
     change_list: Vec<kevent>,
-    event_list: Vec<kevent>,
+    change_list_len: usize,
+    pending: VecDeque<kevent>,
     tasks: HashMap<u64, Task>,
     next_id: u64,
 }
 
-impl IO {
-    pub fn new(queue_depth: usize) -> io::Result<Self> {
+impl<const N: usize> IO<N> {
+    pub fn new() -> io::Result<Self> {
         let kqueue = unsafe { kqueue() };
         if kqueue == -1 {
             return Err(io::Error::last_os_error());
         }
+
         Ok(Self {
             kqueue,
             change_list: Default::default(),
-            event_list: unsafe { vec![zeroed(); queue_depth] },
+            change_list_len: 0,
+            pending: Default::default(),
             tasks: Default::default(),
             next_id: 0,
         })
@@ -103,29 +127,18 @@ impl IO {
     }
 
     pub fn poll_timeout(&mut self, duration: Duration) -> io::Result<Vec<Completion>> {
-        let change_list = take(&mut self.change_list);
-        let mut event_list: [kevent; 128] = unsafe { [zeroed(); 128] };
-        let n = self.flush(change_list, &mut event_list, duration)?;
+        let mut event_list = unsafe { [zeroed(); N] };
+        let n = self.flush(&mut event_list, duration)?;
 
         let mut results = Vec::new();
 
         for event in event_list[..n].iter() {
             let task_id = event.udata as u64;
             match self.tasks.remove(&task_id) {
-                Some(task) => match task {
-                    Task::Accept(socket) => {
-                        let (stream, _) = socket.accept()?;
-                        results.push(Completion::Accept(socket, stream));
-                    }
-                    Task::Receive(mut socket, mut buf) => {
-                        let n = socket.read(buf.as_mut_slice())?;
-                        results.push(Completion::Receive(socket, buf, n))
-                    }
-                    Task::Send(mut socket, mut buf, len) => {
-                        let n = socket.write(&mut buf[..len])?;
-                        results.push(Completion::Send(socket, buf, n))
-                    }
-                },
+                Some(task) => {
+                    let result = task.complete()?;
+                    results.push(result);
+                }
                 None => eprintln!("retrieved event with unknown id {task_id}"),
             }
         }
@@ -133,12 +146,23 @@ impl IO {
         Ok(results)
     }
 
-    fn flush(
-        &self,
-        change_list: Vec<kevent>,
-        event_list: &mut [kevent],
-        duration: Duration,
-    ) -> io::Result<usize> {
+    fn flush(&mut self, event_list: &mut [kevent], duration: Duration) -> io::Result<usize> {
+        let mut change_list = take(&mut self.change_list);
+        if self.change_list_len < N && !self.pending.is_empty() {
+            let events_to_copy = min(
+                self.pending.len(),
+                self.change_list.len() - self.change_list_len,
+            );
+            let target_range = self.change_list_len..self.change_list_len + events_to_copy;
+
+            let mut pending = Vec::with_capacity(events_to_copy);
+            for _ in 0..events_to_copy {
+                pending.push(self.pending.pop_front().unwrap());
+            }
+
+            change_list[target_range].copy_from_slice(pending.as_slice());
+        }
+
         let change_list_ptr = change_list.as_ptr();
         let event_list_ptr = event_list.as_mut_ptr();
 
@@ -168,7 +192,7 @@ impl IO {
         };
 
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            eprintln!("Operation will fail: {}", io::Error::last_os_error());
         }
 
         Ok(n as usize)
@@ -180,9 +204,19 @@ impl IO {
         self.tasks.insert(user_data, task);
         user_data
     }
+
+    fn add_to_change_list(&mut self, event: kevent) {
+        if self.change_list.len() == N {
+            self.pending.push_back(event);
+            return;
+        }
+
+        self.change_list.push(event);
+        self.change_list_len += 1;
+    }
 }
 
-impl Drop for IO {
+impl<const N: usize> Drop for IO<N> {
     fn drop(&mut self) {
         unsafe { close(self.kqueue) };
     }
@@ -202,7 +236,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:8000")?;
         listener.set_nonblocking(true)?;
 
-        let mut io = IO::new(1)?;
+        let mut io: IO<1> = IO::new()?;
         io.accept(listener.try_clone().unwrap());
 
         let address = SocketAddr::from_str("127.0.0.1:8000")?;
@@ -228,7 +262,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:8001")?;
         listener.set_nonblocking(true)?;
 
-        let mut io = IO::new(8)?;
+        let mut io: IO<8> = IO::new()?;
         io.accept(listener.try_clone().unwrap());
 
         let address = SocketAddr::from_str("127.0.0.1:8001")?;
