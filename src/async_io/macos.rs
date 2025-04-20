@@ -1,17 +1,16 @@
 use libc::{
-    clock_gettime, close, kevent, kqueue, timespec, CLOCK_MONOTONIC, EVFILT_READ, EVFILT_WRITE,
+    close, kevent, kqueue, timespec, EVFILT_READ, EVFILT_WRITE,
     EV_ADD, EV_CLEAR, EV_ONESHOT,
 };
-use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
+use std::io;
 use std::io::{Read, Write};
-use std::mem::{take, zeroed};
+use std::mem::zeroed;
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::c_int;
 use std::time::Duration;
-use std::{error, io};
 
 const BUFFER_SIZE: usize = 1024;
 #[derive(Debug)]
@@ -50,9 +49,8 @@ impl Task {
 
 pub struct IO<const N: usize> {
     kqueue: c_int,
-    change_list: Vec<kevent>,
-    change_list_len: usize,
     pending: VecDeque<kevent>,
+    events: [kevent; N],
     tasks: HashMap<u64, Task>,
     next_id: u64,
 }
@@ -66,9 +64,8 @@ impl<const N: usize> IO<N> {
 
         Ok(Self {
             kqueue,
-            change_list: Default::default(),
-            change_list_len: 0,
             pending: Default::default(),
+            events: unsafe { [zeroed(); N] },
             tasks: Default::default(),
             next_id: 0,
         })
@@ -87,7 +84,7 @@ impl<const N: usize> IO<N> {
             udata: operation_id as _,
         };
 
-        self.change_list.push(event);
+        self.pending.push_back(event);
     }
 
     pub fn receive(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>) {
@@ -103,7 +100,7 @@ impl<const N: usize> IO<N> {
             udata: operation_id as _,
         };
 
-        self.change_list.push(event);
+        self.pending.push_back(event);
     }
 
     pub fn send(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>, len: usize) {
@@ -119,7 +116,7 @@ impl<const N: usize> IO<N> {
             udata: operation_id as _,
         };
 
-        self.change_list.push(event);
+        self.pending.push_back(event);
     }
 
     pub fn poll(&mut self) -> io::Result<Vec<Completion>> {
@@ -127,12 +124,12 @@ impl<const N: usize> IO<N> {
     }
 
     pub fn poll_timeout(&mut self, duration: Duration) -> io::Result<Vec<Completion>> {
-        let mut event_list = unsafe { [zeroed(); N] };
-        let n = self.flush(&mut event_list, duration)?;
+        let added_events = self.fill_change_list();
+        let completed_events = self.flush(added_events, duration);
 
         let mut results = Vec::new();
 
-        for event in event_list[..n].iter() {
+        for event in self.events[..completed_events].iter() {
             let task_id = event.udata as u64;
             match self.tasks.remove(&task_id) {
                 Some(task) => {
@@ -146,56 +143,41 @@ impl<const N: usize> IO<N> {
         Ok(results)
     }
 
-    fn flush(&mut self, event_list: &mut [kevent], duration: Duration) -> io::Result<usize> {
-        let mut change_list = take(&mut self.change_list);
-        if self.change_list_len < N && !self.pending.is_empty() {
-            let events_to_copy = min(
-                self.pending.len(),
-                self.change_list.len() - self.change_list_len,
-            );
-            let target_range = self.change_list_len..self.change_list_len + events_to_copy;
-
-            let mut pending = Vec::with_capacity(events_to_copy);
-            for _ in 0..events_to_copy {
-                pending.push(self.pending.pop_front().unwrap());
-            }
-
-            change_list[target_range].copy_from_slice(pending.as_slice());
-        }
-
-        let change_list_ptr = change_list.as_ptr();
-        let event_list_ptr = event_list.as_mut_ptr();
-
-        let timespec = unsafe {
-            let mut time: timespec = zeroed();
-            let ret = clock_gettime(CLOCK_MONOTONIC as _, &mut time as *mut _);
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            time
-        };
+    fn flush(&mut self, changes: usize, duration: Duration) -> usize {
+        let events_ptr = self.events.as_mut_ptr();
 
         let timeout = timespec {
-            tv_sec: (timespec.tv_sec as u64 + duration.as_secs()) as _,
-            tv_nsec: (timespec.tv_nsec as u32 + duration.subsec_nanos()) as _,
+            tv_sec: duration.as_secs() as _,
+            tv_nsec: duration.subsec_nanos() as _,
         };
 
-        let n = unsafe {
+        let completed_events = unsafe {
             kevent(
                 self.kqueue,
-                change_list_ptr,
-                change_list.len() as _,
-                event_list_ptr,
-                event_list.len() as _,
+                events_ptr,
+                changes as _,
+                events_ptr,
+                self.events.len() as _,
                 &timeout,
             )
         };
 
-        if n < 0 {
+        if completed_events < 0 {
             eprintln!("Operation will fail: {}", io::Error::last_os_error());
         }
 
-        Ok(n as usize)
+        completed_events as usize
+    }
+
+    fn fill_change_list(&mut self) -> usize {
+        for i in 0..self.events.len() {
+            match self.pending.pop_back() {
+                Some(next) => self.events[i] = next,
+                None => return i,
+            }
+        }
+
+        self.events.len()
     }
 
     fn add_task(&mut self, task: Task) -> u64 {
@@ -203,16 +185,6 @@ impl<const N: usize> IO<N> {
         self.next_id = self.next_id.wrapping_add(1);
         self.tasks.insert(user_data, task);
         user_data
-    }
-
-    fn add_to_change_list(&mut self, event: kevent) {
-        if self.change_list.len() == N {
-            self.pending.push_back(event);
-            return;
-        }
-
-        self.change_list.push(event);
-        self.change_list_len += 1;
     }
 }
 
@@ -228,8 +200,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::str::FromStr;
-    use std::thread;
     use std::time::Duration;
+    use std::{error, thread};
 
     #[test]
     fn accept() -> Result<(), Box<dyn error::Error>> {
@@ -282,7 +254,7 @@ mod tests {
             assert_eq!(sent, received.as_slice());
         });
 
-        let mut results = io.poll()?;
+        let mut results = io.poll_timeout(Duration::from_secs(1))?;
         assert_eq!(1, results.len());
         let socket = match results.remove(0) {
             Completion::Accept(socket, stream) => stream,
@@ -292,7 +264,7 @@ mod tests {
 
         let buf = Box::new([0u8; BUFFER_SIZE]);
         io.receive(socket.try_clone().unwrap(), buf);
-        results = io.poll()?;
+        results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len) = match results.remove(0) {
             Completion::Receive(stream, buf, len) => (buf, len),
             _ => return Err("Should be accept".into()),
@@ -304,7 +276,7 @@ mod tests {
         let mut buf = Box::new([0u8; BUFFER_SIZE]);
         buf[..5].copy_from_slice(b"hello");
         io.send(socket.try_clone().unwrap(), buf, 5);
-        results = io.poll()?;
+        results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len) = match results.remove(0) {
             Completion::Send(stream, buf, len) => (buf, len),
             _ => return Err("Should be accept".into()),
