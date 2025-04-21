@@ -184,7 +184,7 @@ impl IO {
             io_uring_submit_and_wait_timeout(
                 &mut self.ring,
                 cqes.as_mut_ptr(),
-                QUEUE_DEPTH,
+                1,
                 &mut timeout as *mut _,
                 null_mut(),
             )
