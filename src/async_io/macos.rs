@@ -27,6 +27,7 @@ enum Task {
 }
 
 impl Task {
+    // TODO impl From<Task> for Completion instead
     fn complete(self) -> io::Result<Completion> {
         let result = match self {
             Task::Accept(socket) => {
