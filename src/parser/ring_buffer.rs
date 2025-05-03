@@ -48,7 +48,8 @@ impl<const N: usize> RingBuffer<N> {
         // }
         // self.write_pos - self.read_pos
     }
-    pub fn populate(&mut self, reader: &mut impl Read) -> io::Result<usize> {
+    pub fn populate<R: Read>(&mut self, mut reader: R) -> io::Result<usize>
+    {
         let (first, second) = self.writeable_ranges_ref();
         let mut slices = [IoSliceMut::new(first), IoSliceMut::new(second)];
 

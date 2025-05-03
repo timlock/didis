@@ -1,5 +1,5 @@
 use super::resp;
-use crate::parser::resp::Resp;
+use crate::parser::resp::{parse_resp, Resp};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
 use std::{error, fmt, io};
@@ -124,7 +124,7 @@ pub enum Command {
     Exists(Vec<String>),
 }
 
-fn parse_command(resp: Resp) -> Result<Command, Error> {
+pub fn parse_command(resp: Resp) -> Result<Command, Error> {
     let mut segment_iter = match resp {
         Resp::Array(vec) => vec.into_iter(),
         _ => return Err(Error::InvalidStart),
@@ -148,6 +148,25 @@ fn parse_command(resp: Resp) -> Result<Command, Error> {
         "EXISTS" => parse_exists(segment_iter),
         _ => Err(Error::UnknownCommand(name)),
     }
+}
+
+pub fn parse_command_bytes(value: &[u8]) -> Result<(impl Iterator<Item = Command>, &[u8]), Error> {
+    let mut remaining = value;
+    let mut result = Vec::new();
+    loop {
+        match parse_resp(remaining)? {
+            (Some(resp), r) => {
+                let command = parse_command(resp)?;
+                result.push(command);
+                remaining = r;
+            }
+            (None, r) => {
+                remaining = r;
+                break;
+            }
+        };
+    }
+    Ok((result.into_iter(), remaining))
 }
 
 fn parse_ping(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {

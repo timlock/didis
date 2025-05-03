@@ -1,11 +1,12 @@
 use crate::parser::ring_buffer::RingBuffer;
+use std::cmp::min;
 use std::fmt::{self, Display};
-use std::io;
 use std::io::Read;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::{error, str};
+use std::{io, mem};
 
 #[derive(Debug)]
 pub enum Error {
@@ -15,6 +16,7 @@ pub enum Error {
     LengthMismatch,
     Io(io::Error),
     UnknownResp(u8),
+    InvalidToken(u8),
 }
 
 impl error::Error for Error {}
@@ -28,6 +30,7 @@ impl Display for Error {
             Error::LengthMismatch => write!(f, "Length does not match"),
             Error::Io(error) => write!(f, "IO error: {error}"),
             Error::UnknownResp(byte) => write!(f, "Unknown resp type: {}", &byte),
+            Error::InvalidToken(token) => write!(f, "Invalid token: {}", &token),
         }
     }
 }
@@ -258,6 +261,272 @@ pub fn try_read(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<()> 
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct LineParser {
+    buffer: Vec<u8>,
+    cr: bool,
+}
+
+impl LineParser {
+    fn next(&mut self, value: &[u8]) -> Result<(Option<String>, usize), Error> {
+        let mut bytes_read = 0;
+
+        if !self.cr {
+            match value.iter().position(|b| *b == b'\r') {
+                Some(pos) => {
+                    self.buffer.extend_from_slice(&value[..pos]);
+                    bytes_read += pos + 1;
+                    self.cr = true;
+                }
+                None => {
+                    self.buffer.extend_from_slice(value);
+                    return Ok((None, value.len()));
+                }
+            }
+        }
+
+        if self.cr {
+            return match value.get(bytes_read) {
+                Some(b'\n') => {
+                    let string = String::from_utf8(mem::take(&mut self.buffer))?;
+                    self.cr = false;
+                    Ok((Some(string), bytes_read + 1))
+                }
+                Some(other) => Err(Error::InvalidToken(*other)),
+                None => Ok((None, value.len())),
+            };
+        }
+
+        Ok((None, value.len()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct IntegerParser {
+    line_parser: LineParser,
+}
+
+impl IntegerParser {
+    fn next(&mut self, value: &[u8]) -> Result<(Option<i64>, usize), Error> {
+        match self.line_parser.next(value)? {
+            (None, n) => Ok((None, n)),
+            (Some(string), n) => {
+                let integer = string.parse()?;
+                Ok((Some(integer), n))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BulkStringParser {
+    integer_parser: IntegerParser,
+    buffer: Vec<u8>,
+    size: Option<i64>,
+}
+
+impl BulkStringParser {
+    fn next(&mut self, value: &[u8]) -> Result<(Option<Resp>, usize), Error> {
+        let mut read_bytes = 0;
+        if self.size.is_none() {
+            let (integer, n) = self.integer_parser.next(value)?;
+            if let Some(integer) = integer {
+                self.size = Some(integer as _);
+            }
+            read_bytes += n;
+        }
+
+        if let Some(size) = self.size {
+            if size == -1 {
+                return Ok((Some(Resp::Null), read_bytes));
+            }
+
+            let size = size as _;
+
+            if size > self.buffer.len() {
+                let remaining = size - self.buffer.len();
+                let end = min(value.len(), remaining + read_bytes);
+                let copy_range = read_bytes..end;
+                read_bytes += copy_range.len();
+                self.buffer.extend_from_slice(&value[copy_range]);
+            }
+
+            if self.buffer.len() == size && value.len() > read_bytes + 1 {
+                let cr = value[read_bytes];
+                if cr != b'\r' {
+                    return Err(Error::InvalidToken(cr));
+                }
+                let lf = value[read_bytes + 1];
+                if lf != b'\n' {
+                    return Err(Error::InvalidToken(lf));
+                }
+                read_bytes += 2;
+
+                let string = String::from_utf8(mem::take(&mut self.buffer))?;
+                self.size = None;
+
+                return Ok((Some(Resp::BulkString(string)), read_bytes));
+            }
+        }
+
+        Ok((None, read_bytes))
+    }
+}
+
+#[derive(Debug)]
+struct ArrayParser {
+    integer_parser: IntegerParser,
+    item_parser: Box<Parser>,
+    size: Option<i64>,
+    items: Vec<Resp>,
+}
+
+impl ArrayParser {
+    fn next(&mut self, value: &[u8]) -> Result<(Option<Resp>, usize), Error> {
+        let mut read_bytes = 0;
+        if self.size.is_none() {
+            let (integer, n) = self.integer_parser.next(value)?;
+            if let Some(integer) = integer {
+                self.size = Some(integer as _);
+            }
+            read_bytes += n;
+        }
+
+        if let Some(size) = self.size {
+            if size == -1 {
+                return Ok((Some(Resp::Null), read_bytes));
+            }
+
+            while self.items.len() < size as _ {
+                match self.item_parser.parse(&value[read_bytes..])? {
+                    (Some(resp), n) => {
+                        self.items.push(resp);
+                        read_bytes += n;
+                    }
+                    (None, n) => {
+                        return Ok((None, read_bytes + n));
+                    }
+                };
+            }
+
+            return Ok((Some(Resp::Array(mem::take(&mut self.items))), read_bytes));
+        }
+
+        Ok((None, read_bytes))
+    }
+}
+
+impl Default for ArrayParser {
+    fn default() -> Self {
+        Self {
+            integer_parser: Default::default(),
+            item_parser: Box::new(Parser::default()),
+            size: None,
+            items: vec![],
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ParserState {
+    SimpleString(LineParser),
+    SimpleError(LineParser),
+    Integer(IntegerParser),
+    BulkString(BulkStringParser),
+    Array(ArrayParser),
+    None,
+}
+
+impl TryFrom<u8> for ParserState {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            b'+' => Ok(ParserState::SimpleString(LineParser::default())),
+            b'-' => Ok(ParserState::SimpleError(LineParser::default())),
+            b':' => Ok(ParserState::Integer(IntegerParser::default())),
+            b'$' => Ok(ParserState::BulkString(BulkStringParser::default())),
+            b'*' => Ok(ParserState::Array(ArrayParser::default())),
+            _ => Err(Error::UnknownResp(value)),
+        }
+    }
+}
+#[derive(Debug)]
+pub struct Parser {
+    inner: ParserState,
+}
+
+impl Parser {
+    pub fn parse(&mut self, value: &[u8]) -> Result<(Option<Resp>, usize), Error> {
+        let (resp, n) = match &mut self.inner {
+            ParserState::SimpleString(parser) => match parser.next(value)? {
+                (Some(string), n) => (Some(Resp::SimpleString(string)), n),
+                (None, n) => (None, n),
+            },
+            ParserState::SimpleError(parser) => match parser.next(value)? {
+                (Some(string), n) => (Some(Resp::SimpleError(string)), n),
+                (None, n) => (None, n),
+            },
+            ParserState::Integer(parser) => match parser.next(value)? {
+                (Some(integer), n) => (Some(Resp::Integer(integer)), n),
+                (None, n) => (None, n),
+            },
+            ParserState::BulkString(parser) => match parser.next(value)? {
+                (Some(resp), n) => (Some(resp), n),
+                (None, n) => (None, n),
+            },
+            ParserState::Array(parser) => match parser.next(value)? {
+                (Some(resp), n) => (Some(resp), n),
+                (None, n) => (None, n),
+            },
+            ParserState::None => match value.get(0) {
+                Some(identifier) => {
+                    self.inner = ParserState::try_from(*identifier)?;
+                    let (resp, n) = self.parse(&value[1..])?;
+                    (resp, n + 1)
+                }
+                None => (None, 0),
+            },
+        };
+
+        if resp.is_some() {
+            self.inner = ParserState::None;
+        }
+
+        Ok((resp, n))
+    }
+
+    pub fn parse_all(&mut self, value: &[u8]) -> (Vec<Result<Resp, Error>>, usize) {
+        let mut read = 0;
+        let mut parsed = vec![];
+        while read < value.len() {
+            match self.parse(&value[read..]) {
+                Ok((resp, n)) => {
+                    read += n;
+                    match resp {
+                        Some(resp) => parsed.push(Ok(resp)),
+                        None => break,
+                    }
+                }
+                Err(err) => {
+                    parsed.push(Err(err));
+                    break;
+                }
+            }
+        }
+
+        (parsed, read)
+    }
+}
+
+impl Default for Parser {
+    fn default() -> Self {
+        Self {
+            inner: ParserState::None,
+        }
+    }
 }
 
 pub fn parse_resp(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
@@ -552,20 +821,6 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn parse_bulk_string() -> Result<(), Box<dyn error::Error>> {
-    //     let mut input = b"2\r\nab\r\n".as_slice();
-    //     let mut parser = BulkStringPars::new(()).map_err(|err| err.to_string())?;
-    //     match parser.parse(&mut input)? {
-    //         Some(Resp::BulkString(s)) => {
-    //             assert_eq!(b"ab", s.as_slice());
-    //             Ok(())
-    //         }
-    //         Some(resp) => Err(Box::from(format!("got wrong resp {resp}"))),
-    //         None => Err(Box::from("there should be a parsed resp")),
-    //     }
-    // }
-
     #[test]
     fn parse_simple_string2() -> Result<(), Box<dyn error::Error>> {
         let input = "+hello world\r\n";
@@ -625,6 +880,201 @@ mod tests {
         sender.send(vec![input[4]]).map_err(|_| "Send error")?;
         match parser.next() {
             Some(Ok(Resp::Null)) => Ok(()),
+            _ => Err("Should be null".into()),
+        }
+    }
+
+    #[test]
+    fn parse_null_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "$-1\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::Null), r) => {
+                assert_eq!(input.len(), r);
+                Ok(())
+            }
+            _ => Err("Should be null".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "*1\r\n$4\r\nping\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::Array(arr)), r) => {
+                assert_eq!(input.len(), r);
+                assert_eq!(arr.len(), 1);
+                match &arr[0] {
+                    Resp::BulkString(s) => assert_eq!(s, "ping"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array2_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "*2\r\n$4\r\necho\r\n$11\r\nhello world\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::Array(arr)), r) => {
+                assert_eq!(input.len(), r);
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    Resp::BulkString(s) => assert_eq!(s, "echo"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                match &arr[1] {
+                    Resp::BulkString(s) => assert_eq!(s, "hello world"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array3_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "*2\r\n$3\r\nget\r\n$3\r\nkey\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::Array(arr)), r) => {
+                assert_eq!(input.len(), r);
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    Resp::BulkString(s) => assert_eq!(s, "get"),
+                    _ => return Err("Array should contain a bulk string".into()),
+                }
+                match &arr[1] {
+                    Resp::BulkString(s) => assert_eq!(s, "key"),
+                    _ => return Err("Array should contain a bulk string".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array4_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nsave\r\n*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n";
+        let mut parser = Parser::default();
+        match parser.parse(input.as_bytes())? {
+            (Some(Resp::Array(arr)), r) => {
+                assert_eq!(arr.len(), 3);
+                match &arr[0] {
+                    Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                    _ => return Err("Expected bulk string".into()),
+                }
+                match &arr[1] {
+                    Resp::BulkString(s) => assert_eq!(s, "GET"),
+                    _ => return Err("Expected bulk string".into()),
+                }
+                match &arr[2] {
+                    Resp::BulkString(s) => assert_eq!(s, "save"),
+                    _ => return Err("Expected bulk string".into()),
+                }
+                assert_eq!(35, r);
+                match parser.parse(&input[r..].as_bytes())? {
+                    (Some(Resp::Array(arr)), r) => {
+                        assert_eq!(arr.len(), 3);
+                        assert_eq!(42, r);
+                        match &arr[0] {
+                            Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                            _ => return Err("Expected bulk string".into()),
+                        }
+                        match &arr[1] {
+                            Resp::BulkString(s) => assert_eq!(s, "GET"),
+                            _ => return Err("Expected bulk string".into()),
+                        }
+                        match &arr[2] {
+                            Resp::BulkString(s) => assert_eq!(s, "appendonly"),
+                            _ => return Err("Expected bulk string".into()),
+                        }
+                    }
+                    _ => return Err("Should be of type array".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_simple_string_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "+OK\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::SimpleString(s)), _) => {
+                assert_eq!(s, "OK");
+                Ok(())
+            }
+            _ => Err("Should be of type simple string".into()),
+        }
+    }
+
+    #[test]
+    fn parse_simple_error_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "-ERROR message\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::SimpleError(s)), _) => {
+                assert_eq!(s, "ERROR message");
+                Ok(())
+            }
+            _ => Err("Should be of type simple error".into()),
+        }
+    }
+
+    #[test]
+    fn parse_empty_bulk_string_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "$0\r\n\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::BulkString(s)), _) => {
+                assert_eq!(s, "");
+                Ok(())
+            }
+            _ => Err("Should be of type bulk string".into()),
+        }
+    }
+
+    #[test]
+    fn parse_simple_string2_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "+hello world\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            (Some(Resp::SimpleString(s)), _) => {
+                assert_eq!(s, "hello world");
+                Ok(())
+            }
+            _ => Err("Should be of type simple string".into()),
+        }
+    }
+
+    #[test]
+    fn decoder_parse_null_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = "$-1\r\n".as_bytes();
+        let mut parser = Decoder::new(input);
+        match parser.next() {
+            Some(Ok(Resp::Null)) => Ok(()),
+            _ => Err("Should be null".into()),
+        }
+    }
+
+    #[test]
+    fn decoder_parse_null_split_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = [b'$', b'-', b'1', b'\r', b'\n'];
+        let mut parser = Parser::default();
+
+        let (resp, _) = parser.parse(&input[0..1])?;
+        assert!(resp.is_none());
+        let (resp, _) = parser.parse(&input[1..2])?;
+        assert!(resp.is_none());
+        let (resp, _) = parser.parse(&input[2..3])?;
+        assert!(resp.is_none());
+        let (resp, _) = parser.parse(&input[3..4])?;
+        assert!(resp.is_none());
+        let (resp, _) = parser.parse(&input[4..5])?;
+
+        match resp {
+            Some(Resp::Null) => Ok(()),
             _ => Err("Should be null".into()),
         }
     }

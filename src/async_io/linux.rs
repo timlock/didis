@@ -5,14 +5,14 @@
 #[cfg(not(rust_analyzer))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-use std::collections::{HashMap, VecDeque};
-use std::mem::{zeroed, MaybeUninit};
+use std::collections::VecDeque;
+use std::io;
+use std::mem::zeroed;
 use std::net::{TcpListener, TcpStream};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use std::time::Duration;
-use std::{io, ptr};
 
 const QUEUE_DEPTH: u32 = 256;
 
@@ -20,13 +20,12 @@ const BUFFER_SIZE: usize = 1024;
 
 pub enum Completion {
     Accept(TcpListener, io::Result<TcpStream>),
-    Close(TcpStream, io::Result<()>),
     Send(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
     Receive(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
 }
 
-impl From<io_uring_cqe> for Completion {
-    fn from(cqe: io_uring_cqe) -> Self {
+impl From<&io_uring_cqe> for Completion {
+    fn from(cqe: &io_uring_cqe) -> Self {
         let task_ptr: *mut Task = cqe.user_data as _;
         let task = unsafe { Box::from_raw(task_ptr) };
 
@@ -40,12 +39,6 @@ impl From<io_uring_cqe> for Completion {
                 }
                 let socket = unsafe { TcpStream::from_raw_fd(cqe.res) };
                 Completion::Accept(listener, Ok(socket))
-            }
-            Task::Close(socket) => {
-                if cqe.res < 0 {
-                    return Completion::Close(socket, Err(io::Error::from_raw_os_error(-cqe.res)));
-                }
-                Completion::Close(socket, Ok(()))
             }
             Task::Receive(socket, received) => {
                 if cqe.res < 0 {
@@ -73,7 +66,6 @@ impl From<io_uring_cqe> for Completion {
 
 enum Task {
     Accept(TcpListener),
-    Close(TcpStream),
     Send(TcpStream, Box<[u8; BUFFER_SIZE]>),
     Receive(TcpStream, Box<[u8; BUFFER_SIZE]>),
 }
@@ -109,22 +101,6 @@ impl IO {
 
         unsafe {
             io_uring_prep_accept(sqe, fd, null_mut(), null_mut(), 0);
-            (*sqe).user_data = task_ptr as _;
-        }
-    }
-
-    pub fn close(&mut self, socket: TcpStream) {
-        let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
-        if sqe.is_null() {
-            self.pending.push_back(Task::Close(socket));
-            return;
-        }
-
-        let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Close(socket)));
-
-        unsafe {
-            io_uring_prep_close(sqe, fd);
             (*sqe).user_data = task_ptr as _;
         }
     }
@@ -191,7 +167,11 @@ impl IO {
         };
 
         if ret < 0 {
-            return Err(io::Error::from_raw_os_error(-ret));
+            let error_code = -ret as u32;
+            return match error_code {
+                ETIME => { Ok(Vec::new()) }
+                _ => Err(io::Error::from_raw_os_error(error_code as _)),
+            };
         }
 
         let cqes_iter = cqes.iter().filter(|&&cqe| cqe as usize != 0);
@@ -200,9 +180,9 @@ impl IO {
         let mut completions = Vec::with_capacity(completed);
 
         for cqe in cqes_iter {
-            let result = unsafe { ptr::read(*cqe) };
-            unsafe { io_uring_cqe_seen(&mut self.ring, *cqe) };
+            let result = unsafe { &**cqe };
             let completion = Completion::from(result);
+            unsafe { io_uring_cqe_seen(&mut self.ring, *cqe) };
             completions.push(completion);
         }
 
