@@ -1,4 +1,4 @@
-use super::resp;
+use super::{command, resp};
 use crate::parser::resp::{parse_resp, Resp};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
@@ -106,6 +106,40 @@ impl From<resp::Error> for Error {
         }
     }
 }
+#[derive(Debug, Default)]
+pub struct Parser {
+    resp_parser: resp::Parser,
+}
+
+impl Parser {
+    pub fn parse_all(&mut self, buf: &[u8]) -> (Vec<Result<Command, Error>>, usize) {
+        let mut read = 0;
+        let mut commands = Vec::new();
+        while read < buf.len() {
+            match self.resp_parser.parse(&buf[read..]) {
+                Ok((Some(resp), n)) => {
+                    read += n;
+                    let command = parse_command(resp);
+                    let is_err = command.is_err();
+                    commands.push(command);
+
+                    if is_err {
+                        break;
+                    }
+                }
+                Ok((None, n)) => read += n,
+                Err(err) => {
+                    commands.push(Err(err.into()));
+                    break;
+                }
+            }
+        }
+
+        (commands, read)
+    }
+}
+
+
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Command {
@@ -226,7 +260,7 @@ pub enum ExpireRule {
     ExpiresInMillis(Duration),
     ExpiresAtSecs(SystemTime),
     ExpiresAtMillis(SystemTime),
-    KEEPTTL,
+    KeepTTL,
 }
 impl ExpireRule {
     pub fn calculate_expire_time(&self) -> Option<SystemTime> {
@@ -235,7 +269,7 @@ impl ExpireRule {
             ExpireRule::ExpiresInMillis(ms) => SystemTime::now().checked_add(*ms),
             ExpireRule::ExpiresAtSecs(t) => Some(*t),
             ExpireRule::ExpiresAtMillis(t) => Some(*t),
-            ExpireRule::KEEPTTL => None,
+            ExpireRule::KeepTTL => None,
         }
     }
 }
@@ -271,7 +305,7 @@ impl TryFrom<&[u8]> for ExpireRule {
             return Ok(ExpireRule::ExpiresAtMillis(timestamp));
         }
         if value == b"KEEPTTL" {
-            return Ok(ExpireRule::KEEPTTL);
+            return Ok(ExpireRule::KeepTTL);
         }
 
         Err("")

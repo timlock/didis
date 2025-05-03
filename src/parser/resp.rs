@@ -455,12 +455,12 @@ impl TryFrom<u8> for ParserState {
 }
 #[derive(Debug)]
 pub struct Parser {
-    inner: ParserState,
+    state: ParserState,
 }
 
 impl Parser {
     pub fn parse(&mut self, value: &[u8]) -> Result<(Option<Resp>, usize), Error> {
-        let (resp, n) = match &mut self.inner {
+        let (resp, n) = match &mut self.state {
             ParserState::SimpleString(parser) => match parser.next(value)? {
                 (Some(string), n) => (Some(Resp::SimpleString(string)), n),
                 (None, n) => (None, n),
@@ -483,7 +483,7 @@ impl Parser {
             },
             ParserState::None => match value.get(0) {
                 Some(identifier) => {
-                    self.inner = ParserState::try_from(*identifier)?;
+                    self.state = ParserState::try_from(*identifier)?;
                     let (resp, n) = self.parse(&value[1..])?;
                     (resp, n + 1)
                 }
@@ -492,7 +492,7 @@ impl Parser {
         };
 
         if resp.is_some() {
-            self.inner = ParserState::None;
+            self.state = ParserState::None;
         }
 
         Ok((resp, n))
@@ -524,7 +524,7 @@ impl Parser {
 impl Default for Parser {
     fn default() -> Self {
         Self {
-            inner: ParserState::None,
+            state: ParserState::None,
         }
     }
 }

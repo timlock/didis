@@ -45,7 +45,7 @@ impl Dictionary {
             .flatten();
         let old = self.inner.remove(&key);
         if let Some(ref old) = old {
-            if let Some(ExpireRule::KEEPTTL) = expire_rule {
+            if let Some(ExpireRule::KeepTTL) = expire_rule {
                 expires_at = old.expires_at;
             }
         }

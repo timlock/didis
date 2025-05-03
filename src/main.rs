@@ -2,8 +2,8 @@ use didis::async_io::{Completion, IO};
 use didis::controller::Controller;
 use didis::dictionary::Dictionary;
 use didis::parser::command;
-use didis::parser::command::{parse_command, parse_command_bytes, Command};
-use didis::parser::resp::{Parser, Resp};
+use didis::parser::command::{parse_command, Command, Parser};
+use didis::parser::resp::Resp;
 use didis::parser::ring_buffer::RingBuffer;
 use didis::server::Server;
 use std::cmp::min;
@@ -82,14 +82,13 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
     let mut connections = HashMap::new();
 
     loop {
-        for completed in io.poll_timeout(Duration::from_secs(1))? {
-            match completed {
+        for completion in io.poll_timeout(Duration::from_secs(1))? {
+            match completion {
                 Completion::Accept(listener, stream) => {
-                    let stream = stream?;
-                    let address = stream.peer_addr()?;
+                    let (stream, address) = stream?;
                     println!["New client connected with address {}", address];
                     let cloned = stream.try_clone()?;
-                    let client = Client::try_from(cloned)?;
+                    let client = Client::new(cloned, address);
                     connections.insert(stream.as_raw_fd(), client);
 
                     let buf = Box::new([0u8; 1024]);
@@ -97,7 +96,7 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
 
                     io.accept(listener);
                 }
-                Completion::Send(stream, mut buf, res) => {
+                Completion::Send(stream, mut buf, result) => {
                     let connection = connections.get_mut(&stream.as_raw_fd()).expect(
                         format![
                             "Send data to unknown socket with file descriptor: {}",
@@ -105,11 +104,12 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
                         ]
                         .as_str(),
                     );
-                    match res {
-                        Ok(len) => {
-                            if len < connection.to_send {
-                                let remaining = connection.to_send - len;
-                                buf.copy_within(len..connection.to_send, 0);
+                    match result {
+                        Ok(sent) => {
+                            if sent < connection.to_send {
+                                let remaining = connection.to_send - sent;
+                                buf.copy_within(sent..connection.to_send, 0);
+                                
                                 io.send(stream, buf, remaining)
                             } else if !connection.remaining_out.is_empty() {
                                 let end = min(1024, connection.remaining_out.len());
@@ -117,6 +117,7 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
                                     let byte = connection.remaining_out.pop_front().unwrap();
                                     buf[i] = byte;
                                 }
+                                
                                 io.send(stream, buf, end)
                             } else {
                                 io.receive(stream, buf);
@@ -142,60 +143,37 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
                             println!("Closed connection {stream:?}");
                         }
                         Ok(len) => {
-                            let mut read = 0;
-                            let mut commands = vec![];
-                            let mut error = None;
-                            
-                            while read < len {
-                                match connection.resp_parser.parse(&buf[read..len]) {
-                                    Ok((Some(resp), n)) => {
-                                        read += n;
-                                        match parse_command(resp) {
-                                            Ok(command) => {
-                                                commands.push(command);
-                                            }
-                                            Err(err) => {
-                                                error = Some(err);
-                                                break;
-                                            }
-                                        };
-                                    }
-                                    Ok((None, n)) => read += n,
-                                    Err(err) => {
-                                        error = Some(command::Error::from(err));
-                                        break;
-                                    }
-                                }
-                            }
-                            let mut start = 0;
+                            let (commands, read) = connection.command_parser.parse_all(&buf[..len]);
+                            connection.remaining_out.extend(&buf[read..len]);
+
+                            let mut to_send = 0;
                             for command in commands {
-                                println!("Received command: {:?}", command);
-                                let response = controller.handle_command(command);
-                                println!("Sending response {response}");
-                                let bytes = Vec::from(response);
-                                if start + bytes.len() > buf.len() {
+                                let bytes = match command {
+                                    Ok(command) => {
+                                        println!("Received command: {:?}", command);
+                                        let response = controller.handle_command(command);
+                                        println!("Sending response {response}");
+                                        
+                                        Vec::from(response)
+                                    }
+                                    Err(err) => {
+                                        eprintln!("Received faulty command: {:?}", err);
+                                        let resp_err = Resp::SimpleError(err.to_string());
+                                        
+                                        Vec::from(resp_err)
+                                    }
+                                };
+                                if to_send + bytes.len() > buf.len() {
                                     connection.remaining_out.extend(bytes);
                                 } else {
-                                    buf[start..(start + bytes.len())]
+                                    buf[to_send..(to_send + bytes.len())]
                                         .copy_from_slice(bytes.as_slice());
-                                    start += bytes.len();
+                                    to_send += bytes.len();
                                 }
                             }
 
-                            if let Some(err) = error {
-                                let resp_err = Resp::SimpleError(err.to_string());
-                                let bytes = Vec::from(resp_err);
-                                if start + bytes.len() > buf.len() {
-                                    connection.remaining_out.extend(bytes);
-                                } else {
-                                    buf[start..(start + bytes.len())]
-                                        .copy_from_slice(bytes.as_slice());
-                                    start += bytes.len();
-                                }
-                            }
-
-                            connection.to_send = start;
-                            io.send(stream, buf, start);
+                            connection.to_send = to_send;
+                            io.send(stream, buf, to_send);
                         }
                         Err(err) => {
                             connections.remove(&stream.as_raw_fd());
@@ -212,23 +190,20 @@ struct Client {
     remaining_out: VecDeque<u8>,
     to_send: usize,
     remaining_in: RingBuffer<4096>,
-    resp_parser: Parser,
+    command_parser: Parser,
     address: SocketAddr,
     stream: TcpStream,
 }
 
-impl TryFrom<TcpStream> for Client {
-    type Error = io::Error;
-
-    fn try_from(stream: TcpStream) -> Result<Self, Self::Error> {
-        let address = stream.peer_addr()?;
-        Ok(Client {
+impl Client {
+    fn new(stream: TcpStream, address: SocketAddr) -> Self {
+        Self {
             remaining_out: Default::default(),
             to_send: 0,
             remaining_in: Default::default(),
-            resp_parser: Default::default(),
+            command_parser: Default::default(),
             address,
             stream,
-        })
+        }
     }
 }

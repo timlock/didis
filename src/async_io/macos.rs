@@ -6,18 +6,37 @@ use std::fmt::Debug;
 use std::io;
 use std::io::{Read, Write};
 use std::mem::zeroed;
-use std::net::{TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::ops::Deref;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::time::Duration;
 
 const BUFFER_SIZE: usize = 1024;
 #[derive(Debug)]
 pub enum Completion {
-    Accept(TcpListener, TcpStream),
-    Close(RawFd),
-    Send(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
-    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
+    Accept(TcpListener, io::Result<(TcpStream, SocketAddr)>),
+    Send(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
+    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
+}
+
+impl From<Task> for Completion {
+    fn from(value: Task) -> Self {
+        match value {
+            Task::Accept(socket) => {
+                let result = socket.accept();
+                Completion::Accept(socket, result)
+            }
+            Task::Receive(mut socket, mut buf) => {
+                let n = socket.read(buf.as_mut_slice());
+                Completion::Receive(socket, buf, n)
+            }
+            Task::Send(mut socket, mut buf, len) => {
+                let n = socket.write(&mut buf[..len]);
+                Completion::Send(socket, buf, n)
+            }
+        }
+    }
 }
 
 enum Task {
@@ -26,35 +45,16 @@ enum Task {
     Send(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
 }
 
-impl Task {
-    // TODO impl From<Task> for Completion instead
-    fn complete(self) -> io::Result<Completion> {
-        let result = match self {
-            Task::Accept(socket) => {
-                let (stream, _) = socket.accept()?;
-                Completion::Accept(socket, stream)
-            }
-            Task::Receive(mut socket, mut buf) => {
-                let n = socket.read(buf.as_mut_slice())?;
-                Completion::Receive(socket, buf, n)
-            }
-            Task::Send(mut socket, mut buf, len) => {
-                let n = socket.write(&mut buf[..len])?;
-                Completion::Send(socket, buf, n)
-            }
-        };
-        Ok(result)
-    }
-}
 
-pub struct IO<const N: usize> {
+pub struct IO {
     kqueue: c_int,
     pending: VecDeque<kevent>,
-    events: [kevent; N],
+    events: Vec<kevent>,
+    N: usize,
 }
 
-impl<const N: usize> IO<N> {
-    pub fn new() -> io::Result<Self> {
+impl IO {
+    pub fn new(queue_depth: usize) -> io::Result<Self> {
         let kqueue = unsafe { kqueue() };
         if kqueue == -1 {
             return Err(io::Error::last_os_error());
@@ -63,7 +63,8 @@ impl<const N: usize> IO<N> {
         Ok(Self {
             kqueue,
             pending: Default::default(),
-            events: unsafe { [zeroed(); N] },
+            events: unsafe { vec![zeroed(); queue_depth] },
+            N: queue_depth,
         })
     }
 
@@ -128,7 +129,7 @@ impl<const N: usize> IO<N> {
         for event in self.events[..completed_events].iter() {
             let task_ptr: *mut Task = event.udata as _;
             let task = unsafe { Box::from_raw(task_ptr) };
-            let result = task.complete()?;
+            let result = Completion::from(*task);
             results.push(result);
         }
 
@@ -173,7 +174,7 @@ impl<const N: usize> IO<N> {
     }
 }
 
-impl<const N: usize> Drop for IO<N> {
+impl Drop for IO {
     fn drop(&mut self) {
         unsafe { close(self.kqueue) };
     }
@@ -193,7 +194,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:8000")?;
         listener.set_nonblocking(true)?;
 
-        let mut io: IO<1> = IO::new()?;
+        let mut io = IO::new(1)?;
         io.accept(listener.try_clone().unwrap());
 
         let address = SocketAddr::from_str("127.0.0.1:8000")?;
@@ -219,7 +220,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:8001")?;
         listener.set_nonblocking(true)?;
 
-        let mut io: IO<8> = IO::new()?;
+        let mut io = IO::new(8)?;
         io.accept(listener.try_clone().unwrap());
 
         let address = SocketAddr::from_str("127.0.0.1:8001")?;
@@ -241,8 +242,8 @@ mod tests {
 
         let mut results = io.poll_timeout(Duration::from_secs(1))?;
         assert_eq!(1, results.len());
-        let socket = match results.remove(0) {
-            Completion::Accept(socket, stream) => stream,
+        let (socket, _) = match results.remove(0) {
+            Completion::Accept(socket, stream) => stream?,
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Client connected");
@@ -251,7 +252,7 @@ mod tests {
         io.receive(socket.try_clone().unwrap(), buf);
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len) = match results.remove(0) {
-            Completion::Receive(stream, buf, len) => (buf, len),
+            Completion::Receive(stream, buf, len) => (buf, len?),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Received {len} bytes from client");
@@ -263,7 +264,7 @@ mod tests {
         io.send(socket.try_clone().unwrap(), buf, 5);
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len) = match results.remove(0) {
-            Completion::Send(stream, buf, len) => (buf, len),
+            Completion::Send(stream, buf, len) => (buf, len?),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Sent {} bytes to client", len);
