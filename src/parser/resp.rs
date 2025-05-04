@@ -1,4 +1,5 @@
 use crate::parser::ring_buffer::RingBuffer;
+use std::borrow::Borrow;
 use std::cmp::min;
 use std::fmt::{self, Display};
 use std::io::Read;
@@ -57,7 +58,6 @@ impl From<ParseIntError> for Error {
         Error::ParseInt(value)
     }
 }
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Resp {
     SimpleString(String),
@@ -261,6 +261,167 @@ pub fn try_read(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<()> 
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RespRef<'a> {
+    SimpleString(&'a str),
+    SimpleError(&'a str),
+    Integer(i64),
+    BulkString(&'a str),
+    Array(Vec<RespRef<'a>>),
+    Null,
+}
+
+impl<'a> Borrow<RespRef<'a>> for Resp {
+    fn borrow(&self) -> &RespRef<'a> {
+        todo!()
+    }
+}
+impl<'a> ToOwned for RespRef<'a> {
+    type Owned = Resp;
+
+    fn to_owned(&self) -> Self::Owned {
+        match &self {
+            RespRef::SimpleString(string) => Resp::SimpleString((*string).to_owned()),
+            RespRef::SimpleError(error) => Resp::SimpleError((*error).to_owned()),
+            RespRef::Integer(integer) => Resp::Integer(*integer),
+            RespRef::BulkString(string) => Resp::BulkString((*string).to_owned()),
+            RespRef::Array(array) => {
+                Resp::Array(array.iter().map(|resp| resp.to_owned()).collect())
+            }
+            RespRef::Null => Resp::Null,
+        }
+    }
+}
+
+fn parse_line_ref(value: &[u8]) -> Result<(Option<&str>, &[u8]), Error> {
+    match value.iter().position(|b| *b == b'\r') {
+        Some(pos) => match value.get(pos) {
+            Some(b'\r') => {
+                let (line, remaining) = match value.split_at_checked(pos + 2) {
+                    Some(split) => split,
+                    None => (value, Default::default()),
+                };
+                let line_str = str::from_utf8(line)?;
+                Ok((Some(line_str), remaining))
+            }
+            Some(other) => Err(Error::InvalidToken(*other)),
+            None => Ok((None, value)),
+        },
+        None => Ok((None, value)),
+    }
+}
+
+fn parse_length_ref(value: &[u8]) -> Result<(Option<(i64, &str)>, &[u8]), Error> {
+    match parse_line_ref(value)? {
+        (Some(line), remaining) => Ok((Some((*&line[..line.len() - 2].parse()?, line)), remaining)),
+        (None, remaining) => Ok((None, remaining)),
+    }
+}
+
+fn parse_simple_string_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
+    match parse_line_ref(value)? {
+        (Some(line), remaining) => {
+            let resp = RespRef::SimpleString(&line[..line.len() - 2]);
+            Ok((Some(resp), remaining))
+        }
+        (None, remaining) => Ok((None, remaining)),
+    }
+}
+
+fn parse_simple_error_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
+    match parse_line_ref(value)? {
+        (Some(line), remaining) => Ok((
+            Some(RespRef::SimpleError(&line[..line.len() - 2])),
+            remaining,
+        )),
+        (None, remaining) => Ok((None, remaining)),
+    }
+}
+
+fn parse_integer_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
+    match parse_length_ref(value)? {
+        (Some((integer, line)), remaining) => Ok((Some(RespRef::Integer(integer)), remaining)),
+        (None, remaining) => Ok((None, remaining)),
+    }
+}
+
+fn parse_bulk_string_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
+    let (length, parsed, remaining) = match parse_length_ref(value)? {
+        (Some((length, line)), remaining) => (length, line, remaining),
+        (None, remaining) => return Ok((None, remaining)),
+    };
+
+    if length == -1 {
+        return Ok((Some(RespRef::Null), remaining));
+    }
+
+    if length + 2 > remaining.len() as i64 {
+        return Ok((None, remaining));
+    }
+
+    let cr_pos = length as usize;
+
+    let cr = remaining[cr_pos];
+    if cr != b'\r' {
+        return Err(Error::InvalidToken(cr));
+    }
+    let lf = remaining[cr_pos + 1];
+    if lf != b'\n' {
+        return Err(Error::InvalidToken(lf));
+    }
+
+    let (source, remaining) = remaining.split_at(cr_pos + 2);
+    let source = str::from_utf8(source)?;
+    let string = &source[..source.len() - 2];
+
+    Ok((Some(RespRef::BulkString(string)), remaining))
+}
+
+fn parse_array_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
+    let (length, parsed, mut remaining) = match parse_length_ref(value)? {
+        (Some((length, line)), remaining) => (length, line, remaining),
+        (None, remaining) => return Ok((None, remaining)),
+    };
+
+    if length == -1 {
+        return Ok((Some(RespRef::Null), remaining));
+    }
+
+    let length = length as usize;
+    let mut items = Vec::with_capacity(length);
+    for _ in 0..length {
+        match parse_borrowed_resp(remaining)? {
+            (Some(resp), r) => {
+                items.push(resp);
+                remaining = r;
+            }
+            (None, r) => return Ok((None, r)),
+        }
+    }
+
+    Ok((Some(RespRef::Array(items)), remaining))
+}
+
+fn parse_borrowed_resp(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
+    if value.is_empty() {
+        return Ok((None, value));
+    }
+
+    let type_prefix = value[0];
+    let value = &value[1..];
+
+    let result = match type_prefix {
+        b'+' => parse_simple_string_ref(value)?,
+        b'-' => parse_simple_error_ref(value)?,
+        b':' => parse_integer_ref(value)?,
+        b'$' => parse_bulk_string_ref(value)?,
+        b'*' => parse_array_ref(value)?,
+        _ => return Err(Error::UnknownResp(value[0])),
+    };
+
+    Ok(result)
 }
 
 #[derive(Debug, Default)]
@@ -1076,6 +1237,172 @@ mod tests {
         match resp {
             Some(Resp::Null) => Ok(()),
             _ => Err("Should be null".into()),
+        }
+    }
+
+    #[test]
+    fn parse_null_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "$-1\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::Null), r) => {
+                assert!(r.is_empty());
+                Ok(())
+            }
+            _ => Err("Should be null".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "*1\r\n$4\r\nping\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::Array(arr)), r) => {
+                assert!(r.is_empty());
+                assert_eq!(arr.len(), 1);
+                match arr[0] {
+                    RespRef::BulkString(s) => assert_eq!(s, "ping"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array2_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "*2\r\n$4\r\necho\r\n$11\r\nhello world\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::Array(arr)), r) => {
+                assert!(r.is_empty());
+                assert_eq!(arr.len(), 2);
+                match arr[0] {
+                    RespRef::BulkString(s) => assert_eq!(s, "echo"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                match arr[1] {
+                    RespRef::BulkString(s) => assert_eq!(s, "hello world"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array3_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "*2\r\n$3\r\nget\r\n$3\r\nkey\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::Array(arr)), r) => {
+                assert!(r.is_empty());
+                assert_eq!(arr.len(), 2);
+                match arr[0] {
+                    RespRef::BulkString(s) => assert_eq!(s, "get"),
+                    _ => return Err("Array should contain a bulk string".into()),
+                }
+                match arr[1] {
+                    RespRef::BulkString(s) => assert_eq!(s, "key"),
+                    _ => return Err("Array should contain a bulk string".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_array4_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nsave\r\n*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::Array(arr)), r) => {
+                assert_eq!(arr.len(), 3);
+                match arr[0] {
+                    RespRef::BulkString(s) => assert_eq!(s, "CONFIG"),
+                    _ => return Err("Expected bulk string".into()),
+                }
+                match arr[1] {
+                    RespRef::BulkString(s) => assert_eq!(s, "GET"),
+                    _ => return Err("Expected bulk string".into()),
+                }
+                match arr[2] {
+                    RespRef::BulkString(s) => assert_eq!(s, "save"),
+                    _ => return Err("Expected bulk string".into()),
+                }
+                assert!(!r.is_empty());
+                match parse_borrowed_resp(r)? {
+                    (Some(resp), r) => match resp {
+                        RespRef::Array(arr) => {
+                            assert_eq!(arr.len(), 3);
+                            assert!(r.is_empty());
+                            match arr[0] {
+                                RespRef::BulkString(s) => assert_eq!(s, "CONFIG"),
+                                _ => return Err("Expected bulk string".into()),
+                            }
+                            match arr[1] {
+                                RespRef::BulkString(s) => assert_eq!(s, "GET"),
+                                _ => return Err("Expected bulk string".into()),
+                            }
+                            match arr[2] {
+                                RespRef::BulkString(s) => assert_eq!(s, "appendonly"),
+                                _ => return Err("Expected bulk string".into()),
+                            }
+                        }
+                        _ => return Err("Should be of type array".into()),
+                    },
+                    _ => return Err("Should be of type array".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_simple_string_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "+OK\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::SimpleString(s)), _) => {
+                assert_eq!(s, "OK");
+                Ok(())
+            }
+            _ => Err("Should be of type simple string".into()),
+        }
+    }
+
+    #[test]
+    fn parse_simple_error_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "-ERROR message\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::SimpleError(s)), _) => {
+                assert_eq!(s, "ERROR message");
+                Ok(())
+            }
+            _ => Err("Should be of type simple error".into()),
+        }
+    }
+
+    #[test]
+    fn parse_empty_bulk_string_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "$0\r\n\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::BulkString(s)), _) => {
+                assert_eq!(s, "");
+                Ok(())
+            }
+            _ => Err("Should be of type bulk string".into()),
+        }
+    }
+
+    #[test]
+    fn parse_simple_string2_ref() -> Result<(), Box<dyn error::Error>> {
+        let input = "+hello world\r\n";
+        match parse_borrowed_resp(input.as_bytes())? {
+            (Some(RespRef::SimpleString(s)), _) => {
+                assert_eq!(s, "hello world");
+                Ok(())
+            }
+            _ => Err("Should be of type simple string".into()),
         }
     }
 }
