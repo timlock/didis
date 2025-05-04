@@ -45,7 +45,6 @@ enum Task {
     Send(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
 }
 
-
 pub struct IO {
     kqueue: c_int,
     pending: VecDeque<kevent>,
@@ -84,7 +83,7 @@ impl IO {
 
     pub fn receive(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>) {
         let fd = socket.as_raw_fd();
-        let task_ptr = unsafe { Box::into_raw(Box::new(Task::Receive(socket, buf))) };
+        let task_ptr =  Box::into_raw(Box::new(Task::Receive(socket, buf))) ;
 
         let event = kevent {
             ident: fd as usize,
@@ -100,7 +99,7 @@ impl IO {
 
     pub fn send(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>, len: usize) {
         let fd = socket.as_raw_fd();
-        let task_ptr = unsafe { Box::into_raw(Box::new(Task::Send(socket, buf, len))) };
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buf, len)));
 
         let event = kevent {
             ident: fd as usize,
