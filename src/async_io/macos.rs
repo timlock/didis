@@ -50,7 +50,6 @@ pub struct IO {
     kqueue: c_int,
     pending: VecDeque<kevent>,
     events: Vec<kevent>,
-    N: usize,
 }
 
 impl IO {
@@ -64,7 +63,6 @@ impl IO {
             kqueue,
             pending: Default::default(),
             events: unsafe { vec![zeroed(); queue_depth] },
-            N: queue_depth,
         })
     }
 
