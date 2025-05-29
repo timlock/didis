@@ -21,7 +21,7 @@ impl From<Task> for Completion {
                 Completion::Accept(socket, result)
             }
             Task::Receive(mut socket, mut buf) => {
-                let n = socket.read(buf.as_mut_slice());
+                let n = socket.read(buf.as_mut());
                 Completion::Receive(socket, buf, n)
             }
             Task::Send(mut socket, mut buf, len) => {

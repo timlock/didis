@@ -1,5 +1,5 @@
 use crate::parser::ring_buffer::RingBuffer;
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::cmp::min;
 use std::fmt::{self, Display};
 use std::io::Read;
@@ -264,37 +264,110 @@ pub fn try_read(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<()> 
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum RespRef<'a> {
-    SimpleString(&'a str),
-    SimpleError(&'a str),
+pub enum RespRef<'a> {
+    SimpleString(Cow<'a, str>),
+    SimpleError(Cow<'a, str>),
     Integer(i64),
-    BulkString(&'a str),
+    BulkString(Cow<'a, str>),
     Array(Vec<RespRef<'a>>),
     Null,
 }
 
-impl<'a> Borrow<RespRef<'a>> for Resp {
-    fn borrow(&self) -> &RespRef<'a> {
-        todo!()
+impl<'a> RespRef<'a> {
+    pub fn ok() -> RespRef<'a> {
+        RespRef::SimpleString(Cow::Borrowed("OK"))
     }
-}
-impl<'a> ToOwned for RespRef<'a> {
-    type Owned = Resp;
-
-    fn to_owned(&self) -> Self::Owned {
-        match &self {
-            RespRef::SimpleString(string) => Resp::SimpleString((*string).to_owned()),
-            RespRef::SimpleError(error) => Resp::SimpleError((*error).to_owned()),
-            RespRef::Integer(integer) => Resp::Integer(*integer),
-            RespRef::BulkString(string) => Resp::BulkString((*string).to_owned()),
-            RespRef::Array(array) => {
-                Resp::Array(array.iter().map(|resp| resp.to_owned()).collect())
+    
+    pub fn to_bytes(self) -> Vec<u8>{
+        let mut bytes = Vec::new();
+        const CRLF: &[u8; 2] = b"\r\n";
+        match self {
+            RespRef::SimpleString(s) => {
+                bytes.push(b'+');
+                bytes.extend_from_slice(s.as_bytes());
+                bytes.extend_from_slice(CRLF);
             }
-            RespRef::Null => Resp::Null,
+            RespRef::SimpleError(s) => {
+                bytes.push(b'-');
+                bytes.extend_from_slice(s.as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            RespRef::Integer(i) => {
+                bytes.push(b':');
+                bytes.extend_from_slice(i.to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            RespRef::BulkString(b) => {
+                bytes.push(b'$');
+                bytes.extend_from_slice(b.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                bytes.extend_from_slice(b.as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            RespRef::Array(resps) => {
+                bytes.push(b'*');
+                bytes.extend_from_slice(resps.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                for resp in resps {
+                    let serialized = resp.to_bytes();
+                    bytes.extend_from_slice(&serialized);
+                }
+            }
+            RespRef::Null => bytes.extend_from_slice(b"*-1\r\n"),
         }
+        bytes
+    }
+}
+impl<'a> Display for RespRef<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", String::from(self))
     }
 }
 
+impl<'a> From<&RespRef<'a>> for String {
+    fn from(value: &RespRef<'a>) -> Self {
+        let mut string = String::new();
+        const CLRF: &str = "\r\n";
+        match value {
+            RespRef::SimpleString(s) => {
+                string += "+";
+                string += s;
+                string += CLRF;
+            }
+            RespRef::SimpleError(e) => {
+                string += "-";
+                string += e;
+                string += CLRF;
+            }
+            RespRef::Integer(i) => {
+                string += ":";
+                string += i.to_string().as_str();
+                string += CLRF;
+            }
+            RespRef::BulkString(b) => {
+                string += "$";
+                string += b.len().to_string().as_str();
+                string += CLRF;
+                string += b;
+                string += CLRF;
+            }
+            RespRef::Array(a) => {
+                string += "*";
+                string += a.len().to_string().as_str();
+                string += CLRF;
+                for i in a {
+                    string += String::from(i).as_str();
+                }
+            }
+            RespRef::Null => {
+                string += "*";
+                string += "-1";
+                string += CLRF;
+            }
+        }
+        string
+    }
+}
 fn parse_line_ref(value: &[u8]) -> Result<(Option<&str>, &[u8]), Error> {
     match value.iter().position(|b| *b == b'\r') {
         Some(pos) => match value.get(pos) {
@@ -323,7 +396,7 @@ fn parse_length_ref(value: &[u8]) -> Result<(Option<(i64, &str)>, &[u8]), Error>
 fn parse_simple_string_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
     match parse_line_ref(value)? {
         (Some(line), remaining) => {
-            let resp = RespRef::SimpleString(&line[..line.len() - 2]);
+            let resp = RespRef::SimpleString(Cow::Borrowed(&line[..line.len() - 2]));
             Ok((Some(resp), remaining))
         }
         (None, remaining) => Ok((None, remaining)),
@@ -333,7 +406,7 @@ fn parse_simple_string_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Err
 fn parse_simple_error_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error> {
     match parse_line_ref(value)? {
         (Some(line), remaining) => Ok((
-            Some(RespRef::SimpleError(&line[..line.len() - 2])),
+            Some(RespRef::SimpleError(Cow::Borrowed(&line[..line.len() - 2]))),
             remaining,
         )),
         (None, remaining) => Ok((None, remaining)),
@@ -374,7 +447,7 @@ fn parse_bulk_string_ref(value: &[u8]) -> Result<(Option<RespRef>, &[u8]), Error
 
     let (source, remaining) = remaining.split_at(cr_pos + 2);
     let source = str::from_utf8(source)?;
-    let string = &source[..source.len() - 2];
+    let string = Cow::Borrowed(&source[..source.len() - 2]);
 
     Ok((Some(RespRef::BulkString(string)), remaining))
 }
@@ -1259,7 +1332,7 @@ mod tests {
             (Some(RespRef::Array(arr)), r) => {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 1);
-                match arr[0] {
+                match arr[0].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "ping"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
@@ -1276,11 +1349,11 @@ mod tests {
             (Some(RespRef::Array(arr)), r) => {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 2);
-                match arr[0] {
+                match arr[0].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "echo"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
-                match arr[1] {
+                match arr[1].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "hello world"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
@@ -1297,11 +1370,11 @@ mod tests {
             (Some(RespRef::Array(arr)), r) => {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 2);
-                match arr[0] {
+                match arr[0].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "get"),
                     _ => return Err("Array should contain a bulk string".into()),
                 }
-                match arr[1] {
+                match arr[1].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "key"),
                     _ => return Err("Array should contain a bulk string".into()),
                 }
@@ -1317,15 +1390,15 @@ mod tests {
         match parse_borrowed_resp(input.as_bytes())? {
             (Some(RespRef::Array(arr)), r) => {
                 assert_eq!(arr.len(), 3);
-                match arr[0] {
+                match arr[0].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "CONFIG"),
                     _ => return Err("Expected bulk string".into()),
                 }
-                match arr[1] {
+                match arr[1].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "GET"),
                     _ => return Err("Expected bulk string".into()),
                 }
-                match arr[2] {
+                match arr[2].borrow() {
                     RespRef::BulkString(s) => assert_eq!(s, "save"),
                     _ => return Err("Expected bulk string".into()),
                 }
@@ -1335,15 +1408,15 @@ mod tests {
                         RespRef::Array(arr) => {
                             assert_eq!(arr.len(), 3);
                             assert!(r.is_empty());
-                            match arr[0] {
+                            match arr[0].borrow() {
                                 RespRef::BulkString(s) => assert_eq!(s, "CONFIG"),
                                 _ => return Err("Expected bulk string".into()),
                             }
-                            match arr[1] {
+                            match arr[1].borrow() {
                                 RespRef::BulkString(s) => assert_eq!(s, "GET"),
                                 _ => return Err("Expected bulk string".into()),
                             }
-                            match arr[2] {
+                            match arr[2].borrow() {
                                 RespRef::BulkString(s) => assert_eq!(s, "appendonly"),
                                 _ => return Err("Expected bulk string".into()),
                             }

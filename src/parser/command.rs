@@ -1,4 +1,4 @@
-use super::{command, resp};
+use super::resp;
 use crate::parser::resp::{parse_resp, Resp};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};

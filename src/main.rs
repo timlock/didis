@@ -3,17 +3,20 @@ use didis::controller::Controller;
 use didis::dictionary::Dictionary;
 use didis::parser::command;
 use didis::parser::command::Parser;
-use didis::parser::resp::Resp;
-use didis::parser::ring_buffer::RingBuffer;
-use didis::server::Server;
+use didis::parser::resp::{Resp, RespRef};
+use didis::server::{AsyncServer, Server};
+use std::borrow::Cow;
 use std::cmp::min;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
+
+const QUEUE_DEPTH: usize = 256;
+const BUFFER_SIZE: usize = 4096;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let address = "127.0.0.1:6379";
@@ -22,7 +25,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting server on {}", address);
     // let result = run(server, worker);
-    let result = run_async(address, worker);
+
+    let io = IO::new(QUEUE_DEPTH)?;
+    let mut server = AsyncServer::new(io);
+    let result = server.run(address);
+    // let result = run_async(address, worker);
     println!("Server stopped");
     result.map_err(|e| e.into())
 }
@@ -39,7 +46,7 @@ fn run(mut server: Server, mut controller: Controller) -> Result<(), io::Error> 
                         println!("Received command: {:?}", command);
                         let response = controller.handle_command(command);
                         println!("Sending response {response}");
-                        let serialized = Vec::from(response);
+                        let serialized = (response).to_bytes();
                         if let Err(err) = connection.outgoing.write_all(&serialized) {
                             disconnected.push(address.clone());
                             eprintln!("{err}");
@@ -76,7 +83,7 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
 
-    let mut io = IO::new(256)?;
+    let mut io = IO::new(QUEUE_DEPTH)?;
     io.accept(listener);
 
     let mut connections = HashMap::new();
@@ -84,14 +91,14 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
     loop {
         for completion in io.poll_timeout(Duration::from_secs(1))? {
             match completion {
-                Completion::Accept(listener, stream) => {
-                    let (stream, address) = stream?;
+                Completion::Accept(listener, result) => {
+                    let (stream, address) = result?;
                     println!["New client connected with address {}", address];
                     let cloned = stream.try_clone()?;
-                    let client = Client::new(cloned, address);
+                    let client = Connection::new(cloned, address);
                     connections.insert(stream.as_raw_fd(), client);
 
-                    let buf = Box::new([0u8; 1024]);
+                    let buf = Box::new([0u8; BUFFER_SIZE]);
                     io.receive(stream, buf);
 
                     io.accept(listener);
@@ -106,21 +113,11 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
                     );
                     match result {
                         Ok(sent) => {
-                            if sent < connection.to_send {
-                                let remaining = connection.to_send - sent;
-                                buf.copy_within(sent..connection.to_send, 0);
-                                
-                                io.send(stream, buf, remaining)
-                            } else if !connection.remaining_out.is_empty() {
-                                let end = min(1024, connection.remaining_out.len());
-                                for i in 0..end {
-                                    let byte = connection.remaining_out.pop_front().unwrap();
-                                    buf[i] = byte;
-                                }
-                                
-                                io.send(stream, buf, end)
+                            connection.handle_sent(sent, buf.as_mut());
+                            if connection.to_send > 0 {
+                                io.send(stream, buf, connection.to_send)
                             } else {
-                                io.receive(stream, buf);
+                                io.receive(stream, buf)
                             }
                         }
                         Err(err) => {
@@ -144,36 +141,36 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
                         }
                         Ok(len) => {
                             let (commands, read) = connection.command_parser.parse_all(&buf[..len]);
-                            connection.remaining_out.extend(&buf[read..len]);
+                            connection.remaining_in.extend(&buf[read..len]);
 
-                            let mut to_send = 0;
                             for command in commands {
                                 let bytes = match command {
                                     Ok(command) => {
                                         println!("Received command: {:?}", command);
                                         let response = controller.handle_command(command);
                                         println!("Sending response {response}");
-                                        
-                                        Vec::from(response)
+
+                                        response.to_bytes()
                                     }
                                     Err(err) => {
                                         eprintln!("Received faulty command: {:?}", err);
-                                        let resp_err = Resp::SimpleError(err.to_string());
-                                        
-                                        Vec::from(resp_err)
+                                        let resp_err =
+                                            RespRef::SimpleError(Cow::Owned(err.to_string()));
+
+                                        resp_err.to_bytes()
                                     }
                                 };
-                                if to_send + bytes.len() > buf.len() {
+
+                                if connection.to_send + bytes.len() > buf.len() {
                                     connection.remaining_out.extend(bytes);
                                 } else {
-                                    buf[to_send..(to_send + bytes.len())]
+                                    buf[connection.to_send..(connection.to_send + bytes.len())]
                                         .copy_from_slice(bytes.as_slice());
-                                    to_send += bytes.len();
+                                    connection.to_send += bytes.len();
                                 }
                             }
 
-                            connection.to_send = to_send;
-                            io.send(stream, buf, to_send);
+                            io.send(stream, buf, connection.to_send);
                         }
                         Err(err) => {
                             connections.remove(&stream.as_raw_fd());
@@ -186,16 +183,16 @@ fn run_async(address: &str, mut controller: Controller) -> Result<(), io::Error>
     }
 }
 
-struct Client {
-    remaining_out: VecDeque<u8>,
+struct Connection {
+    remaining_out: Vec<u8>,
     to_send: usize,
-    remaining_in: RingBuffer<4096>,
+    remaining_in: Vec<u8>,
     command_parser: Parser,
     address: SocketAddr,
     stream: TcpStream,
 }
 
-impl Client {
+impl Connection {
     fn new(stream: TcpStream, address: SocketAddr) -> Self {
         Self {
             remaining_out: Default::default(),
@@ -204,6 +201,20 @@ impl Client {
             command_parser: Default::default(),
             address,
             stream,
+        }
+    }
+
+    fn handle_sent(&mut self, sent: usize, buffer: &mut [u8]) {
+        if self.to_send > 0 {
+            buffer.copy_within(sent..self.to_send, 0);
+        }
+
+        self.to_send -= sent;
+
+        if !self.remaining_out.is_empty() && self.to_send != buffer.len() {
+            let to_copy = min(buffer.len() - self.to_send, self.remaining_out.len());
+            let copy_range = self.to_send..(self.to_send + to_copy);
+            buffer[copy_range].copy_from_slice(&self.remaining_out.as_slice()[..to_copy]);
         }
     }
 }

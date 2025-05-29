@@ -2,6 +2,7 @@ use crate::parser::command::{ExpireRule, OverwriteRule};
 use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, error, time::SystemTime};
 
+#[derive(Default)]
 pub struct Dictionary {
     inner: HashMap<String, Entry>,
 }
