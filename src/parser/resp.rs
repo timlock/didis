@@ -72,6 +72,45 @@ impl Resp {
     pub fn ok() -> Resp {
         Resp::SimpleString("OK".to_string())
     }
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        const CRLF: &[u8; 2] = b"\r\n";
+        match self {
+            Resp::SimpleString(s) => {
+                bytes.push(b'+');
+                bytes.extend_from_slice(s.as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::SimpleError(s) => {
+                bytes.push(b'-');
+                bytes.extend_from_slice(s.as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::Integer(i) => {
+                bytes.push(b':');
+                bytes.extend_from_slice(i.to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::BulkString(b) => {
+                bytes.push(b'$');
+                bytes.extend_from_slice(b.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                bytes.extend_from_slice(b.as_bytes());
+                bytes.extend_from_slice(CRLF);
+            }
+            Resp::Array(resps) => {
+                bytes.push(b'*');
+                bytes.extend_from_slice(resps.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                for resp in resps {
+                    let serialized = resp.to_bytes();
+                    bytes.extend_from_slice(&serialized);
+                }
+            }
+            Resp::Null => bytes.extend_from_slice(b"*-1\r\n"),
+        }
+        bytes
+    }
 }
 
 impl Display for Resp {
@@ -122,48 +161,6 @@ impl From<&Resp> for String {
             }
         }
         string
-    }
-}
-
-impl From<Resp> for Vec<u8> {
-    fn from(value: Resp) -> Self {
-        let mut bytes = Vec::new();
-        const CRLF: &[u8; 2] = b"\r\n";
-        match value {
-            Resp::SimpleString(s) => {
-                bytes.push(b'+');
-                bytes.extend_from_slice(s.as_bytes());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::SimpleError(s) => {
-                bytes.push(b'-');
-                bytes.extend_from_slice(s.as_bytes());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::Integer(i) => {
-                bytes.push(b':');
-                bytes.extend_from_slice(i.to_string().as_bytes());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::BulkString(b) => {
-                bytes.push(b'$');
-                bytes.extend_from_slice(b.len().to_string().as_bytes());
-                bytes.extend_from_slice(CRLF);
-                bytes.extend_from_slice(b.as_bytes());
-                bytes.extend_from_slice(CRLF);
-            }
-            Resp::Array(resps) => {
-                bytes.push(b'*');
-                bytes.extend_from_slice(resps.len().to_string().as_bytes());
-                bytes.extend_from_slice(CRLF);
-                for resp in resps {
-                    let serialized = Vec::from(resp);
-                    bytes.extend_from_slice(&serialized);
-                }
-            }
-            Resp::Null => bytes.extend_from_slice(b"*-1\r\n"),
-        }
-        bytes
     }
 }
 
@@ -277,8 +274,8 @@ impl<'a> RespRef<'a> {
     pub fn ok() -> RespRef<'a> {
         RespRef::SimpleString(Cow::Borrowed("OK"))
     }
-    
-    pub fn to_bytes(self) -> Vec<u8>{
+
+    pub fn to_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::new();
         const CRLF: &[u8; 2] = b"\r\n";
         match self {

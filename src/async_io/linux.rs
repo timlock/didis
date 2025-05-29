@@ -66,13 +66,13 @@ enum Task {
 pub struct IO {
     ring: io_uring,
     pending: VecDeque<Task>,
-    queue_depth: u32,
+    queue_depth: usize,
 }
 
 impl IO {
-    pub fn new(queue_depth: u32) -> io::Result<Self> {
+    pub fn new(queue_depth: usize) -> io::Result<Self> {
         let mut ring: io_uring = unsafe { zeroed() };
-        let ret = unsafe { io_uring_queue_init(queue_depth, &mut ring, 0) };
+        let ret = unsafe { io_uring_queue_init(queue_depth as _, &mut ring, 0) };
         if ret < 0 {
             return Err(io::Error::from_raw_os_error(-ret));
         }
@@ -90,7 +90,7 @@ impl IO {
             tv_nsec: duration.subsec_nanos() as _,
         };
 
-        let mut cqes = vec![null_mut(); self.queue_depth as usize];
+        let mut cqes = vec![null_mut(); self.queue_depth];
 
         let ret = unsafe {
             io_uring_submit_and_wait_timeout(

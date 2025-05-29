@@ -1,18 +1,10 @@
-use socket::TcpStreamNonBlocking;
-
 use crate::async_io::{AsyncIO, Completion, IO};
 use crate::controller::Controller;
 use crate::parser::command::Parser;
-use crate::parser::resp::RespRef;
-use crate::parser::{command, resp};
-use crate::server::listener::TcpListenerNonBlocking;
-use std::borrow::Cow;
-use std::cell::RefCell;
+use crate::parser::resp::Resp;
 use std::cmp::min;
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
-use std::rc::Rc;
 use std::time::Duration;
 use std::{
     collections::HashMap,
@@ -20,131 +12,16 @@ use std::{
     net::SocketAddr,
 };
 
-mod listener;
-mod socket;
 
 const BUFFER_SIZE: usize = 4096;
 
 pub struct Server {
-    listener: TcpListenerNonBlocking,
-    pub connections: HashMap<SocketAddr, Connection>,
-}
-
-impl Server {
-    pub fn new(address: &str) -> io::Result<Self> {
-        let listener = TcpListenerNonBlocking::bind(address)?;
-        Ok(Server {
-            listener,
-            connections: HashMap::new(),
-        })
-    }
-
-    pub fn accept_connections(&mut self) -> io::Result<()> {
-        loop {
-            match self.listener.accept() {
-                Ok(None) => return Ok(()),
-                Ok(Some((stream, address))) => {
-                    println!("new connection: {address}");
-                    self.connections.insert(address, Connection::from(stream));
-                }
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
-    pub fn disconnect(&mut self, address: SocketAddr) {
-        self.connections.remove(&address);
-    }
-}
-
-pub struct Connection {
-    pub incoming: command::RingDecoder<IoRef<TcpStreamNonBlocking>>,
-    // pub incoming: command::Decoder<IoRef<TcpStreamNonBlocking>>,
-    pub outgoing: IoRef<TcpStreamNonBlocking>,
-}
-impl Connection {
-    pub fn new(stream: TcpStreamNonBlocking) -> Self {
-        let socket_ref = IoRef::from(stream);
-        let resp_decoder = resp::RingDecoder::new(socket_ref.clone());
-        let command_decoder = command::RingDecoder::new(resp_decoder);
-
-        // let resp_decoder = resp::Decoder::new(socket_ref.clone());
-        // let command_decoder = command::Decoder::new(resp_decoder);
-
-        Self {
-            incoming: command_decoder,
-            outgoing: socket_ref,
-        }
-    }
-}
-
-impl From<TcpStreamNonBlocking> for Connection {
-    fn from(value: TcpStreamNonBlocking) -> Self {
-        Connection::new(value)
-    }
-}
-
-pub struct IoRef<T> {
-    inner: Rc<RefCell<T>>,
-}
-
-impl<T> IoRef<T>
-where
-    T: Read + Write,
-{
-    pub fn new(stream: T) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(stream)),
-        }
-    }
-}
-
-impl<T> From<T> for IoRef<T>
-where
-    T: Read + Write,
-{
-    fn from(value: T) -> Self {
-        IoRef::new(value)
-    }
-}
-
-impl<T> Read for IoRef<T>
-where
-    T: Read + Write,
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.borrow_mut().read(buf)
-    }
-}
-
-impl<T> Write for IoRef<T>
-where
-    T: Read + Write,
-{
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.borrow_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.borrow_mut().flush()
-    }
-}
-
-impl<T> Clone for IoRef<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-pub struct AsyncServer {
-    connections: HashMap<RawFd, AsyncConnection>,
+    connections: HashMap<RawFd, Connection>,
     controller: Controller,
     io: IO,
 }
 
-impl AsyncServer {
+impl Server {
     pub fn new(io: IO) -> Self {
         let connections = HashMap::new();
         Self {
@@ -190,7 +67,7 @@ impl AsyncServer {
         let (stream, address) = result?;
         println!["New client connected with address {}", address];
         let cloned = stream.try_clone()?;
-        let client = AsyncConnection::new(cloned, address);
+        let client = Connection::new(cloned, address);
         self.connections.insert(stream.as_raw_fd(), client);
 
         let buf = Box::new([0u8; BUFFER_SIZE]);
@@ -243,9 +120,7 @@ impl AsyncServer {
                         }
                         Err(err) => {
                             eprintln!("Received faulty command: {:?}", err);
-                            let resp_err = RespRef::SimpleError(Cow::Owned(err.to_string()));
-
-                            resp_err.to_bytes()
+                            Resp::SimpleError(err.to_string()).to_bytes()
                         }
                     };
 
@@ -264,7 +139,7 @@ impl AsyncServer {
     }
 }
 
-struct AsyncConnection {
+struct Connection {
     remaining_out: Vec<u8>,
     to_send: usize,
     remaining_in: Vec<u8>,
@@ -273,7 +148,7 @@ struct AsyncConnection {
     stream: TcpStream,
 }
 
-impl AsyncConnection {
+impl Connection {
     fn new(stream: TcpStream, address: SocketAddr) -> Self {
         Self {
             remaining_out: Default::default(),
