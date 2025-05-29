@@ -1,3 +1,4 @@
+use crate::async_io::{AsyncIO, Completion};
 use libc::{
     close, kevent, kqueue, timespec, EVFILT_READ, EVFILT_WRITE, EV_ADD, EV_CLEAR, EV_ONESHOT,
 };
@@ -11,14 +12,6 @@ use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::time::Duration;
-
-const BUFFER_SIZE: usize = 1024;
-#[derive(Debug)]
-pub enum Completion {
-    Accept(TcpListener, io::Result<(TcpStream, SocketAddr)>),
-    Send(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
-    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
-}
 
 impl From<Task> for Completion {
     fn from(value: Task) -> Self {
@@ -41,8 +34,8 @@ impl From<Task> for Completion {
 
 enum Task {
     Accept(TcpListener),
-    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>),
-    Send(TcpStream, Box<[u8; BUFFER_SIZE]>, usize),
+    Receive(TcpStream, Box<[u8]>),
+    Send(TcpStream, Box<[u8]>, usize),
 }
 
 pub struct IO {
@@ -63,74 +56,6 @@ impl IO {
             pending: Default::default(),
             events: unsafe { vec![zeroed(); queue_depth] },
         })
-    }
-
-    pub fn accept(&mut self, socket: TcpListener) {
-        let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Accept(socket)));
-
-        let event = kevent {
-            ident: fd as usize,
-            filter: EVFILT_READ,
-            flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
-            fflags: 0,
-            data: 0,
-            udata: task_ptr as _,
-        };
-
-        self.pending.push_back(event);
-    }
-
-    pub fn receive(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>) {
-        let fd = socket.as_raw_fd();
-        let task_ptr =  Box::into_raw(Box::new(Task::Receive(socket, buf))) ;
-
-        let event = kevent {
-            ident: fd as usize,
-            filter: EVFILT_READ,
-            flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
-            fflags: 0,
-            data: 0,
-            udata: task_ptr as _,
-        };
-
-        self.pending.push_back(event);
-    }
-
-    pub fn send(&mut self, socket: TcpStream, buf: Box<[u8; BUFFER_SIZE]>, len: usize) {
-        let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buf, len)));
-
-        let event = kevent {
-            ident: fd as usize,
-            filter: EVFILT_WRITE,
-            flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
-            fflags: 0,
-            data: 0,
-            udata: task_ptr as _,
-        };
-
-        self.pending.push_back(event);
-    }
-
-    pub fn poll(&mut self) -> io::Result<Vec<Completion>> {
-        self.poll_timeout(Duration::from_secs(0))
-    }
-
-    pub fn poll_timeout(&mut self, duration: Duration) -> io::Result<Vec<Completion>> {
-        let added_events = self.fill_change_list();
-        let completed_events = self.flush(added_events, duration);
-
-        let mut results = Vec::new();
-
-        for event in self.events[..completed_events].iter() {
-            let task_ptr: *mut Task = event.udata as _;
-            let task = unsafe { Box::from_raw(task_ptr) };
-            let result = Completion::from(*task);
-            results.push(result);
-        }
-
-        Ok(results)
     }
 
     fn flush(&mut self, changes: usize, duration: Duration) -> usize {
@@ -168,6 +93,76 @@ impl IO {
         }
 
         self.events.len()
+    }
+}
+
+impl AsyncIO for IO {
+    fn accept(&mut self, socket: TcpListener) {
+        let fd = socket.as_raw_fd();
+        let task_ptr = Box::into_raw(Box::new(Task::Accept(socket)));
+
+        let event = kevent {
+            ident: fd as usize,
+            filter: EVFILT_READ,
+            flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
+            fflags: 0,
+            data: 0,
+            udata: task_ptr as _,
+        };
+
+        self.pending.push_back(event);
+    }
+
+    fn receive(&mut self, socket: TcpStream, buf: Box<[u8]>) {
+        let fd = socket.as_raw_fd();
+        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buf)));
+
+        let event = kevent {
+            ident: fd as usize,
+            filter: EVFILT_READ,
+            flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
+            fflags: 0,
+            data: 0,
+            udata: task_ptr as _,
+        };
+
+        self.pending.push_back(event);
+    }
+
+    fn send(&mut self, socket: TcpStream, buf: Box<[u8]>, len: usize) {
+        let fd = socket.as_raw_fd();
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buf, len)));
+
+        let event = kevent {
+            ident: fd as usize,
+            filter: EVFILT_WRITE,
+            flags: EV_ADD | EV_CLEAR | EV_ONESHOT,
+            fflags: 0,
+            data: 0,
+            udata: task_ptr as _,
+        };
+
+        self.pending.push_back(event);
+    }
+
+    fn poll(&mut self) -> io::Result<Vec<Completion>> {
+        self.poll_timeout(Duration::from_secs(0))
+    }
+
+    fn poll_timeout(&mut self, duration: Duration) -> io::Result<Vec<Completion>> {
+        let added_events = self.fill_change_list();
+        let completed_events = self.flush(added_events, duration);
+
+        let mut results = Vec::new();
+
+        for event in self.events[..completed_events].iter() {
+            let task_ptr: *mut Task = event.udata as _;
+            let task = unsafe { Box::from_raw(task_ptr) };
+            let result = Completion::from(*task);
+            results.push(result);
+        }
+
+        Ok(results)
     }
 }
 
@@ -245,7 +240,7 @@ mod tests {
         };
         eprintln!("Client connected");
 
-        let buf = Box::new([0u8; BUFFER_SIZE]);
+        let buf = Box::new([0u8; 1024]);
         io.receive(socket.try_clone().unwrap(), buf);
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len) = match results.remove(0) {
@@ -256,7 +251,7 @@ mod tests {
         assert_eq!(5, len);
         assert_eq!(b"hello", buf[..5].iter().as_slice());
 
-        let mut buf = Box::new([0u8; BUFFER_SIZE]);
+        let mut buf = Box::new([0u8; 1024]);
         buf[..5].copy_from_slice(b"hello");
         io.send(socket.try_clone().unwrap(), buf, 5);
         results = io.poll_timeout(Duration::from_secs(1))?;

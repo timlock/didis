@@ -1,8 +1,8 @@
-use didis::async_io::{Completion, IO};
+use didis::async_io::{AsyncIO, Completion, IO};
 use didis::controller::Controller;
 use didis::dictionary::Dictionary;
 use didis::parser::command;
-use didis::parser::command::{parse_command, Command, Parser};
+use didis::parser::command::Parser;
 use didis::parser::resp::Resp;
 use didis::parser::ring_buffer::RingBuffer;
 use didis::server::Server;

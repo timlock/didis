@@ -5,24 +5,14 @@
 #[cfg(not(rust_analyzer))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+use crate::async_io::{AsyncIO, Completion};
 use std::collections::VecDeque;
 use std::io;
 use std::mem::zeroed;
 use std::net::{TcpListener, TcpStream};
-use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr::null_mut;
 use std::time::Duration;
-
-const QUEUE_DEPTH: u32 = 256;
-
-const BUFFER_SIZE: usize = 1024;
-
-pub enum Completion {
-    Accept(TcpListener, io::Result<TcpStream>),
-    Send(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
-    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>, io::Result<usize>),
-}
 
 impl From<&io_uring_cqe> for Completion {
     fn from(cqe: &io_uring_cqe) -> Self {
@@ -38,7 +28,10 @@ impl From<&io_uring_cqe> for Completion {
                     );
                 }
                 let socket = unsafe { TcpStream::from_raw_fd(cqe.res) };
-                Completion::Accept(listener, Ok(socket))
+                match socket.peer_addr() {
+                    Ok(address) => Completion::Accept(listener, Ok((socket, address))),
+                    Err(err) => Completion::Accept(listener, Err(err)),
+                }
             }
             Task::Receive(socket, received) => {
                 if cqe.res < 0 {
@@ -66,17 +59,18 @@ impl From<&io_uring_cqe> for Completion {
 
 enum Task {
     Accept(TcpListener),
-    Send(TcpStream, Box<[u8; BUFFER_SIZE]>),
-    Receive(TcpStream, Box<[u8; BUFFER_SIZE]>),
+    Send(TcpStream, Box<[u8]>),
+    Receive(TcpStream, Box<[u8]>),
 }
 
 pub struct IO {
     ring: io_uring,
     pending: VecDeque<Task>,
+    queue_depth: u32,
 }
 
 impl IO {
-    pub fn new(queue_depth: u32) -> Result<Self, io::Error> {
+    pub fn new(queue_depth: u32) -> io::Result<Self> {
         let mut ring: io_uring = unsafe { zeroed() };
         let ret = unsafe { io_uring_queue_init(queue_depth, &mut ring, 0) };
         if ret < 0 {
@@ -86,66 +80,8 @@ impl IO {
         Ok(Self {
             ring,
             pending: Default::default(),
+            queue_depth,
         })
-    }
-
-    pub fn accept(&mut self, listener: TcpListener) {
-        let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
-        if sqe.is_null() {
-            self.pending.push_back(Task::Accept(listener));
-            return;
-        }
-
-        let fd = listener.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Accept(listener)));
-
-        unsafe {
-            io_uring_prep_accept(sqe, fd, null_mut(), null_mut(), 0);
-            (*sqe).user_data = task_ptr as _;
-        }
-    }
-
-    pub fn receive(&mut self, socket: TcpStream, mut buffer: Box<[u8; BUFFER_SIZE]>) {
-        let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
-        if sqe.is_null() {
-            self.pending.push_back(Task::Receive(socket, buffer));
-            return;
-        }
-
-        let fd = socket.as_raw_fd();
-        let buf_ptr = buffer.as_mut_ptr();
-        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer)));
-
-        unsafe {
-            io_uring_prep_recv(sqe, fd, buf_ptr as _, BUFFER_SIZE, 0);
-            (*sqe).user_data = task_ptr as _;
-        }
-    }
-
-    pub fn send(&mut self, socket: TcpStream, buffer: Box<[u8; BUFFER_SIZE]>, len: usize) {
-        let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
-        if sqe.is_null() {
-            self.pending.push_back(Task::Send(socket, buffer));
-            return;
-        }
-
-        let fd = socket.as_raw_fd();
-        let mut buffer = buffer;
-        let buf_ptr = buffer.as_mut_ptr();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer)));
-
-        unsafe {
-            io_uring_prep_send(sqe, fd, buf_ptr as _, len, 0);
-            (*sqe).user_data = task_ptr as _;
-        }
-    }
-
-    pub fn poll(&mut self) -> io::Result<Vec<Completion>> {
-        self.poll_timeout(Duration::from_secs(0))
-    }
-
-    pub fn poll_timeout(&mut self, duration: Duration) -> io::Result<Vec<Completion>> {
-        self.flush(duration)
     }
 
     fn flush(&mut self, duration: Duration) -> io::Result<Vec<Completion>> {
@@ -154,7 +90,7 @@ impl IO {
             tv_nsec: duration.subsec_nanos() as _,
         };
 
-        let mut cqes = [null_mut(); QUEUE_DEPTH as usize];
+        let mut cqes = vec![null_mut(); self.queue_depth as usize];
 
         let ret = unsafe {
             io_uring_submit_and_wait_timeout(
@@ -169,7 +105,7 @@ impl IO {
         if ret < 0 {
             let error_code = -ret as u32;
             return match error_code {
-                ETIME => { Ok(Vec::new()) }
+                ETIME => Ok(Vec::new()),
                 _ => Err(io::Error::from_raw_os_error(error_code as _)),
             };
         }
@@ -187,6 +123,68 @@ impl IO {
         }
 
         Ok(completions)
+    }
+}
+
+impl AsyncIO for IO {
+    fn accept(&mut self, listener: TcpListener) {
+        let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
+        if sqe.is_null() {
+            self.pending.push_back(Task::Accept(listener));
+            return;
+        }
+
+        let fd = listener.as_raw_fd();
+        let task_ptr = Box::into_raw(Box::new(Task::Accept(listener)));
+
+        unsafe {
+            io_uring_prep_accept(sqe, fd, null_mut(), null_mut(), 0);
+            (*sqe).user_data = task_ptr as _;
+        }
+    }
+
+    fn receive(&mut self, socket: TcpStream, mut buffer: Box<[u8]>) {
+        let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
+        if sqe.is_null() {
+            self.pending.push_back(Task::Receive(socket, buffer));
+            return;
+        }
+
+        let fd = socket.as_raw_fd();
+        let buf_ptr = buffer.as_mut_ptr();
+        let buf_len = buffer.len();
+        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer)));
+
+        unsafe {
+            io_uring_prep_recv(sqe, fd, buf_ptr as _, buf_len, 0);
+            (*sqe).user_data = task_ptr as _;
+        }
+    }
+
+    fn send(&mut self, socket: TcpStream, buffer: Box<[u8]>, len: usize) {
+        let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
+        if sqe.is_null() {
+            self.pending.push_back(Task::Send(socket, buffer));
+            return;
+        }
+
+        let fd = socket.as_raw_fd();
+        let mut buffer = buffer;
+        let buf_ptr = buffer.as_mut_ptr();
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer)));
+
+        unsafe {
+            io_uring_prep_send(sqe, fd, buf_ptr as _, len, 0);
+            (*sqe).user_data = task_ptr as _;
+        }
+    }
+
+    fn poll(&mut self) -> io::Result<Vec<Completion>> {
+        self.poll_timeout(Duration::from_secs(0))
+    }
+
+    fn poll_timeout(&mut self, duration: Duration) -> io::Result<Vec<Completion>> {
+        self.flush(duration)
     }
 }
 
@@ -210,7 +208,7 @@ mod test {
         let listener = TcpListener::bind("127.0.0.1:8000")?;
         listener.set_nonblocking(true)?;
 
-        let mut io = IO::new(QUEUE_DEPTH)?;
+        let mut io = IO::new(32)?;
         io.accept(listener);
 
         let address = SocketAddr::from_str("127.0.0.1:8000")?;
@@ -236,7 +234,7 @@ mod test {
         let listener = TcpListener::bind("127.0.0.1:8001")?;
         listener.set_nonblocking(true)?;
 
-        let mut io = IO::new(QUEUE_DEPTH)?;
+        let mut io = IO::new(32)?;
         io.accept(listener);
 
         let address = SocketAddr::from_str("127.0.0.1:8001")?;
@@ -258,13 +256,13 @@ mod test {
 
         let mut results = io.flush(Duration::from_secs(1))?;
         assert_eq!(1, results.len());
-        let socket = match results.remove(0) {
+        let (socket, _) = match results.remove(0) {
             Completion::Accept(_, socket) => socket?,
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Client connected");
 
-        let buf = Box::new([0u8; BUFFER_SIZE]);
+        let buf = Box::new([0u8; 1024]);
         io.receive(socket, buf);
         results = io.flush(Duration::from_secs(1))?;
         let (socket, buf, len) = match results.remove(0) {
@@ -275,7 +273,7 @@ mod test {
         assert_eq!(5, len);
         assert_eq!(b"hello", buf[..5].iter().as_slice());
 
-        let mut buf = Box::new([0u8; BUFFER_SIZE]);
+        let mut buf = Box::new([0u8; 1024]);
         buf[..5].copy_from_slice(b"hello");
         io.send(socket, buf, 5);
         results = io.flush(Duration::from_secs(1))?;
