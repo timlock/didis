@@ -58,7 +58,7 @@ impl From<ParseIntError> for Error {
         Error::ParseInt(value)
     }
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Resp {
     SimpleString(String),
     SimpleError(String),

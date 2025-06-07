@@ -1,18 +1,14 @@
 use didis::async_io::IO;
 use didis::server::Server;
 use std::error::Error;
-
-const QUEUE_DEPTH: usize = 256;
-const BUFFER_SIZE: usize = 4096;
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let address = "127.0.0.1:6379";
-
-    println!("Starting server on {}", address);
-
-    let io = IO::new(QUEUE_DEPTH)?;
+    let io = IO::new(256)?;
     let mut server = Server::new(io);
-    let result = server.run(address);
-    println!("Server stopped");
-    result.map_err(|e| e.into())
+
+    let address = SocketAddr::from_str("127.0.0.1:6379")?;
+
+    server.run(address, Vec::new()).map_err(|err| err.into())
 }

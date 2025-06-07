@@ -12,30 +12,43 @@ use std::{
     net::SocketAddr,
 };
 
-
 const BUFFER_SIZE: usize = 4096;
+
+
 
 pub struct Server {
     connections: HashMap<RawFd, Connection>,
+    peers: HashMap<RawFd, Connection>,
     controller: Controller,
     io: IO,
 }
 
 impl Server {
     pub fn new(io: IO) -> Self {
-        let connections = HashMap::new();
         Self {
-            connections,
+            connections: Default::default(),
+            peers: Default::default(),
             controller: Default::default(),
             io,
         }
     }
 
-    pub fn run(&mut self, address: &str) -> Result<(), io::Error> {
-        let listener = TcpListener::bind(address)?;
+    pub fn run(&mut self, addr: SocketAddr, peers: Vec<SocketAddr>) -> io::Result<()> {
+        println!("Server starts listening on {addr}");
+
+        let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
 
         self.io.accept(listener);
+
+        for peer_addr in peers {
+            let socket = TcpStream::connect(peer_addr)?;
+            let fd = socket.as_raw_fd();
+            let conn = Connection::new(socket.try_clone()?, peer_addr);
+            self.peers.insert(fd, conn);
+            let buf = Box::new([0u8; BUFFER_SIZE]);
+            self.io.receive(socket, buf);
+        }
 
         loop {
             for completion in self.io.poll_timeout(Duration::from_secs(1))? {
@@ -66,8 +79,7 @@ impl Server {
     fn handle_accept(&mut self, result: io::Result<(TcpStream, SocketAddr)>) -> io::Result<()> {
         let (stream, address) = result?;
         println!["New client connected with address {}", address];
-        let cloned = stream.try_clone()?;
-        let client = Connection::new(cloned, address);
+        let client = Connection::new(stream.try_clone()?, address);
         self.connections.insert(stream.as_raw_fd(), client);
 
         let buf = Box::new([0u8; BUFFER_SIZE]);
