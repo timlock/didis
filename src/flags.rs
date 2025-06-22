@@ -236,7 +236,6 @@ mod tests {
     #[test]
     fn test_parse_remaining() {
         let args = vec!["--test", "text", "first", "second", "third"];
-        let expected_flags = vec![("test", String::from("text"))];
         let remaining = vec!["first", "second", "third"];
 
         let mut flag_set = FlagSet::default();
@@ -250,7 +249,7 @@ mod tests {
         assert_eq!("text", value.as_str());
 
         assert!(result.is_ok());
-        let result = result.unwrap();
+        let _ = result.unwrap();
 
         assert_eq!(remaining.len(), args.len());
         for i in 0..args.len() {
@@ -261,7 +260,6 @@ mod tests {
     #[test]
     fn test_parse_remaining_with_bool_flag() {
         let args = vec!["--test", "first", "second", "third"];
-        let expected_flags = vec![("test", true)];
         let remaining = vec!["first", "second", "third"];
 
         let mut flag_set = FlagSet::default();
@@ -275,7 +273,7 @@ mod tests {
         assert!(value);
 
         assert!(result.is_ok());
-        let result = result.unwrap();
+        let _ = result.unwrap();
 
         assert_eq!(remaining.len(), args.len());
         for i in 0..args.len() {

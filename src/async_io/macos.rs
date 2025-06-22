@@ -3,12 +3,10 @@ use libc::{
     close, kevent, kqueue, timespec, EVFILT_READ, EVFILT_WRITE, EV_ADD, EV_CLEAR, EV_ONESHOT,
 };
 use std::collections::VecDeque;
-use std::fmt::Debug;
 use std::io;
 use std::io::{Read, Write};
 use std::mem::zeroed;
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::ops::Deref;
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::time::Duration;
@@ -194,7 +192,7 @@ mod tests {
             println!("Connect to server");
             let result = TcpStream::connect_timeout(&address, Duration::from_secs(5));
             match result {
-                Ok(s) => println!("CONNECTED"),
+                Ok(_) => println!("CONNECTED"),
                 Err(err) => println!("Could not conenct {err}"),
             };
         });
@@ -235,7 +233,7 @@ mod tests {
         let mut results = io.poll_timeout(Duration::from_secs(1))?;
         assert_eq!(1, results.len());
         let (socket, _) = match results.remove(0) {
-            Completion::Accept(socket, stream) => stream?,
+            Completion::Accept(_, stream) => stream?,
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Client connected");
@@ -244,7 +242,7 @@ mod tests {
         io.receive(socket.try_clone().unwrap(), buf);
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len) = match results.remove(0) {
-            Completion::Receive(stream, buf, len) => (buf, len?),
+            Completion::Receive(_, buf, len) => (buf, len?),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Received {len} bytes from client");
@@ -255,8 +253,8 @@ mod tests {
         buf[..5].copy_from_slice(b"hello");
         io.send(socket.try_clone().unwrap(), buf, 5);
         results = io.poll_timeout(Duration::from_secs(1))?;
-        let (buf, len) = match results.remove(0) {
-            Completion::Send(stream, buf, len) => (buf, len?),
+        let (_, len) = match results.remove(0) {
+            Completion::Send(_, buf, len) => (buf, len?),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Sent {} bytes to client", len);
