@@ -36,11 +36,6 @@ pub trait StateMachine<T> {
     fn apply(&mut self, operation: &T) -> T;
 }
 
-enum ReplicaRole {
-    Primary,
-    Backup,
-}
-
 pub struct Replica<T>
 where
     T: Clone,
@@ -115,6 +110,9 @@ where
 
     pub fn handle_message(&mut self, message: MessageIn<T>) -> Option<MessageOut<T>> {
         match message {
+            MessageIn::ClientRequest(request) => {
+                return self.handle_request(request);
+            }
             MessageIn::Prepare(prepare) => {
                 if let Some((addr, prepare_ok)) = self.handle_prepare(prepare) {
                     return Some(MessageOut::PrepareOk(prepare_ok, addr));
@@ -125,7 +123,7 @@ where
                     return Some(MessageOut::Reply(reply, addr));
                 }
             }
-            MessageIn::Commit(commit) => {}
+            MessageIn::Commit(commit) => self.handle_commit(commit.commit_number),
         };
         None
     }
@@ -141,7 +139,7 @@ where
         self.client_table.get_mut(&client_id).unwrap()
     }
 
-    pub fn handle_request(&mut self, request: Request<T>) -> Option<RequestResponse<T>> {
+    fn handle_request(&mut self, request: Request<T>) -> Option<MessageOut<T>> {
         if self.is_backup() {
             return None;
         }
@@ -158,7 +156,7 @@ where
         }
         if request.request_number == client.request_number {
             if let Some(result) = client.response.clone() {
-                return Some(RequestResponse::SendResponse(
+                return Some(MessageOut::ClientResponse(
                     Reply {
                         view_number: self.view_number,
                         request_number: request.request_number,
@@ -169,7 +167,7 @@ where
             }
             return None;
         }
-        
+
         client.request_number = request.request_number;
 
         self.op_number += 1;
@@ -182,7 +180,7 @@ where
             commit_number: self.commit_number,
         };
 
-        Some(RequestResponse::Prepare(prepare, self.peers()))
+        Some(MessageOut::Prepare(prepare, self.peers()))
     }
 
     fn add_prepared(&mut self, op_number: u64) -> &mut HashSet<usize> {
@@ -261,9 +259,7 @@ where
             self.add_prepares_in_wait()
         }
 
-        if prepare.commit_number > self.commit_number {
-            self.handle_commit(prepare.commit_number);
-        }
+        self.handle_commit(prepare.commit_number);
 
         let prepare_ok = PrepareOk {
             view_number: self.view_number,
@@ -274,6 +270,7 @@ where
         Some((self.primary_addr(), prepare_ok))
     }
 
+    // TODO state transfer if commit_number is higher than log size?
     fn handle_commit(&mut self, commit_number: u64) {
         let end = min(commit_number as usize, self.log.len());
         let range = self.commit_number as usize..end;
@@ -286,9 +283,8 @@ where
 
             client.request_number = request.request_number;
             client.response = Some(reply);
+            self.commit_number += 1;
         }
-
-        self.commit_number = end as u64;
     }
 
     fn add_prepares_in_wait(&mut self) {
@@ -328,12 +324,6 @@ where
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum RequestResponse<T: Clone> {
-    SendResponse(Reply<T>, SocketAddr),
-    Prepare(Prepare<T>, Vec<SocketAddr>),
-}
-
 #[derive(Debug, PartialEq, Clone)]
 pub struct Request<T: Clone> {
     operation: T,
@@ -371,23 +361,24 @@ pub struct Commit {
 
 #[derive(Debug, PartialEq)]
 pub enum MessageIn<T: Clone> {
+    ClientRequest(Request<T>),
     Prepare(Prepare<T>),
     PrepareOk(PrepareOk),
     Commit(Commit),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum MessageOut<T: Clone> {
     Prepare(Prepare<T>, Vec<SocketAddr>),
     PrepareOk(PrepareOk, SocketAddr),
     Commit(Commit, Vec<SocketAddr>),
     Reply(Reply<T>, SocketAddr),
+    ClientResponse(Reply<T>, SocketAddr),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libc::difftime;
     use std::error::Error;
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
@@ -429,7 +420,7 @@ mod tests {
 
     #[test]
     fn tick_primary_timeout() -> Result<(), Box<dyn Error>> {
-        let state_machine = Box::new(MockStateMachine::new(|op| unimplemented!()));
+        let state_machine = Box::new(MockStateMachine::new(|_| unimplemented!()));
         let interval = Duration::from_secs(2);
         let last_timeout = Instant::now();
         let mut replica = Replica::new(state_machine, 1, CONFIG.to_vec(), interval, last_timeout);
@@ -458,7 +449,7 @@ mod tests {
         let interval = Duration::from_secs(2);
         let last_timeout = Instant::now();
 
-        let primary_state_machine = Box::new(MockStateMachine::new(|op| "success".to_owned()));
+        let primary_state_machine = Box::new(MockStateMachine::new(|_| "success".to_owned()));
         let mut primary = Replica::new(
             primary_state_machine,
             1,
@@ -475,7 +466,7 @@ mod tests {
             interval,
             last_timeout,
         );
-        let replica2_state_machine = Box::new(MockStateMachine::new(|op| "success".to_owned()));
+        let replica2_state_machine = Box::new(MockStateMachine::new(|_| "success".to_owned()));
         let mut replica2 = Replica::new(
             replica2_state_machine,
             3,
@@ -489,29 +480,29 @@ mod tests {
         assert!(replica2.is_backup());
 
         let client_id = SocketAddr::from_str("0.0.0.2:1")?;
-        let request = Request {
+        let first_request = Request {
             operation: "operation".to_owned(),
             client_id: client_id,
             request_number: 1,
         };
 
-        let response = primary.handle_request(request.clone());
+        // client sends request
+        let response = primary.handle_message(MessageIn::ClientRequest(first_request.clone()));
         assert!(response.is_some());
         let (prepare, destination) = match response.unwrap() {
-            RequestResponse::SendResponse(_, _) => {
-                return Err("primary response should be of type Prepare".into())
-            }
-            RequestResponse::Prepare(prepare, peers) => (prepare, peers),
+            MessageOut::Prepare(prepare, peers) => (prepare, peers),
+            _ => return Err("primary response should be of type Prepare".into()),
         };
         assert_eq!(peers(0), destination);
         let want = Prepare {
             view_number: 0,
-            message: request.clone(),
+            message: first_request.clone(),
             op_number: 1,
             commit_number: 0,
         };
         assert_eq!(want, prepare);
 
+        // replicas handle prepare
         let response = replica1.handle_message(MessageIn::Prepare(prepare.clone()));
         assert!(response.is_some());
         let (prepare_ok1, destination) = match response.unwrap() {
@@ -540,6 +531,7 @@ mod tests {
         };
         assert_eq!(want, prepare_ok2);
 
+        // primary handles prepare_oks
         let response = primary.handle_message(MessageIn::PrepareOk(prepare_ok1));
         assert!(response.is_none());
 
@@ -555,16 +547,85 @@ mod tests {
             request_number: 1,
             result: "success".to_owned(),
         };
-        assert_eq!(reply, want);
+        assert_eq!(want, reply);
 
-        let response = primary.handle_request(request);
+        // client resends request
+        let response = primary.handle_message(MessageIn::ClientRequest(first_request.clone()));
         let (reply, destination) = match response.unwrap() {
-            RequestResponse::SendResponse(reply, destination) => (reply, destination),
+            MessageOut::ClientResponse(reply, destination) => (reply, destination),
             _ => return Err("Primary response should be of type Reply".into()),
         };
         assert_eq!(client_id, destination);
         assert_eq!(want, reply);
 
+        // client sends new request
+        let second_request = Request {
+            operation: "operation".to_owned(),
+            client_id: client_id,
+            request_number: 2,
+        };
+
+        let response = primary.handle_message(MessageIn::ClientRequest(second_request.clone()));
+        assert!(response.is_some());
+        let (prepare, destination) = match response.unwrap() {
+            MessageOut::Prepare(prepare, peers) => (prepare, peers),
+            _ => return Err("primary response should be of type Prepare".into()),
+        };
+        assert_eq!(peers(0), destination);
+        let want = Prepare {
+            view_number: 0,
+            message: second_request.clone(),
+            op_number: 2,
+            commit_number: 1,
+        };
+        assert_eq!(want, prepare);
+
+        // replicas handle prepare
+        let response = replica1.handle_message(MessageIn::Prepare(prepare.clone()));
+        assert!(response.is_some());
+        let (prepare_ok1, destination) = match response.unwrap() {
+            MessageOut::PrepareOk(prepare_ok, destination) => (prepare_ok, destination),
+            _ => return Err("replica1 response should be of type PrepareOk".into()),
+        };
+        assert_eq!(CONFIG[0], destination);
+        let want = PrepareOk {
+            view_number: 0,
+            op_number: 2,
+            replica_number: 2,
+        };
+        assert_eq!(want, prepare_ok1);
+
+        let response = replica2.handle_message(MessageIn::Prepare(prepare));
+        assert!(response.is_some());
+        let (prepare_ok2, destination) = match response.unwrap() {
+            MessageOut::PrepareOk(prepare_ok, destination) => (prepare_ok, destination),
+            _ => return Err("replica1 response should be of type PrepareOk".into()),
+        };
+        assert_eq!(CONFIG[0], destination);
+        let want = PrepareOk {
+            view_number: 0,
+            op_number: 2,
+            replica_number: 3,
+        };
+        assert_eq!(want, prepare_ok2);
+        
+        // primary handles prepare_oks
+        let response = primary.handle_message(MessageIn::PrepareOk(prepare_ok1));
+        assert!(response.is_none());
+
+        let response = primary.handle_message(MessageIn::PrepareOk(prepare_ok2));
+        assert!(response.is_some());
+        let (reply, destination) = match response.unwrap() {
+            MessageOut::Reply(reply, destination) => (reply, destination),
+            _ => return Err("Primary response should be of type Reply".into()),
+        };
+        assert_eq!(client_id, destination);
+        let want = Reply {
+            view_number: 0,
+            request_number: 2,
+            result: "success".to_owned(),
+        };
+        assert_eq!(want, reply);
         Ok(())
     }
 }
