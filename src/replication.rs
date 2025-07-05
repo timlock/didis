@@ -1,7 +1,8 @@
-use std::cmp::min;
+use std::cmp::{min, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::mem;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -153,7 +154,10 @@ where
                     return Some(MessageOut::Reply(reply, addr));
                 }
             }
-            MessageIn::Commit(commit) => self.handle_commit(commit.commit_number),
+            MessageIn::Commit(commit) => {
+                // TODO state transfer if commit_number is higher than log size?
+                self.handle_commit(commit.commit_number);
+            }
             MessageIn::StartViewChange(start_view_change) => {
                 if let Some((addr, do_view_change)) =
                     self.handle_start_view_change(start_view_change)
@@ -162,11 +166,18 @@ where
                 }
             }
             MessageIn::DoViewChange(do_view_change) => {
-                if let Some((addr, start_view)) = self.handle_do_view_change(do_view_change) {
-                    return Some(MessageOut::StartView(start_view, addr));
+                if let Some((addr, start_view, new_commit_number)) =
+                    self.handle_do_view_change(do_view_change)
+                {
+                    let replies = self.handle_commit(new_commit_number);
+                    return Some(MessageOut::StartView(start_view, addr, replies));
                 }
             }
-            MessageIn::StartView(_) => todo!(),
+            MessageIn::StartView(start_view) => {
+                if let Some((addr, prepare_ok)) = self.handle_start_view(start_view) {
+                    return Some(MessageOut::PrepareOk(prepare_ok, addr));
+                }
+            }
         };
         None
     }
@@ -302,6 +313,7 @@ where
             self.add_prepares_in_wait()
         }
 
+        // TODO state transfer if commit_number is higher than log size?
         self.handle_commit(prepare.commit_number);
 
         let prepare_ok = PrepareOk {
@@ -313,8 +325,9 @@ where
         Some((self.primary_addr(), prepare_ok))
     }
 
-    // TODO state transfer if commit_number is higher than log size?
-    fn handle_commit(&mut self, commit_number: u64) {
+    fn handle_commit(&mut self, commit_number: u64) -> Vec<(Reply<T>, SocketAddr)> {
+        let mut replies = Vec::new();
+
         let end = min(commit_number as usize, self.log.len());
         let range = self.commit_number as usize..end;
         for request in self.log[range].iter() {
@@ -325,9 +338,18 @@ where
                 .expect("Backup should have client stored when applying its request");
 
             client.request_number = request.request_number;
-            client.response = Some(reply);
+            client.response = Some(reply.clone());
             self.commit_number += 1;
+
+            let reply = Reply {
+                view_number: self.view_number,
+                request_number: request.request_number,
+                result: reply,
+            };
+            replies.push((reply, request.client_id))
         }
+
+        replies
     }
 
     fn handle_start_view_change(
@@ -391,7 +413,7 @@ where
     fn handle_do_view_change(
         &mut self,
         do_view_change: DoViewChange<T>,
-    ) -> Option<(Vec<SocketAddr>, StartView<T>)> {
+    ) -> Option<(Vec<SocketAddr>, StartView<T>, u64)> {
         let quorum = self.quorum();
 
         let do_view_changes = match &mut self.status {
@@ -415,25 +437,53 @@ where
         if do_view_changes.len() < quorum {
             return None;
         }
-        let mut best_msg: Option<&DoViewChange<T>> = None;
-        for msg in do_view_changes.iter() {
-            match best_msg {
-                Some(best) => {
-                    if best.last_normal_view_number < msg.last_normal_view_number
-                        || (best.last_normal_view_number == msg.last_normal_view_number
-                            && best.op_number < msg.op_number)
-                    {
-                        best_msg = Some(msg)
-                    }
-                }
-                None => best_msg = Some(msg),
-            }
-        }
-        let best_msg =
-            best_msg.expect("Primary should have f do_view_changes messages stored, but has none");
-        
 
-        None
+        let do_view_changes = mem::take(do_view_changes);
+
+        let highest_commit = do_view_changes
+            .iter()
+            .map(|msg| msg.commit_number)
+            .max()
+            .expect("Primary should have f do_view_changes messages stored, but has none");
+
+        self.log = do_view_changes
+            .into_iter()
+            .max()
+            .expect("Primary should have f do_view_changes messages stored, but has none")
+            .log;
+        self.op_number = self.log.len() as u64;
+
+        self.status = ReplicaStatus::Normal;
+
+        let start_view = StartView {
+            view_number: self.view_number,
+            log: self.log.clone(),
+            op_number: self.op_number,
+            commit_number: self.commit_number,
+        };
+
+        Some((self.peers(), start_view, highest_commit))
+    }
+
+    fn handle_start_view(&mut self, start_view: StartView<T>) -> Option<(SocketAddr, PrepareOk)> {
+        self.log = start_view.log;
+        self.op_number = self.log.len() as u64;
+        self.view_number = start_view.view_number;
+        self.status = ReplicaStatus::Normal;
+
+        let old_commit_number = self.commit_number;
+        self.handle_commit(start_view.commit_number);
+
+        if old_commit_number == self.commit_number {
+            return None;
+        }
+
+        let prepare_ok = PrepareOk {
+            view_number: self.view_number,
+            op_number: self.op_number,
+            replica_number: self.replica_number,
+        };
+        Some((self.primary_addr(), prepare_ok))
     }
 
     fn add_prepares_in_wait(&mut self) {
@@ -526,6 +576,36 @@ where
     commit_number: u64,
 }
 
+impl<T> PartialOrd<Self> for DoViewChange<T>
+where
+    T: Clone + Eq + Hash,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for DoViewChange<T>
+where
+    T: Clone + Hash + Eq,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.last_normal_view_number > other.last_normal_view_number {
+            return Ordering::Greater;
+        }
+        if self.last_normal_view_number < other.last_normal_view_number {
+            return Ordering::Less;
+        }
+        if self.op_number > other.op_number {
+            return Ordering::Greater;
+        }
+        if self.op_number < other.op_number {
+            return Ordering::Less;
+        }
+        Ordering::Equal
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct StartView<T: Clone> {
     view_number: usize,
@@ -560,7 +640,7 @@ where
     ClientResponse(Reply<T>, SocketAddr),
     StartViewChange(StartViewChange, Vec<SocketAddr>),
     DoViewChange(DoViewChange<T>, SocketAddr),
-    StartView(StartView<T>, Vec<SocketAddr>),
+    StartView(StartView<T>, Vec<SocketAddr>, Vec<(Reply<T>, SocketAddr)>),
 }
 
 #[cfg(test)]
