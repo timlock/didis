@@ -6,18 +6,21 @@ use std::mem;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+pub trait Operation: Clone + Hash + Eq + Default {}
+impl<T> Operation for T where T: Clone + Hash + Eq + Default {}
+
 enum ReplicaStatus<T>
 where
-    T: Clone + Hash + Eq,
+    T: Operation,
 {
     Normal,
-    ViewChange(HashSet<usize>, usize, HashSet<DoViewChange<T>>),
+    ViewChange(ViewChange<T>),
     Recovering,
 }
 
 impl<T> ReplicaStatus<T>
 where
-    T: Clone + Hash + Eq,
+    T: Operation,
 {
     fn is_normal(&self) -> bool {
         match self {
@@ -38,6 +41,35 @@ where
             ReplicaStatus::Recovering => true,
             _ => false,
         }
+    }
+}
+
+#[derive(Default)]
+struct ViewChange<T>
+where
+    T: Operation,
+{
+    peers_in_same_view: HashSet<usize>,
+    last_normal_view_number: usize,
+    do_view_changes: HashSet<DoViewChange<T>>,
+}
+
+impl<T> ViewChange<T>
+where
+    T: Operation,
+{
+    fn highest_commit(&self) -> Option<u64> {
+        self.do_view_changes
+            .iter()
+            .map(|msg| msg.commit_number)
+            .max()
+    }
+
+    fn newest_log(self) -> Option<Vec<Request<T>>> {
+        self.do_view_changes
+            .into_iter()
+            .max()
+            .map(|do_view_change| do_view_change.log)
     }
 }
 
@@ -69,7 +101,7 @@ pub trait StateMachine<T> {
 
 pub struct Replica<T>
 where
-    T: Clone + Hash + Eq,
+    T: Operation,
 {
     configuration: Vec<SocketAddr>,
     replica_number: usize,
@@ -89,7 +121,7 @@ where
 
 impl<T> Replica<T>
 where
-    T: Clone + Hash + Eq,
+    T: Operation,
 {
     pub fn new(
         state_machine: Box<dyn StateMachine<T>>,
@@ -116,7 +148,7 @@ where
         }
     }
 
-    pub fn handle_timeout(&mut self, now: Instant) -> Option<(MessageOut<T>)> {
+    pub fn handle_timeout(&mut self, now: Instant) -> Option<MessageOut<T>> {
         if now.duration_since(self.last_timeout) < self.interval {
             return None;
         }
@@ -131,7 +163,14 @@ where
                 };
                 Some(MessageOut::Commit(commit, self.peers()))
             }
-            false => Some(self.start_view_change(self.view_number + 1)),
+            false => {
+                self.start_view_change(self.view_number + 1);
+                let start_view_change = StartViewChange {
+                    view_number: self.view_number,
+                    replica_number: self.replica_number,
+                };
+                Some(MessageOut::StartViewChange(start_view_change, self.peers()))
+            }
         }
     }
 
@@ -159,11 +198,7 @@ where
                 self.handle_commit(commit.commit_number);
             }
             MessageIn::StartViewChange(start_view_change) => {
-                if let Some((addr, do_view_change)) =
-                    self.handle_start_view_change(start_view_change)
-                {
-                    return Some(MessageOut::DoViewChange(do_view_change, addr));
-                }
+                return self.handle_start_view_change(start_view_change)
             }
             MessageIn::DoViewChange(do_view_change) => {
                 if let Some((addr, start_view, new_commit_number)) =
@@ -226,6 +261,9 @@ where
 
         self.op_number += 1;
         self.log.push(request.clone());
+        let mut peers = HashSet::new();
+        peers.insert(self.replica_number);
+        self.prepared.insert(self.op_number, peers);
 
         let prepare = Prepare {
             view_number: self.view_number,
@@ -251,10 +289,9 @@ where
             return None;
         }
 
-        let prepared_peers = match self.prepared.get_mut(&prepare_ok.op_number) {
-            Some(prepared) => prepared,
-            None => self.add_prepared(prepare_ok.op_number),
-        };
+        let prepared_peers = self.prepared.get_mut(&prepare_ok.op_number).expect(
+            "Primary should include itself when counting the peers which have prepared a request",
+        );
         prepared_peers.insert(prepare_ok.replica_number);
         if prepared_peers.len() < self.quorum() {
             return None;
@@ -355,59 +392,88 @@ where
     fn handle_start_view_change(
         &mut self,
         start_view_change: StartViewChange,
-    ) -> Option<(SocketAddr, DoViewChange<T>)> {
-        assert!(self.status.is_view_change());
-        if start_view_change.view_number != self.view_number {
+    ) -> Option<MessageOut<T>> {
+        if start_view_change.view_number < self.view_number {
             return None;
         }
 
         let quorum = self.quorum();
         match &mut self.status {
-            ReplicaStatus::ViewChange(peers_in_same_view, last_normal_view_number, _) => {
-                peers_in_same_view.insert(start_view_change.replica_number);
+            ReplicaStatus::Normal => {
+                self.start_view_change(start_view_change.view_number);
+                let start_view_change = StartViewChange {
+                    view_number: self.view_number,
+                    replica_number: self.replica_number,
+                };
+                Some(MessageOut::StartViewChange(start_view_change, self.peers()))
+            }
+            ReplicaStatus::ViewChange(_) if start_view_change.view_number > self.view_number => {
+                self.start_view_change(start_view_change.view_number);
+                let start_view_change = StartViewChange {
+                    view_number: self.view_number,
+                    replica_number: self.replica_number,
+                };
+                Some(MessageOut::StartViewChange(start_view_change, self.peers()))
+            }
+            ReplicaStatus::ViewChange(view_change) => {
+                view_change
+                    .peers_in_same_view
+                    .insert(start_view_change.replica_number);
 
-                if peers_in_same_view.len() > quorum {
+                if view_change.peers_in_same_view.len() >= quorum - 1 {
                     let do_view_change = DoViewChange {
                         view_number: self.view_number,
                         log: self.log.clone(),
-                        last_normal_view_number: *last_normal_view_number,
+                        last_normal_view_number: view_change.last_normal_view_number,
                         op_number: self.op_number,
                         commit_number: self.commit_number,
                     };
 
-                    return Some((self.primary_addr(), do_view_change));
+                    match self.is_primary() {
+                        true => {
+                            if let Some((addr, start_view, new_commit_number)) =
+                                self.handle_do_view_change(do_view_change)
+                            {
+                                let replies = self.handle_commit(new_commit_number);
+                                return Some(MessageOut::StartView(start_view, addr, replies));
+                            }
+                        }
+                        false => {
+                            return Some(MessageOut::DoViewChange(
+                                do_view_change,
+                                self.primary_addr(),
+                            ));
+                        }
+                    }
                 }
+                None
             }
-            _ => {
-                panic!()
-            }
-        };
-
-        None
+            ReplicaStatus::Recovering => None,
+        }
     }
 
-    fn start_view_change(&mut self, new_view_number: usize) -> MessageOut<T> {
+    fn start_view_change(&mut self, new_view_number: usize) -> &mut ViewChange<T> {
         assert!(new_view_number > self.view_number);
 
-        let last_normal_view_number = match self.status {
+        let last_normal_view_number = match &self.status {
             ReplicaStatus::Normal => self.view_number,
-            ReplicaStatus::ViewChange(_, last_normal_view_number, _) => last_normal_view_number,
+            ReplicaStatus::ViewChange(view_change) => view_change.last_normal_view_number,
             ReplicaStatus::Recovering => {
                 panic!("Replica should not start a view change when in recovery mode")
             }
         };
-        self.status = ReplicaStatus::ViewChange(
-            Default::default(),
-            last_normal_view_number,
-            Default::default(),
-        );
         self.view_number = new_view_number;
 
-        let start_view_change = StartViewChange {
-            view_number: self.view_number,
-            replica_number: self.replica_number,
-        };
-        MessageOut::StartViewChange(start_view_change, self.peers())
+        self.status = ReplicaStatus::ViewChange(ViewChange {
+            peers_in_same_view: Default::default(),
+            last_normal_view_number: last_normal_view_number,
+            do_view_changes: Default::default(),
+        });
+
+        match &mut self.status {
+            ReplicaStatus::ViewChange(view_change) => view_change,
+            _ => panic!("Status should be view change because it has been changed set to view change just before")
+        }
     }
 
     fn handle_do_view_change(
@@ -416,41 +482,27 @@ where
     ) -> Option<(Vec<SocketAddr>, StartView<T>, u64)> {
         let quorum = self.quorum();
 
-        let do_view_changes = match &mut self.status {
-            ReplicaStatus::Normal if self.view_number < do_view_change.view_number => return None,
-            ReplicaStatus::Normal => {
-                self.start_view_change(do_view_change.view_number);
-                match &mut self.status {
-                    ReplicaStatus::ViewChange(_, _, do_view_changes) => {
-                        do_view_changes.insert(do_view_change);
-                        do_view_changes
-                    }
-                    _ => panic!("Replica should be in view change mode after receiving a DoViewChange with higher view number than its own"),
-                }
-            }
-            ReplicaStatus::ViewChange(_, _, do_view_changes) => do_view_changes,
+        let view_change = match &mut self.status {
+            ReplicaStatus::Normal if do_view_change.view_number < self.view_number => return None,
+            ReplicaStatus::Normal => self.start_view_change(do_view_change.view_number),
+            ReplicaStatus::ViewChange(view_change) => view_change,
             ReplicaStatus::Recovering => {
                 panic!("Replica should not start a view change when in recovery mode")
             }
         };
 
-        if do_view_changes.len() < quorum {
+        view_change.do_view_changes.insert(do_view_change);
+        if view_change.do_view_changes.len() < quorum {
             return None;
         }
 
-        let do_view_changes = mem::take(do_view_changes);
-
-        let highest_commit = do_view_changes
-            .iter()
-            .map(|msg| msg.commit_number)
-            .max()
-            .expect("Primary should have f do_view_changes messages stored, but has none");
-
-        self.log = do_view_changes
-            .into_iter()
-            .max()
-            .expect("Primary should have f do_view_changes messages stored, but has none")
-            .log;
+        let view_change = mem::take(view_change);
+        let highest_commit = view_change
+            .highest_commit()
+            .expect("Primary should have do_view_changes messages stored when starting a new view");
+        self.log = view_change
+            .newest_log()
+            .expect("Primary should have do_view_changes messages stored when starting a new view");
         self.op_number = self.log.len() as u64;
 
         self.status = ReplicaStatus::Normal;
@@ -509,7 +561,7 @@ where
         !self.is_primary()
     }
     fn quorum(&self) -> usize {
-        self.configuration.len() / 2
+        self.configuration.len() / 2 + 1
     }
 
     fn peers(&self) -> Vec<SocketAddr> {
