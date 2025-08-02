@@ -1,6 +1,11 @@
-use std::cmp::{min, Ordering};
+mod message;
+
+use crate::replication::message::{
+    Commit, DoViewChange, MessageIn, MessageOut, Prepare, PrepareOk, Reply, Request, StartView,
+    StartViewChange,
+};
+use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem;
 use std::net::SocketAddr;
@@ -198,7 +203,7 @@ where
                 self.handle_commit(commit.commit_number);
             }
             MessageIn::StartViewChange(start_view_change) => {
-                return self.handle_start_view_change(start_view_change)
+                return self.handle_start_view_change(start_view_change);
             }
             MessageIn::DoViewChange(do_view_change) => {
                 if let Some((addr, start_view, new_commit_number)) =
@@ -405,6 +410,7 @@ where
                     view_number: self.view_number,
                     replica_number: self.replica_number,
                 };
+
                 Some(MessageOut::StartViewChange(start_view_change, self.peers()))
             }
             ReplicaStatus::ViewChange(_) if start_view_change.view_number > self.view_number => {
@@ -413,6 +419,7 @@ where
                     view_number: self.view_number,
                     replica_number: self.replica_number,
                 };
+
                 Some(MessageOut::StartViewChange(start_view_change, self.peers()))
             }
             ReplicaStatus::ViewChange(view_change) => {
@@ -427,6 +434,7 @@ where
                         last_normal_view_number: view_change.last_normal_view_number,
                         op_number: self.op_number,
                         commit_number: self.commit_number,
+                        replica_number: self.replica_number,
                     };
 
                     match self.is_primary() {
@@ -466,13 +474,15 @@ where
 
         self.status = ReplicaStatus::ViewChange(ViewChange {
             peers_in_same_view: Default::default(),
-            last_normal_view_number: last_normal_view_number,
+            last_normal_view_number,
             do_view_changes: Default::default(),
         });
 
         match &mut self.status {
             ReplicaStatus::ViewChange(view_change) => view_change,
-            _ => panic!("Status should be view change because it has been changed set to view change just before")
+            _ => panic!(
+                "Status should be view change because it has been changed set to view change just before"
+            ),
         }
     }
 
@@ -481,9 +491,11 @@ where
         do_view_change: DoViewChange<T>,
     ) -> Option<(Vec<SocketAddr>, StartView<T>, u64)> {
         let quorum = self.quorum();
+        let is_primary = self.is_primary();
 
         let view_change = match &mut self.status {
             ReplicaStatus::Normal if do_view_change.view_number < self.view_number => return None,
+            ReplicaStatus::Normal if do_view_change.view_number == self.view_number && is_primary => return None, //TODO verify
             ReplicaStatus::Normal => self.start_view_change(do_view_change.view_number),
             ReplicaStatus::ViewChange(view_change) => view_change,
             ReplicaStatus::Recovering => {
@@ -575,124 +587,13 @@ where
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Hash, Eq)]
-pub struct Request<T: Clone> {
-    operation: T,
-    client_id: SocketAddr,
-    request_number: u64,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct Prepare<T: Clone> {
-    view_number: usize,
-    message: Request<T>,
-    op_number: u64,
-    commit_number: u64,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct PrepareOk {
-    view_number: usize,
-    op_number: u64,
-    replica_number: usize,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Reply<T> {
-    view_number: usize,
-    request_number: u64,
-    result: T,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Commit {
-    view_number: usize,
-    commit_number: u64,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct StartViewChange {
-    view_number: usize,
-    replica_number: usize,
-}
-
-#[derive(Debug, PartialEq, Hash, Eq)]
-pub struct DoViewChange<T>
-where
-    T: Clone + Hash + Eq,
-{
-    view_number: usize,
-    log: Vec<Request<T>>,
-    last_normal_view_number: usize,
-    op_number: u64,
-    commit_number: u64,
-}
-
-impl<T> PartialOrd<Self> for DoViewChange<T>
-where
-    T: Clone + Eq + Hash,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+struct Config(Vec<SocketAddr>);
+impl Config {
+    fn peers(&self, exclude: usize) -> Vec<SocketAddr> {
+        let mut peers = self.0.clone();
+        peers.remove(exclude);
+        peers
     }
-}
-
-impl<T> Ord for DoViewChange<T>
-where
-    T: Clone + Hash + Eq,
-{
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.last_normal_view_number > other.last_normal_view_number {
-            return Ordering::Greater;
-        }
-        if self.last_normal_view_number < other.last_normal_view_number {
-            return Ordering::Less;
-        }
-        if self.op_number > other.op_number {
-            return Ordering::Greater;
-        }
-        if self.op_number < other.op_number {
-            return Ordering::Less;
-        }
-        Ordering::Equal
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub struct StartView<T: Clone> {
-    view_number: usize,
-    log: Vec<Request<T>>,
-    op_number: u64,
-    commit_number: u64,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum MessageIn<T>
-where
-    T: Clone + Hash + Eq,
-{
-    ClientRequest(Request<T>),
-    Prepare(Prepare<T>),
-    PrepareOk(PrepareOk),
-    Commit(Commit),
-    StartViewChange(StartViewChange),
-    DoViewChange(DoViewChange<T>),
-    StartView(StartView<T>),
-}
-
-#[derive(Debug, PartialEq)]
-pub enum MessageOut<T>
-where
-    T: Clone + Hash + Eq,
-{
-    Prepare(Prepare<T>, Vec<SocketAddr>),
-    PrepareOk(PrepareOk, SocketAddr),
-    Commit(Commit, Vec<SocketAddr>),
-    Reply(Reply<T>, SocketAddr),
-    ClientResponse(Reply<T>, SocketAddr),
-    StartViewChange(StartViewChange, Vec<SocketAddr>),
-    DoViewChange(DoViewChange<T>, SocketAddr),
-    StartView(StartView<T>, Vec<SocketAddr>, Vec<(Reply<T>, SocketAddr)>),
 }
 
 #[cfg(test)]
@@ -700,6 +601,7 @@ mod tests {
     use super::*;
     use std::error::Error;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::ops::Add;
     use std::str::FromStr;
 
     const CONFIG: &[SocketAddr] = &[
@@ -945,6 +847,138 @@ mod tests {
             result: "success".to_owned(),
         };
         assert_eq!(want, reply);
+        Ok(())
+    }
+
+    #[test]
+    fn view_change_no_logs() -> Result<(), Box<dyn Error>> {
+        let interval = Duration::from_secs(2);
+        let last_timeout = Instant::now();
+
+        let config = Config(vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)), 0001),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)), 0002),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)), 0003),
+        ]);
+
+        let primary_state_machine = Box::new(MockStateMachine::new(|_| "success".to_owned()));
+        let mut primary = Replica::new(
+            primary_state_machine,
+            1,
+            config.0.clone(),
+            interval,
+            last_timeout,
+        );
+
+        let replica1_state_machine = Box::new(MockStateMachine::new(|op| "success".to_owned()));
+        let mut replica1 = Replica::new(
+            replica1_state_machine,
+            2,
+            config.0.clone(),
+            interval,
+            last_timeout,
+        );
+        let replica2_state_machine = Box::new(MockStateMachine::new(|_| "success".to_owned()));
+        let mut replica2 = Replica::new(
+            replica2_state_machine,
+            3,
+            config.0.clone(),
+            interval,
+            last_timeout,
+        );
+
+        assert!(primary.is_primary());
+        assert!(replica1.is_backup());
+        assert!(replica2.is_backup());
+
+        // Step 1: A replica notices a timeout and begins a view change
+        let start_view_change_2 = replica1.handle_timeout(last_timeout.add(interval));
+        let want = MessageOut::StartViewChange(
+            StartViewChange {
+                view_number: 1,
+                replica_number: 2,
+            },
+            config.peers(1),
+        );
+        assert_eq!(Some(want), start_view_change_2);
+
+        let response = MessageIn::try_from(start_view_change_2.unwrap()).unwrap();
+
+        let start_view_change_1 = primary.handle_message(response.clone());
+        let want = MessageOut::StartViewChange(
+            StartViewChange {
+                view_number: 1,
+                replica_number: 1,
+            },
+            config.peers(0),
+        );
+        assert_eq!(Some(want), start_view_change_1);
+
+        let start_view_change_3 = replica2.handle_message(response);
+        let want = MessageOut::StartViewChange(
+            StartViewChange {
+                view_number: 1,
+                replica_number: 3,
+            },
+            config.peers(2),
+        );
+        assert_eq!(Some(want), start_view_change_3);
+
+        // Step 2: Replica receives start_view_change from f other replicas and notifies the new primary
+        let response = replica1
+            .handle_message(MessageIn::try_from(start_view_change_1.clone().unwrap()).unwrap());
+        assert_eq!(None, response);
+
+        let response = replica1
+            .handle_message(MessageIn::try_from(start_view_change_3.clone().unwrap()).unwrap());
+        assert_eq!(None, response);
+
+        let do_view_change_1 = primary
+            .handle_message(MessageIn::try_from(start_view_change_3.clone().unwrap()).unwrap());
+        let want = MessageOut::DoViewChange(
+            DoViewChange {
+                view_number: 1,
+                log: vec![],
+                last_normal_view_number: 0,
+                op_number: 0,
+                commit_number: 0,
+                replica_number: 1,
+            },
+            config.0[1],
+        );
+        assert_eq!(Some(want), do_view_change_1);
+
+        let do_view_change_3 = replica2
+            .handle_message(MessageIn::try_from(start_view_change_1.clone().unwrap()).unwrap());
+        let want = MessageOut::DoViewChange(
+            DoViewChange {
+                view_number: 1,
+                log: vec![],
+                last_normal_view_number: 0,
+                op_number: 0,
+                commit_number: 0,
+                replica_number: 3,
+            },
+            config.0[1],
+        );
+        assert_eq!(Some(want), do_view_change_3);
+
+        // Step 3: New primary receives f+1 do_view_change messages
+        let response = replica1.handle_message(MessageIn::try_from(do_view_change_1.unwrap()).unwrap());
+        let want = MessageOut::StartView(
+            StartView::<String> {
+                view_number: 1,
+                log: vec![],
+                op_number: 0,
+                commit_number: 0,
+            },
+            config.peers(1),
+            vec![],
+        );
+
+        let response = replica1.handle_message(MessageIn::try_from(do_view_change_3.unwrap()).unwrap());
+        assert_eq!(None, response);
+
         Ok(())
     }
 }
