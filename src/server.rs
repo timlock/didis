@@ -5,8 +5,8 @@ use crate::parser::resp::Resp;
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{
     collections::HashMap,
@@ -208,7 +208,7 @@ mod test {
     use std::str::FromStr;
     use std::thread::JoinHandle;
 
-    fn launch_server(address: SocketAddr) -> (Arc<AtomicBool>, JoinHandle<()> ){
+    fn launch_server(address: SocketAddr) -> (Arc<AtomicBool>, JoinHandle<()>) {
         let mut server = Server::new(address);
         let server_handle = server.handle();
 
@@ -226,7 +226,6 @@ mod test {
 
             println!("Server thread closed");
         });
-
 
         while !thread_launched.load(Ordering::SeqCst) {}
 
@@ -248,8 +247,7 @@ mod test {
 
         assert_eq!(Resp::Null, response);
 
-
-        let set_cmd = Command::Set{
+        let set_cmd = Command::Set {
             key: "Key".to_string(),
             value: "Value".to_string(),
             overwrite_rule: None,
@@ -263,6 +261,49 @@ mod test {
         let response = client.send(get_cmd)?;
         assert_eq!(Resp::BulkString(String::from("Value")), response);
 
+        server_handle.store(true, Ordering::SeqCst);
+        thread_handle.join().unwrap();
+
+        Ok(())
+    }
+    #[test]
+    fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
+        let address = SocketAddr::from_str("127.0.0.1:10002")?;
+
+        let (server_handle, thread_handle) = launch_server(address);
+
+        println!("Connecting to server on {}", address);
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+        let mut client = Client::new(stream);
+
+        let cmd_batch = vec![
+            Command::Set {
+                key: "Key1".to_string(),
+                value: "Value1".to_string(),
+                overwrite_rule: None,
+                get: false,
+                expire_rule: None,
+            },
+            Command::Set {
+                key: "Key2".to_string(),
+                value: "Value2".to_string(),
+                overwrite_rule: None,
+                get: false,
+                expire_rule: None,
+            },
+            Command::Get(String::from("Key1")),
+            Command::Get(String::from("Key2")),
+        ];
+        let mut response = client.send_batch(cmd_batch)?;
+        assert_eq!(4, response.len());
+        let first_result = response.remove(0)?;
+        assert_eq!(Resp::ok(), first_result);
+        let second_result = response.remove(0)?;
+        assert_eq!(Resp::ok(), second_result);
+        let third_result = response.remove(0)?;
+        assert_eq!(Resp::BulkString(String::from("Value1")), third_result);
+        let fourth_result = response.remove(0)?;
+        assert_eq!(Resp::BulkString(String::from("Value2")), fourth_result);
 
 
         server_handle.store(true, Ordering::SeqCst);
@@ -270,6 +311,4 @@ mod test {
 
         Ok(())
     }
-
-
 }

@@ -1,6 +1,7 @@
 use crate::parser::command::Command;
 use crate::parser::resp;
 use crate::parser::resp::Resp;
+use std::io;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;
@@ -38,8 +39,46 @@ impl Client {
 
         let (response, size) = self.resp_parser.parse(bytes.as_slice())?;
 
-        println!("Received response from server size={} bytes duration={:?} {:?}", size,start.elapsed(), response);
+        println!(
+            "Received response from server size={} bytes duration={:?} {:?}",
+            size,
+            start.elapsed(),
+            response
+        );
 
         Ok(response.expect("TODO error handling"))
+    }
+
+    pub fn send_batch(
+        &mut self,
+        commands: Vec<Command>,
+    ) -> io::Result<Vec<Result<Resp, resp::Error>>> {
+        println!("Sending command batch to server {:?}", commands);
+        let mut bytes = commands.into_iter().flat_map(Vec::from).collect::<Vec<_>>();
+
+        let start = Instant::now();
+
+        self.tcp_stream.write_all(bytes.as_slice())?;
+
+        bytes.clear();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = self.tcp_stream.read(&mut buf)?;
+            bytes.extend_from_slice(&buf[..n]);
+            if n < buf.len() {
+                break;
+            }
+        }
+
+        let (results, size) = self.resp_parser.parse_all(bytes.as_slice());
+
+        println!(
+            "Received response batch from server size={} bytes duration={:?} {:?}",
+            size,
+            start.elapsed(),
+            results
+        );
+
+        Ok(results)
     }
 }
