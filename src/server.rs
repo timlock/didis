@@ -206,22 +206,38 @@ mod test {
     use crate::client::Client;
     use crate::parser::command::Command;
     use std::str::FromStr;
+    use std::thread::JoinHandle;
+
+    fn launch_server(address: SocketAddr) -> (Arc<AtomicBool>, JoinHandle<()> ){
+        let mut server = Server::new(address);
+        let server_handle = server.handle();
+
+        let thread_launched = Arc::new(AtomicBool::new(false));
+        let thread_launched_clone = thread_launched.clone();
+
+        let thread_handle = thread::spawn(move || {
+            println!("Server thread launched");
+
+            let io = IO::new(256).unwrap();
+
+            thread_launched_clone.store(true, Ordering::SeqCst);
+
+            server.run(io).unwrap();
+
+            println!("Server thread closed");
+        });
+
+
+        while !thread_launched.load(Ordering::SeqCst) {}
+
+        (server_handle, thread_handle)
+    }
 
     #[test]
     fn set_value() -> Result<(), Box<dyn std::error::Error>> {
         let address = SocketAddr::from_str("127.0.0.1:10001")?;
 
-        let mut server = Server::new(address);
-        let server_handle = server.handle();
-
-        let handle = thread::spawn(move || {
-            println!("Server thread launched");
-
-            let io = IO::new(256).unwrap();
-            server.run(io).unwrap();
-
-            println!("Server thread closed");
-        });
+        let (server_handle, thread_handle) = launch_server(address);
 
         println!("Connecting to server on {}", address);
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -250,8 +266,10 @@ mod test {
 
 
         server_handle.store(true, Ordering::SeqCst);
-        handle.join().unwrap();
+        thread_handle.join().unwrap();
 
         Ok(())
     }
+
+
 }

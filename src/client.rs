@@ -3,6 +3,7 @@ use crate::parser::resp;
 use crate::parser::resp::Resp;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::Instant;
 
 pub struct Client {
     tcp_stream: TcpStream,
@@ -20,6 +21,9 @@ impl Client {
     pub fn send(&mut self, command: Command) -> Result<Resp, resp::Error> {
         println!("Sending command to server {:?}", command);
         let mut bytes = Vec::from(command);
+
+        let start = Instant::now();
+
         self.tcp_stream.write_all(bytes.as_slice())?;
 
         bytes.clear();
@@ -34,7 +38,7 @@ impl Client {
 
         let (response, size) = self.resp_parser.parse(bytes.as_slice())?;
 
-        println!("Received response from server size {} {:?}", size, response);
+        println!("Received response from server size={} bytes duration={:?} {:?}", size,start.elapsed(), response);
 
         Ok(response.expect("TODO error handling"))
     }
