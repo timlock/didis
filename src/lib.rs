@@ -5,3 +5,4 @@ pub mod flags;
 pub mod parser;
 pub mod replication;
 pub mod server;
+pub mod client;

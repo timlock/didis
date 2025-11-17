@@ -5,67 +5,58 @@ use crate::parser::resp::Resp;
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{
     collections::HashMap,
     io::{self},
     net::SocketAddr,
+    thread,
 };
 
 const BUFFER_SIZE: usize = 4096;
 
-
-
 pub struct Server {
+    address: SocketAddr,
     connections: HashMap<RawFd, Connection>,
-    peers: HashMap<RawFd, Connection>,
     controller: Controller,
-    io: IO,
+    done: Arc<AtomicBool>,
 }
 
 impl Server {
-    pub fn new(io: IO) -> Self {
+    pub fn new(address: SocketAddr) -> Self {
         Self {
+            address,
             connections: Default::default(),
-            peers: Default::default(),
             controller: Default::default(),
-            io,
+            done: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub fn run(&mut self, addr: SocketAddr, peers: Vec<SocketAddr>) -> io::Result<()> {
-        println!("Server starts listening on {addr}");
+    pub fn run(&mut self, mut io: IO) -> io::Result<()> {
+        println!("Server starts listening on {}", self.address);
 
-        let listener = TcpListener::bind(addr)?;
+        let listener = TcpListener::bind(self.address)?;
         listener.set_nonblocking(true)?;
-
-        self.io.accept(listener);
-
-        for peer_addr in peers {
-            let socket = TcpStream::connect(peer_addr)?;
-            let fd = socket.as_raw_fd();
-            let conn = Connection::new(socket.try_clone()?, peer_addr);
-            self.peers.insert(fd, conn);
-            let buf = Box::new([0u8; BUFFER_SIZE]);
-            self.io.receive(socket, buf);
-        }
+        io.accept(listener);
 
         loop {
-            for completion in self.io.poll_timeout(Duration::from_secs(1))? {
+            for completion in io.poll_timeout(Duration::from_secs(1))? {
                 match completion {
                     Completion::Accept(listener, result) => {
-                        self.handle_accept(result)?;
-                        self.io.accept(listener);
+                        self.handle_accept(&mut io, result)?;
+                        io.accept(listener);
                     }
                     Completion::Send(stream, buf, result) => match result {
-                        Ok(sent) => self.handle_send(stream, buf, sent),
+                        Ok(sent) => self.handle_send(&mut io, stream, buf, sent),
                         Err(err) => {
                             self.connections.remove(&stream.as_raw_fd());
                             println!("Closed connection {stream:?}: {err}");
                         }
                     },
                     Completion::Receive(stream, buf, res) => match res {
-                        Ok(received) => self.handle_receive(stream, buf, received),
+                        Ok(received) => self.handle_receive(&mut io, stream, buf, received),
                         Err(err) => {
                             self.connections.remove(&stream.as_raw_fd());
                             println!("Closed connection {stream:?} IO error: {err}");
@@ -73,21 +64,37 @@ impl Server {
                     },
                 }
             }
+
+            if self.done.load(Ordering::SeqCst) {
+                println!("Server stopped");
+                return Ok(());
+            }
         }
     }
 
-    fn handle_accept(&mut self, result: io::Result<(TcpStream, SocketAddr)>) -> io::Result<()> {
+    pub fn handle(&self) -> Arc<AtomicBool> {
+        self.done.clone()
+    }
+    pub fn stop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+
+    fn handle_accept(
+        &mut self,
+        io: &mut IO,
+        result: io::Result<(TcpStream, SocketAddr)>,
+    ) -> io::Result<()> {
         let (stream, address) = result?;
         println!["New client connected with address {}", address];
         let client = Connection::new(stream.try_clone()?, address);
         self.connections.insert(stream.as_raw_fd(), client);
 
         let buf = Box::new([0u8; BUFFER_SIZE]);
-        self.io.receive(stream, buf);
+        io.receive(stream, buf);
         Ok(())
     }
 
-    fn handle_send(&mut self, stream: TcpStream, mut buf: Box<[u8]>, sent: usize) {
+    fn handle_send(&mut self, mut io: &mut IO, stream: TcpStream, mut buf: Box<[u8]>, sent: usize) {
         let connection = self.connections.get_mut(&stream.as_raw_fd()).expect(
             format![
                 "Send data to unknown socket with file descriptor: {}",
@@ -97,13 +104,19 @@ impl Server {
         );
         connection.handle_sent(sent, buf.as_mut());
         if connection.to_send > 0 {
-            self.io.send(stream, buf, connection.to_send);
+            io.send(stream, buf, connection.to_send);
         } else {
-            self.io.receive(stream, buf);
+            io.receive(stream, buf);
         }
     }
 
-    fn handle_receive(&mut self, stream: TcpStream, mut buffer: Box<[u8]>, received: usize) {
+    fn handle_receive(
+        &mut self,
+        io: &mut IO,
+        stream: TcpStream,
+        mut buffer: Box<[u8]>,
+        received: usize,
+    ) {
         let connection = self.connections.get_mut(&stream.as_raw_fd()).expect(
             format![
                 "Received data from unknown socket with file descriptor: {}",
@@ -145,7 +158,7 @@ impl Server {
                     }
                 }
 
-                self.io.send(stream, buffer, connection.to_send);
+                io.send(stream, buffer, connection.to_send);
             }
         }
     }
@@ -184,5 +197,61 @@ impl Connection {
             let copy_range = self.to_send..(self.to_send + to_copy);
             buffer[copy_range].copy_from_slice(&self.remaining_out.as_slice()[..to_copy]);
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::client::Client;
+    use crate::parser::command::Command;
+    use std::str::FromStr;
+
+    #[test]
+    fn set_value() -> Result<(), Box<dyn std::error::Error>> {
+        let address = SocketAddr::from_str("127.0.0.1:10001")?;
+
+        let mut server = Server::new(address);
+        let server_handle = server.handle();
+
+        let handle = thread::spawn(move || {
+            println!("Server thread launched");
+
+            let io = IO::new(256).unwrap();
+            server.run(io).unwrap();
+
+            println!("Server thread closed");
+        });
+
+        println!("Connecting to server on {}", address);
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+        let mut client = Client::new(stream);
+
+        let get_cmd = Command::Get(String::from("Key"));
+        let response = client.send(get_cmd)?;
+
+        assert_eq!(Resp::Null, response);
+
+
+        let set_cmd = Command::Set{
+            key: "Key".to_string(),
+            value: "Value".to_string(),
+            overwrite_rule: None,
+            get: false,
+            expire_rule: None,
+        };
+        let response = client.send(set_cmd)?;
+        assert_eq!(Resp::ok(), response);
+
+        let get_cmd = Command::Get(String::from("Key"));
+        let response = client.send(get_cmd)?;
+        assert_eq!(Resp::BulkString(String::from("Value")), response);
+
+
+
+        server_handle.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        Ok(())
     }
 }

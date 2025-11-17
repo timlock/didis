@@ -1,5 +1,5 @@
 use super::resp;
-use crate::parser::resp::{parse_resp, Resp};
+use crate::parser::resp::{Resp, parse_resp};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
 use std::{error, fmt, io};
@@ -139,8 +139,6 @@ impl Parser {
     }
 }
 
-
-
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Command {
     Ping(Option<String>),
@@ -157,6 +155,82 @@ pub enum Command {
     Client,
     Exists(Vec<String>),
 }
+
+impl Command {
+    pub fn to_resp(self) -> Resp {
+        match self {
+            Command::Ping(message) => {
+                let mut command_parts = vec![Resp::BulkString(String::from("PING"))];
+                if let Some(message) = message {
+                    command_parts.push(Resp::BulkString(message));
+                }
+                Resp::Array(command_parts)
+            }
+            Command::Echo(message) => Resp::Array(vec![
+                Resp::BulkString(String::from("ECHO")),
+                Resp::BulkString(message),
+            ]),
+            Command::Get(key) => Resp::Array(vec![
+                Resp::BulkString(String::from("GET")),
+                Resp::BulkString(key),
+            ]),
+            Command::Set {
+                key,
+                value,
+                overwrite_rule,
+                get,
+                expire_rule,
+            } => {
+                let mut command_parts = vec![
+                    Resp::BulkString(String::from("SET")),
+                    Resp::BulkString(key),
+                    Resp::BulkString(value),
+                ];
+                if let Some(overwrite_rule) = overwrite_rule {
+                    command_parts.push(Resp::from(overwrite_rule));
+                }
+                if get {
+                    command_parts.push(Resp::BulkString(String::from("GET")))
+                }
+                if let Some(expire_rule) = expire_rule {
+                    command_parts.push(Resp::from(expire_rule));
+                }
+
+                Resp::Array(command_parts)
+            }
+            Command::ConfigGet(c) => Resp::Array(vec![
+                Resp::BulkString(String::from("CONFIG")),
+                Resp::BulkString(String::from("GET")),
+                Resp::BulkString(c),
+            ]),
+            Command::Client => Resp::Array(vec![Resp::BulkString(String::from("CLIENT"))]),
+            Command::Exists(keys) => {
+                let mut command_parts = vec![Resp::BulkString(String::from("EXISTS"))];
+                for key in keys {
+                    command_parts.push(Resp::BulkString(key));
+                }
+
+                Resp::Array(command_parts)
+            }
+        }
+    }
+    pub fn to_bytes(self) -> Vec<u8> {
+        Resp::from(self).to_bytes()
+    }
+}
+
+impl From<Command> for Resp {
+    fn from(value: Command) -> Self {
+        value.to_resp()
+    }
+}
+
+impl From<Command> for Vec<u8> {
+    fn from(value: Command) -> Self {
+        value.to_bytes()
+    }
+}
+
 
 pub fn parse_command(resp: Resp) -> Result<Command, Error> {
     let mut segment_iter = match resp {
@@ -258,8 +332,8 @@ fn parse_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
 pub enum ExpireRule {
     ExpiresInSecs(Duration),
     ExpiresInMillis(Duration),
-    ExpiresAtSecs(SystemTime),
-    ExpiresAtMillis(SystemTime),
+    ExpiresAtSecs(Duration),
+    ExpiresAtMillis(Duration),
     KeepTTL,
 }
 impl ExpireRule {
@@ -267,8 +341,8 @@ impl ExpireRule {
         match self {
             ExpireRule::ExpiresInSecs(s) => SystemTime::now().checked_add(*s),
             ExpireRule::ExpiresInMillis(ms) => SystemTime::now().checked_add(*ms),
-            ExpireRule::ExpiresAtSecs(t) => Some(*t),
-            ExpireRule::ExpiresAtMillis(t) => Some(*t),
+            ExpireRule::ExpiresAtSecs(s) => Some(SystemTime::UNIX_EPOCH.checked_add(*s)?),
+            ExpireRule::ExpiresAtMillis(ms) => Some(SystemTime::UNIX_EPOCH.checked_add(*ms)?),
             ExpireRule::KeepTTL => None,
         }
     }
@@ -287,28 +361,46 @@ impl TryFrom<&[u8]> for ExpireRule {
             let trimmed = &value[2..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed).map_err(|_| "Invalid UTF-8 string")?;
             let millis = ascii_number.parse().map_err(|_| "Invalid number")?;
-            let dur = Duration::from_secs(millis);
+            let dur = Duration::from_millis(millis);
             return Ok(ExpireRule::ExpiresInMillis(dur));
         }
         if value.starts_with(b"EXAT") {
             let trimmed = &value[4..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed).map_err(|_| "Invalid UTF-8 string")?;
             let secs = ascii_number.parse().map_err(|_| "Invalid number")?;
-            let timestamp = SystemTime::now().add(Duration::from_secs(secs));
-            return Ok(ExpireRule::ExpiresAtSecs(timestamp));
+            return Ok(ExpireRule::ExpiresAtSecs(Duration::from_secs(secs)));
         }
         if value.starts_with(b"PXAT") {
             let trimmed = &value[4..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed).map_err(|_| "Invalid UTF-8 string")?;
             let millis = ascii_number.parse().map_err(|_| "Invalid number")?;
-            let timestamp = SystemTime::now().add(Duration::from_millis(millis));
-            return Ok(ExpireRule::ExpiresAtMillis(timestamp));
+            return Ok(ExpireRule::ExpiresAtMillis(Duration::from_millis(millis)));
         }
         if value == b"KEEPTTL" {
             return Ok(ExpireRule::KeepTTL);
         }
 
         Err("")
+    }
+}
+
+impl From<ExpireRule> for Resp {
+    fn from(value: ExpireRule) -> Self {
+        match value {
+            ExpireRule::ExpiresInSecs(duration) => {
+                Resp::BulkString(format!("EX {}", duration.as_secs()))
+            }
+            ExpireRule::ExpiresInMillis(duration) => {
+                Resp::BulkString(format!("PX {}", duration.as_millis()))
+            }
+            ExpireRule::ExpiresAtSecs(duration) => {
+                Resp::BulkString(format!("EXAT {}", duration.as_secs()))
+            }
+            ExpireRule::ExpiresAtMillis(duration) => {
+                Resp::BulkString(format!("PXAT {}", duration.as_millis()))
+            }
+            ExpireRule::KeepTTL => Resp::BulkString(String::from("KEEPTTL")),
+        }
     }
 }
 
@@ -326,6 +418,15 @@ impl TryFrom<&[u8]> for OverwriteRule {
             b"NX" => Ok(OverwriteRule::NotExists),
             b"XX" => Ok(OverwriteRule::Exists),
             _ => Err(()),
+        }
+    }
+}
+
+impl From<OverwriteRule> for Resp {
+    fn from(value: OverwriteRule) -> Self {
+        match value {
+            OverwriteRule::NotExists => Resp::BulkString(String::from("NX")),
+            OverwriteRule::Exists => Resp::BulkString(String::from("XX")),
         }
     }
 }
