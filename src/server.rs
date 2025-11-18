@@ -13,7 +13,6 @@ use std::{
     io::{self},
     net::SocketAddr,
 };
-use std::io::Write;
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -109,9 +108,11 @@ impl Server {
             .as_str(),
         );
 
-
-        connection.handle_sent(sent, buf.as_mut());
-        println!("Sent {} bytes to client, remaining bytes {}", sent, connection.to_send);
+        connection.handle_sent(sent, &mut buf);
+        println!(
+            "Sent {} bytes to client, remaining bytes {}",
+            sent, connection.to_send
+        );
         if connection.to_send > 0 {
             io.send(stream, buf, connection.to_send);
             return;
@@ -160,21 +161,7 @@ impl Server {
                 }
             };
 
-            if connection.to_send > buffer.len() {
-                connection.remaining_out.extend(serialized_response);
-            } else {
-                let remaining_space = buffer.len() - connection.to_send;
-                if serialized_response.len() < remaining_space {
-                    buffer[connection.to_send..(connection.to_send + serialized_response.len())]
-                        .copy_from_slice(serialized_response.as_slice());
-                    connection.to_send += serialized_response.len();
-                }else {
-                    buffer[connection.to_send..]
-                        .copy_from_slice(&serialized_response[..remaining_space]);
-                    connection.to_send += remaining_space;
-                    connection.remaining_out.extend_from_slice(&serialized_response[remaining_space..])
-                }
-            }
+            connection.handle_sending_response(serialized_response, &mut buffer);
         }
 
         if connection.to_send > 0 {
@@ -215,14 +202,22 @@ impl Connection {
         }
 
         if !self.remaining_out.is_empty() && self.to_send < buffer.len() {
-
             let to_copy = min(buffer.len() - self.to_send, self.remaining_out.len());
             let copy_range = self.to_send..(self.to_send + to_copy);
-            buffer[copy_range].copy_from_slice(&self.remaining_out.as_slice()[..to_copy]);
-            self.remaining_out.drain(..to_copy);
+
+            buffer[copy_range].copy_from_slice(self.remaining_out.drain(..to_copy).as_slice());
 
             self.to_send += to_copy;
         }
+    }
+
+    fn handle_sending_response(&mut self, mut response: Vec<u8>, buffer: &mut [u8]) {
+        let to_send = min(buffer.len() - self.to_send, response.len());
+
+        buffer[self.to_send..self.to_send + to_send]
+            .copy_from_slice(response.drain(..to_send).as_slice());
+        self.remaining_out.extend_from_slice(response.as_slice());
+        self.to_send += to_send;
     }
 }
 
@@ -353,7 +348,7 @@ mod test {
 
         assert_eq!(Value::Null, response);
 
-        let large_value = String::from_utf8(vec![b'a'; BUFFER_SIZE * 100])?;
+        let large_value = String::from_utf8(vec![b'a'; BUFFER_SIZE * 1000])?;
 
         let set_cmd = Command::Set {
             key: "Key".to_string(),
