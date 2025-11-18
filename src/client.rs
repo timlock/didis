@@ -20,7 +20,7 @@ impl Client {
     }
 
     pub fn send(&mut self, command: Command) -> Result<Resp, resp::Error> {
-        println!("Sending command to server {:?}", command);
+        println!("Sending command to server {}", command);
         let mut bytes = Vec::from(command);
 
         let start = Instant::now();
@@ -38,15 +38,16 @@ impl Client {
         }
 
         let (response, size) = self.resp_parser.parse(bytes.as_slice())?;
+        let response = response.expect("TODO error handling");
 
         println!(
-            "Received response from server size={} bytes duration={:?} {:?}",
+            "Received response from server size={} bytes duration={:?} {}",
             size,
             start.elapsed(),
             response
         );
 
-        Ok(response.expect("TODO error handling"))
+        Ok(response)
     }
 
     pub fn send_batch(

@@ -1,5 +1,6 @@
 use super::resp;
 use crate::parser::resp::{Resp, parse_resp};
+use std::fmt::{Display, Formatter, write};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
 use std::{error, fmt, io};
@@ -219,6 +220,53 @@ impl Command {
     }
 }
 
+impl Display for Command {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Command::Ping(value) => match value {
+                None => write!(f, "PING"),
+                Some(value) => write!(f, "PING {}", value),
+            },
+            Command::Echo(value) => write!(f, "ECHO {}", value),
+            Command::Get(key) => write!(f, "GET {}", key),
+            Command::Set {
+                key,
+                value,
+                overwrite_rule,
+                get,
+                expire_rule,
+            } => {
+                write!(f, "SET {}", key)?;
+                if let Some(overwrite_rule) = overwrite_rule {
+                    write!(f, " {:?}", overwrite_rule)?;
+                }
+                if value.len() < 32 {
+                    write!(f, "{}", value)?;
+                } else {
+                    write!(f, "{}...(shortened)", &value[..32])?;
+                }
+                if *get {
+                    write!(f, " GET")?;
+                }
+                if let Some(expire_rule) = expire_rule {
+                    write!(f, " {:?}", expire_rule)?;
+                }
+                Ok(())
+            }
+
+            Command::ConfigGet(value) => {
+                write!(f, "CONFIG GET {}", value)
+            }
+            Command::Client => {
+                write!(f, "CLIENT")
+            }
+            Command::Exists(keys) => {
+                write!(f, "KEYS {:?}", keys)
+            }
+        }
+    }
+}
+
 impl From<Command> for Resp {
     fn from(value: Command) -> Self {
         value.to_resp()
@@ -230,7 +278,6 @@ impl From<Command> for Vec<u8> {
         value.to_bytes()
     }
 }
-
 
 pub fn parse_command(resp: Resp) -> Result<Command, Error> {
     let mut segment_iter = match resp {

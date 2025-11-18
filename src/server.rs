@@ -1,4 +1,4 @@
-use crate::async_io::{IO, Completion, AsyncIO};
+use crate::async_io::{AsyncIO, Completion, IO};
 use crate::controller::Controller;
 use crate::parser::command::Parser;
 use crate::parser::resp::Resp;
@@ -13,6 +13,7 @@ use std::{
     io::{self},
     net::SocketAddr,
 };
+use std::io::Write;
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -54,7 +55,7 @@ impl Server {
                             println!("Closed connection {stream:?}: {err}");
                         }
                     },
-                    Completion::Receive(stream, buf, res) => match res {
+                    Completion::Receive(stream, buf, result) => match result {
                         Ok(received) => self.handle_receive(io, stream, buf, received),
                         Err(err) => {
                             self.connections.remove(&stream.as_raw_fd());
@@ -107,12 +108,15 @@ impl Server {
             ]
             .as_str(),
         );
+
+
         connection.handle_sent(sent, buf.as_mut());
+        println!("Sent {} bytes to client, remaining bytes {}", sent, connection.to_send);
         if connection.to_send > 0 {
             io.send(stream, buf, connection.to_send);
-        } else {
-            io.receive(stream, buf);
+            return;
         }
+        io.receive(stream, buf);
     }
 
     fn handle_receive(
@@ -130,42 +134,56 @@ impl Server {
             .as_str(),
         );
 
-        match received {
-            0 => {
-                self.connections.remove(&stream.as_raw_fd());
-                println!("Closed connection {stream:?}");
-            }
-            len => {
-                let (commands, read) = connection.command_parser.parse_all(&buffer[..len]);
-                connection.remaining_in.extend(&buffer[read..len]);
+        if received == 0 {
+            self.connections.remove(&stream.as_raw_fd());
+            println!("Closed connection {stream:?}");
+            return;
+        }
 
-                for command in commands {
-                    let bytes = match command {
-                        Ok(command) => {
-                            println!("Received command: {:?}", command);
-                            let response = self.controller.handle_command(command);
-                            println!("Sending response {response}");
+        println!("Received {} bytes from client", received);
 
-                            response.to_bytes()
-                        }
-                        Err(err) => {
-                            eprintln!("Received faulty command: {:?}", err);
-                            Resp::SimpleError(err.to_string()).to_bytes()
-                        }
-                    };
+        let (commands, parsed) = connection.command_parser.parse_all(&buffer[..received]);
+        connection.remaining_in.extend(&buffer[parsed..received]);
 
-                    if connection.to_send + bytes.len() > buffer.len() {
-                        connection.remaining_out.extend(bytes);
-                    } else {
-                        buffer[connection.to_send..(connection.to_send + bytes.len())]
-                            .copy_from_slice(bytes.as_slice());
-                        connection.to_send += bytes.len();
-                    }
+        for command in commands {
+            let serialized_response = match command {
+                Ok(command) => {
+                    println!("Received command: {}", command);
+                    let response = self.controller.handle_command(command);
+                    println!("Sending response {response}");
+
+                    response.to_bytes()
                 }
+                Err(err) => {
+                    eprintln!("Received faulty command: {:?}", err);
+                    Resp::SimpleError(err.to_string()).to_bytes()
+                }
+            };
 
-                io.send(stream, buffer, connection.to_send);
+            if connection.to_send > buffer.len() {
+                connection.remaining_out.extend(serialized_response);
+            } else {
+                let remaining_space = buffer.len() - connection.to_send;
+                if serialized_response.len() < remaining_space {
+                    buffer[connection.to_send..(connection.to_send + serialized_response.len())]
+                        .copy_from_slice(serialized_response.as_slice());
+                    connection.to_send += serialized_response.len();
+                }else {
+                    buffer[connection.to_send..]
+                        .copy_from_slice(&serialized_response[..remaining_space]);
+                    connection.to_send += remaining_space;
+                    connection.remaining_out.extend_from_slice(&serialized_response[remaining_space..])
+                }
             }
         }
+
+        if connection.to_send > 0 {
+            io.send(stream, buffer, connection.to_send);
+            return;
+        }
+
+        println!("Received not enough bytes to handle message, receiving more bytes");
+        io.receive(stream, buffer);
     }
 }
 
@@ -193,14 +211,17 @@ impl Connection {
     fn handle_sent(&mut self, sent: usize, buffer: &mut [u8]) {
         if self.to_send > 0 {
             buffer.copy_within(sent..self.to_send, 0);
+            self.to_send -= sent;
         }
 
-        self.to_send -= sent;
+        if !self.remaining_out.is_empty() && self.to_send < buffer.len() {
 
-        if !self.remaining_out.is_empty() && self.to_send != buffer.len() {
             let to_copy = min(buffer.len() - self.to_send, self.remaining_out.len());
             let copy_range = self.to_send..(self.to_send + to_copy);
             buffer[copy_range].copy_from_slice(&self.remaining_out.as_slice()[..to_copy]);
+            self.remaining_out.drain(..to_copy);
+
+            self.to_send += to_copy;
         }
     }
 }
@@ -310,6 +331,43 @@ mod test {
         assert_eq!(Resp::BulkString(String::from("Value1")), third_result);
         let fourth_result = response.remove(0)?;
         assert_eq!(Resp::BulkString(String::from("Value2")), fourth_result);
+
+        server_handle.store(true, Ordering::SeqCst);
+        thread_handle.join().unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
+        let address = SocketAddr::from_str("127.0.0.1:10003")?;
+
+        let (server_handle, thread_handle) = launch_server(address);
+
+        println!("Connecting to server on {}", address);
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+        let mut client = Client::new(stream);
+
+        let get_cmd = Command::Get(String::from("Key"));
+        let response = client.send(get_cmd)?;
+
+        assert_eq!(Resp::Null, response);
+
+        let large_value = String::from_utf8(vec![b'a'; BUFFER_SIZE * 100])?;
+
+        let set_cmd = Command::Set {
+            key: "Key".to_string(),
+            value: large_value.clone(),
+            overwrite_rule: None,
+            get: false,
+            expire_rule: None,
+        };
+        let response = client.send(set_cmd)?;
+        assert_eq!(Resp::ok(), response);
+
+        let get_cmd = Command::Get(String::from("Key"));
+        let response = client.send(get_cmd)?;
+        assert_eq!(Resp::BulkString(String::from(large_value)), response);
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();

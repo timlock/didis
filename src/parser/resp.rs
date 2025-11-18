@@ -1,7 +1,7 @@
 use crate::parser::ring_buffer::RingBuffer;
 use std::borrow::{Borrow, Cow};
 use std::cmp::min;
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Formatter};
 use std::io::Read;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
@@ -115,9 +115,29 @@ impl Resp {
 
 impl Display for Resp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", String::from(self))
+        match self {
+            Resp::SimpleString(value) => write!(f, "+{}\\r\\n", value),
+            Resp::SimpleError(value) => write!(f, "-{}\\r\\n", value),
+            Resp::Integer(value) => write!(f, ":{}\\r\\n", value),
+            Resp::BulkString(value) => {
+                if value.len() < 32 {
+                    write!(f, "${}\\r\\n{}\\r\\n",value.len(), value)
+                }else{
+                    write!(f, "${}\\r\\n{}...(shortened)\\r\\n",value.len(), &value[..32])
+                }
+            },
+            Resp::Array(values) => {
+                write!(f, "*{}\\r\\n", values.len())?;
+                for value in values {
+                    write!(f, "{}", value)?;
+                }
+                write!(f, "\\r\\n",)
+            }
+            Resp::Null => write!(f, "_\\r\\n")
+        }
     }
 }
+
 
 impl From<&Resp> for String {
     fn from(value: &Resp) -> Self {
@@ -893,7 +913,7 @@ fn parse_null(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::mpsc::{Receiver, Sender, channel};
 
     use super::*;
 
