@@ -348,7 +348,10 @@ mod test {
 
         assert_eq!(Value::Null, response);
 
-        let large_value = String::from_utf8(vec![b'a'; BUFFER_SIZE * 1000])?;
+        let mut large_value = String::new();
+        for i in 0.. BUFFER_SIZE * 100 {
+           large_value.push(char::from_digit((i % 10) as u32, 10).unwrap())
+        }
 
         let set_cmd = Command::Set {
             key: "Key".to_string(),
