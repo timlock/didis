@@ -1,4 +1,4 @@
-use crate::async_io::{AsyncIO, Completion, IO};
+use crate::async_io::{IO, Completion, AsyncIO};
 use crate::controller::Controller;
 use crate::parser::command::Parser;
 use crate::parser::resp::Resp;
@@ -12,7 +12,6 @@ use std::{
     collections::HashMap,
     io::{self},
     net::SocketAddr,
-    thread,
 };
 
 const BUFFER_SIZE: usize = 4096;
@@ -34,7 +33,7 @@ impl Server {
         }
     }
 
-    pub fn run(&mut self, mut io: IO) -> io::Result<()> {
+    pub fn run(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
         println!("Server starts listening on {}", self.address);
 
         let listener = TcpListener::bind(self.address)?;
@@ -45,18 +44,18 @@ impl Server {
             for completion in io.poll_timeout(Duration::from_secs(1))? {
                 match completion {
                     Completion::Accept(listener, result) => {
-                        self.handle_accept(&mut io, result)?;
+                        self.handle_accept(io, result)?;
                         io.accept(listener);
                     }
                     Completion::Send(stream, buf, result) => match result {
-                        Ok(sent) => self.handle_send(&mut io, stream, buf, sent),
+                        Ok(sent) => self.handle_send(io, stream, buf, sent),
                         Err(err) => {
                             self.connections.remove(&stream.as_raw_fd());
                             println!("Closed connection {stream:?}: {err}");
                         }
                     },
                     Completion::Receive(stream, buf, res) => match res {
-                        Ok(received) => self.handle_receive(&mut io, stream, buf, received),
+                        Ok(received) => self.handle_receive(io, stream, buf, received),
                         Err(err) => {
                             self.connections.remove(&stream.as_raw_fd());
                             println!("Closed connection {stream:?} IO error: {err}");
@@ -81,7 +80,7 @@ impl Server {
 
     fn handle_accept(
         &mut self,
-        io: &mut IO,
+        io: &mut impl AsyncIO,
         result: io::Result<(TcpStream, SocketAddr)>,
     ) -> io::Result<()> {
         let (stream, address) = result?;
@@ -94,7 +93,13 @@ impl Server {
         Ok(())
     }
 
-    fn handle_send(&mut self, mut io: &mut IO, stream: TcpStream, mut buf: Box<[u8]>, sent: usize) {
+    fn handle_send(
+        &mut self,
+        io: &mut impl AsyncIO,
+        stream: TcpStream,
+        mut buf: Box<[u8]>,
+        sent: usize,
+    ) {
         let connection = self.connections.get_mut(&stream.as_raw_fd()).expect(
             format![
                 "Send data to unknown socket with file descriptor: {}",
@@ -112,7 +117,7 @@ impl Server {
 
     fn handle_receive(
         &mut self,
-        io: &mut IO,
+        io: &mut impl AsyncIO,
         stream: TcpStream,
         mut buffer: Box<[u8]>,
         received: usize,
@@ -206,6 +211,7 @@ mod test {
     use crate::client::Client;
     use crate::parser::command::Command;
     use std::str::FromStr;
+    use std::thread;
     use std::thread::JoinHandle;
 
     fn launch_server(address: SocketAddr) -> (Arc<AtomicBool>, JoinHandle<()>) {
@@ -218,11 +224,11 @@ mod test {
         let thread_handle = thread::spawn(move || {
             println!("Server thread launched");
 
-            let io = IO::new(256).unwrap();
+            let mut io = IO::new(256).unwrap();
 
             thread_launched_clone.store(true, Ordering::SeqCst);
 
-            server.run(io).unwrap();
+            server.run(&mut io).unwrap();
 
             println!("Server thread closed");
         });
@@ -304,7 +310,6 @@ mod test {
         assert_eq!(Resp::BulkString(String::from("Value1")), third_result);
         let fourth_result = response.remove(0)?;
         assert_eq!(Resp::BulkString(String::from("Value2")), fourth_result);
-
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();

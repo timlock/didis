@@ -9,8 +9,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut server = Server::new(address);
 
-    let io = IO::new(256)?;
-    server.run(io)?;
-    
+    let mut io = IO::new(256)?;
+    server.run(&mut io)?;
+
     Ok(())
 }

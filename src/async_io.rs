@@ -1,16 +1,16 @@
 #[cfg(target_os = "linux")]
 mod linux;
 
-use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::time::Duration;
 #[cfg(target_os = "linux")]
 pub use crate::async_io::linux::*;
-
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 pub use crate::async_io::macos::*;
+
+use std::io;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::time::Duration;
 
 pub enum Completion {
     Accept(TcpListener, io::Result<(TcpStream, SocketAddr)>),
