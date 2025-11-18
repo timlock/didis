@@ -1,5 +1,5 @@
 use super::resp;
-use crate::parser::resp::{Resp, parse_resp};
+use crate::parser::resp::{Value, parse_resp};
 use std::fmt::{Display, Formatter, write};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
@@ -158,22 +158,22 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn to_resp(self) -> Resp {
+    pub fn to_resp(self) -> Value {
         match self {
             Command::Ping(message) => {
-                let mut command_parts = vec![Resp::BulkString(String::from("PING"))];
+                let mut command_parts = vec![Value::BulkString(String::from("PING"))];
                 if let Some(message) = message {
-                    command_parts.push(Resp::BulkString(message));
+                    command_parts.push(Value::BulkString(message));
                 }
-                Resp::Array(command_parts)
+                Value::Array(command_parts)
             }
-            Command::Echo(message) => Resp::Array(vec![
-                Resp::BulkString(String::from("ECHO")),
-                Resp::BulkString(message),
+            Command::Echo(message) => Value::Array(vec![
+                Value::BulkString(String::from("ECHO")),
+                Value::BulkString(message),
             ]),
-            Command::Get(key) => Resp::Array(vec![
-                Resp::BulkString(String::from("GET")),
-                Resp::BulkString(key),
+            Command::Get(key) => Value::Array(vec![
+                Value::BulkString(String::from("GET")),
+                Value::BulkString(key),
             ]),
             Command::Set {
                 key,
@@ -183,40 +183,40 @@ impl Command {
                 expire_rule,
             } => {
                 let mut command_parts = vec![
-                    Resp::BulkString(String::from("SET")),
-                    Resp::BulkString(key),
-                    Resp::BulkString(value),
+                    Value::BulkString(String::from("SET")),
+                    Value::BulkString(key),
+                    Value::BulkString(value),
                 ];
                 if let Some(overwrite_rule) = overwrite_rule {
-                    command_parts.push(Resp::from(overwrite_rule));
+                    command_parts.push(Value::from(overwrite_rule));
                 }
                 if get {
-                    command_parts.push(Resp::BulkString(String::from("GET")))
+                    command_parts.push(Value::BulkString(String::from("GET")))
                 }
                 if let Some(expire_rule) = expire_rule {
-                    command_parts.push(Resp::from(expire_rule));
+                    command_parts.push(Value::from(expire_rule));
                 }
 
-                Resp::Array(command_parts)
+                Value::Array(command_parts)
             }
-            Command::ConfigGet(c) => Resp::Array(vec![
-                Resp::BulkString(String::from("CONFIG")),
-                Resp::BulkString(String::from("GET")),
-                Resp::BulkString(c),
+            Command::ConfigGet(c) => Value::Array(vec![
+                Value::BulkString(String::from("CONFIG")),
+                Value::BulkString(String::from("GET")),
+                Value::BulkString(c),
             ]),
-            Command::Client => Resp::Array(vec![Resp::BulkString(String::from("CLIENT"))]),
+            Command::Client => Value::Array(vec![Value::BulkString(String::from("CLIENT"))]),
             Command::Exists(keys) => {
-                let mut command_parts = vec![Resp::BulkString(String::from("EXISTS"))];
+                let mut command_parts = vec![Value::BulkString(String::from("EXISTS"))];
                 for key in keys {
-                    command_parts.push(Resp::BulkString(key));
+                    command_parts.push(Value::BulkString(key));
                 }
 
-                Resp::Array(command_parts)
+                Value::Array(command_parts)
             }
         }
     }
     pub fn to_bytes(self) -> Vec<u8> {
-        Resp::from(self).to_bytes()
+        Value::from(self).to_bytes()
     }
 }
 
@@ -267,7 +267,7 @@ impl Display for Command {
     }
 }
 
-impl From<Command> for Resp {
+impl From<Command> for Value {
     fn from(value: Command) -> Self {
         value.to_resp()
     }
@@ -279,15 +279,15 @@ impl From<Command> for Vec<u8> {
     }
 }
 
-pub fn parse_command(resp: Resp) -> Result<Command, Error> {
+pub fn parse_command(resp: Value) -> Result<Command, Error> {
     let mut segment_iter = match resp {
-        Resp::Array(vec) => vec.into_iter(),
+        Value::Array(vec) => vec.into_iter(),
         _ => return Err(Error::InvalidStart),
     };
 
     let name = match segment_iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(name) => name,
+            Value::BulkString(name) => name,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Err(Error::MissingName),
@@ -324,10 +324,10 @@ pub fn parse_command_bytes(value: &[u8]) -> Result<(impl Iterator<Item = Command
     Ok((result.into_iter(), remaining))
 }
 
-fn parse_ping(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_ping(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(text) => text,
+            Value::BulkString(text) => text,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Ok(Command::Ping(None)),
@@ -341,10 +341,10 @@ fn parse_ping(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     Ok(Command::Ping(Some(text)))
 }
 
-fn parse_echo(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_echo(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(text) => text,
+            Value::BulkString(text) => text,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
@@ -358,10 +358,10 @@ fn parse_echo(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     Ok(Command::Echo(text))
 }
 
-fn parse_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_get(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(text) => text,
+            Value::BulkString(text) => text,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
@@ -431,22 +431,22 @@ impl TryFrom<&[u8]> for ExpireRule {
     }
 }
 
-impl From<ExpireRule> for Resp {
+impl From<ExpireRule> for Value {
     fn from(value: ExpireRule) -> Self {
         match value {
             ExpireRule::ExpiresInSecs(duration) => {
-                Resp::BulkString(format!("EX {}", duration.as_secs()))
+                Value::BulkString(format!("EX {}", duration.as_secs()))
             }
             ExpireRule::ExpiresInMillis(duration) => {
-                Resp::BulkString(format!("PX {}", duration.as_millis()))
+                Value::BulkString(format!("PX {}", duration.as_millis()))
             }
             ExpireRule::ExpiresAtSecs(duration) => {
-                Resp::BulkString(format!("EXAT {}", duration.as_secs()))
+                Value::BulkString(format!("EXAT {}", duration.as_secs()))
             }
             ExpireRule::ExpiresAtMillis(duration) => {
-                Resp::BulkString(format!("PXAT {}", duration.as_millis()))
+                Value::BulkString(format!("PXAT {}", duration.as_millis()))
             }
-            ExpireRule::KeepTTL => Resp::BulkString(String::from("KEEPTTL")),
+            ExpireRule::KeepTTL => Value::BulkString(String::from("KEEPTTL")),
         }
     }
 }
@@ -469,19 +469,19 @@ impl TryFrom<&[u8]> for OverwriteRule {
     }
 }
 
-impl From<OverwriteRule> for Resp {
+impl From<OverwriteRule> for Value {
     fn from(value: OverwriteRule) -> Self {
         match value {
-            OverwriteRule::NotExists => Resp::BulkString(String::from("NX")),
-            OverwriteRule::Exists => Resp::BulkString(String::from("XX")),
+            OverwriteRule::NotExists => Value::BulkString(String::from("NX")),
+            OverwriteRule::Exists => Value::BulkString(String::from("XX")),
         }
     }
 }
 
-fn parse_set(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_set(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(text) => text,
+            Value::BulkString(text) => text,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
@@ -489,7 +489,7 @@ fn parse_set(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
 
     let value = match iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(text) => text,
+            Value::BulkString(text) => text,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
@@ -500,7 +500,7 @@ fn parse_set(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     let mut expire_rule = None;
     for next in iter {
         match next {
-            Resp::BulkString(text) => {
+            Value::BulkString(text) => {
                 let uppercase = text.to_ascii_uppercase();
                 if let Ok(r) = OverwriteRule::try_from(uppercase.as_ref()) {
                     overwrite_rule = Some(r);
@@ -523,11 +523,11 @@ fn parse_set(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
     })
 }
 
-fn parse_config_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_config_get(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     // Sub command like GET or SET
     let _ = match iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(text) => text,
+            Value::BulkString(text) => text,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
@@ -535,7 +535,7 @@ fn parse_config_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Err
 
     let key = match iter.next() {
         Some(resp) => match resp {
-            Resp::BulkString(text) => text,
+            Value::BulkString(text) => text,
             _ => return Err(Error::UnexpectedResp),
         },
         None => return Err(Error::InvalidNumberOfArguments(0)),
@@ -549,7 +549,7 @@ fn parse_config_get(mut iter: impl Iterator<Item = Resp>) -> Result<Command, Err
     Ok(Command::ConfigGet(key))
 }
 
-fn parse_client(iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_client(iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     let (remaining, _) = iter.size_hint();
     if remaining > 0 {
         return Err(Error::InvalidNumberOfArguments(remaining));
@@ -557,12 +557,12 @@ fn parse_client(iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
 
     Ok(Command::Client)
 }
-fn parse_exists(iter: impl Iterator<Item = Resp>) -> Result<Command, Error> {
+fn parse_exists(iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     let mut keys = Vec::new();
 
     for next in iter {
         match next {
-            Resp::BulkString(text) => {
+            Value::BulkString(text) => {
                 keys.push(text);
             }
             _ => return Err(Error::UnexpectedResp),
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn parse_ping() -> Result<(), String> {
         let name = "PING".to_string();
-        let resp = Resp::Array(vec![Resp::BulkString(name)]);
+        let resp = Value::Array(vec![Value::BulkString(name)]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(Command::Ping(None), command);
         Ok(())
@@ -587,7 +587,7 @@ mod tests {
     fn parse_echo() -> Result<(), String> {
         let name = "ECHO".to_string();
         let arg = "test".to_string();
-        let resp = Resp::Array(vec![Resp::BulkString(name), Resp::BulkString(arg.clone())]);
+        let resp = Value::Array(vec![Value::BulkString(name), Value::BulkString(arg.clone())]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(Command::Echo(arg), command);
         Ok(())
@@ -595,13 +595,13 @@ mod tests {
 
     #[test]
     fn parse_set() -> Result<(), String> {
-        let resp = Resp::Array(vec![
-            Resp::BulkString("SET".to_string()),
-            Resp::BulkString("key".to_string()),
-            Resp::BulkString("value".to_string()),
-            Resp::BulkString("XX".to_string()),
-            Resp::BulkString("GET".to_string()),
-            Resp::BulkString("EX 10".to_string()),
+        let resp = Value::Array(vec![
+            Value::BulkString("SET".to_string()),
+            Value::BulkString("key".to_string()),
+            Value::BulkString("value".to_string()),
+            Value::BulkString("XX".to_string()),
+            Value::BulkString("GET".to_string()),
+            Value::BulkString("EX 10".to_string()),
         ]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(
@@ -619,10 +619,10 @@ mod tests {
 
     #[test]
     fn parse_set_no_options() -> Result<(), String> {
-        let resp = Resp::Array(vec![
-            Resp::BulkString("SET".to_string()),
-            Resp::BulkString("key".to_string()),
-            Resp::BulkString("value".to_string()),
+        let resp = Value::Array(vec![
+            Value::BulkString("SET".to_string()),
+            Value::BulkString("key".to_string()),
+            Value::BulkString("value".to_string()),
         ]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(

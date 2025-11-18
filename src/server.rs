@@ -1,7 +1,7 @@
 use crate::async_io::{AsyncIO, Completion, IO};
 use crate::controller::Controller;
 use crate::parser::command::Parser;
-use crate::parser::resp::Resp;
+use crate::parser::resp::Value;
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
@@ -156,7 +156,7 @@ impl Server {
                 }
                 Err(err) => {
                     eprintln!("Received faulty command: {:?}", err);
-                    Resp::SimpleError(err.to_string()).to_bytes()
+                    Value::SimpleError(err.to_string()).to_bytes()
                 }
             };
 
@@ -272,7 +272,7 @@ mod test {
         let get_cmd = Command::Get(String::from("Key"));
         let response = client.send(get_cmd)?;
 
-        assert_eq!(Resp::Null, response);
+        assert_eq!(Value::Null, response);
 
         let set_cmd = Command::Set {
             key: "Key".to_string(),
@@ -282,11 +282,11 @@ mod test {
             expire_rule: None,
         };
         let response = client.send(set_cmd)?;
-        assert_eq!(Resp::ok(), response);
+        assert_eq!(Value::ok(), response);
 
         let get_cmd = Command::Get(String::from("Key"));
         let response = client.send(get_cmd)?;
-        assert_eq!(Resp::BulkString(String::from("Value")), response);
+        assert_eq!(Value::BulkString(String::from("Value")), response);
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();
@@ -324,13 +324,13 @@ mod test {
         let mut response = client.send_batch(cmd_batch)?;
         assert_eq!(4, response.len());
         let first_result = response.remove(0)?;
-        assert_eq!(Resp::ok(), first_result);
+        assert_eq!(Value::ok(), first_result);
         let second_result = response.remove(0)?;
-        assert_eq!(Resp::ok(), second_result);
+        assert_eq!(Value::ok(), second_result);
         let third_result = response.remove(0)?;
-        assert_eq!(Resp::BulkString(String::from("Value1")), third_result);
+        assert_eq!(Value::BulkString(String::from("Value1")), third_result);
         let fourth_result = response.remove(0)?;
-        assert_eq!(Resp::BulkString(String::from("Value2")), fourth_result);
+        assert_eq!(Value::BulkString(String::from("Value2")), fourth_result);
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();
@@ -351,7 +351,7 @@ mod test {
         let get_cmd = Command::Get(String::from("Key"));
         let response = client.send(get_cmd)?;
 
-        assert_eq!(Resp::Null, response);
+        assert_eq!(Value::Null, response);
 
         let large_value = String::from_utf8(vec![b'a'; BUFFER_SIZE * 100])?;
 
@@ -363,11 +363,11 @@ mod test {
             expire_rule: None,
         };
         let response = client.send(set_cmd)?;
-        assert_eq!(Resp::ok(), response);
+        assert_eq!(Value::ok(), response);
 
         let get_cmd = Command::Get(String::from("Key"));
         let response = client.send(get_cmd)?;
-        assert_eq!(Resp::BulkString(String::from(large_value)), response);
+        assert_eq!(Value::BulkString(String::from(large_value)), response);
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();

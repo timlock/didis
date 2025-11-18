@@ -59,46 +59,46 @@ impl From<ParseIntError> for Error {
     }
 }
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Resp {
+pub enum Value {
     SimpleString(String),
     SimpleError(String),
     Integer(i64),
     BulkString(String),
-    Array(Vec<Resp>),
+    Array(Vec<Value>),
     Null,
 }
 
-impl Resp {
-    pub fn ok() -> Resp {
-        Resp::SimpleString("OK".to_string())
+impl Value {
+    pub fn ok() -> Value {
+        Value::SimpleString("OK".to_string())
     }
     pub fn to_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::new();
         const CRLF: &[u8; 2] = b"\r\n";
         match self {
-            Resp::SimpleString(s) => {
+            Value::SimpleString(s) => {
                 bytes.push(b'+');
                 bytes.extend_from_slice(s.as_bytes());
                 bytes.extend_from_slice(CRLF);
             }
-            Resp::SimpleError(s) => {
+            Value::SimpleError(s) => {
                 bytes.push(b'-');
                 bytes.extend_from_slice(s.as_bytes());
                 bytes.extend_from_slice(CRLF);
             }
-            Resp::Integer(i) => {
+            Value::Integer(i) => {
                 bytes.push(b':');
                 bytes.extend_from_slice(i.to_string().as_bytes());
                 bytes.extend_from_slice(CRLF);
             }
-            Resp::BulkString(b) => {
+            Value::BulkString(b) => {
                 bytes.push(b'$');
                 bytes.extend_from_slice(b.len().to_string().as_bytes());
                 bytes.extend_from_slice(CRLF);
                 bytes.extend_from_slice(b.as_bytes());
                 bytes.extend_from_slice(CRLF);
             }
-            Resp::Array(resps) => {
+            Value::Array(resps) => {
                 bytes.push(b'*');
                 bytes.extend_from_slice(resps.len().to_string().as_bytes());
                 bytes.extend_from_slice(CRLF);
@@ -107,66 +107,66 @@ impl Resp {
                     bytes.extend_from_slice(&serialized);
                 }
             }
-            Resp::Null => bytes.extend_from_slice(b"*-1\r\n"),
+            Value::Null => bytes.extend_from_slice(b"*-1\r\n"),
         }
         bytes
     }
 }
 
-impl Display for Resp {
+impl Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Resp::SimpleString(value) => write!(f, "+{}\\r\\n", value),
-            Resp::SimpleError(value) => write!(f, "-{}\\r\\n", value),
-            Resp::Integer(value) => write!(f, ":{}\\r\\n", value),
-            Resp::BulkString(value) => {
+            Value::SimpleString(value) => write!(f, "+{}\\r\\n", value),
+            Value::SimpleError(value) => write!(f, "-{}\\r\\n", value),
+            Value::Integer(value) => write!(f, ":{}\\r\\n", value),
+            Value::BulkString(value) => {
                 if value.len() < 32 {
                     write!(f, "${}\\r\\n{}\\r\\n",value.len(), value)
                 }else{
                     write!(f, "${}\\r\\n{}...(shortened)\\r\\n",value.len(), &value[..32])
                 }
             },
-            Resp::Array(values) => {
+            Value::Array(values) => {
                 write!(f, "*{}\\r\\n", values.len())?;
                 for value in values {
                     write!(f, "{}", value)?;
                 }
                 write!(f, "\\r\\n",)
             }
-            Resp::Null => write!(f, "_\\r\\n")
+            Value::Null => write!(f, "_\\r\\n")
         }
     }
 }
 
 
-impl From<&Resp> for String {
-    fn from(value: &Resp) -> Self {
+impl From<&Value> for String {
+    fn from(value: &Value) -> Self {
         let mut string = String::new();
         const CLRF: &str = "\r\n";
         match value {
-            Resp::SimpleString(s) => {
+            Value::SimpleString(s) => {
                 string += "+";
                 string += s;
                 string += CLRF;
             }
-            Resp::SimpleError(e) => {
+            Value::SimpleError(e) => {
                 string += "-";
                 string += e;
                 string += CLRF;
             }
-            Resp::Integer(i) => {
+            Value::Integer(i) => {
                 string += ":";
                 string += i.to_string().as_str();
                 string += CLRF;
             }
-            Resp::BulkString(b) => {
+            Value::BulkString(b) => {
                 string += "$";
                 string += b.len().to_string().as_str();
                 string += CLRF;
                 string += b;
                 string += CLRF;
             }
-            Resp::Array(a) => {
+            Value::Array(a) => {
                 string += "*";
                 string += a.len().to_string().as_str();
                 string += CLRF;
@@ -174,7 +174,7 @@ impl From<&Resp> for String {
                     string += String::from(i).as_str();
                 }
             }
-            Resp::Null => {
+            Value::Null => {
                 string += "*";
                 string += "-1";
                 string += CLRF;
@@ -205,7 +205,7 @@ impl<T> Iterator for RingDecoder<T>
 where
     T: Read,
 {
-    type Item = Result<Resp, Error>;
+    type Item = Result<Value, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Err(err) = self.buf.populate(&mut self.reader) {
@@ -245,7 +245,7 @@ impl<T> Iterator for Decoder<T>
 where
     T: Read,
 {
-    type Item = Result<Resp, Error>;
+    type Item = Result<Value, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Err(err) = try_read(&mut self.reader, &mut self.buf) {
@@ -579,7 +579,7 @@ struct BulkStringParser {
 }
 
 impl BulkStringParser {
-    fn next(&mut self, value: &[u8]) -> Result<(Option<Resp>, usize), Error> {
+    fn next(&mut self, value: &[u8]) -> Result<(Option<Value>, usize), Error> {
         let mut read_bytes = 0;
         if self.size.is_none() {
             let (integer, n) = self.integer_parser.next(value)?;
@@ -591,7 +591,7 @@ impl BulkStringParser {
 
         if let Some(size) = self.size {
             if size == -1 {
-                return Ok((Some(Resp::Null), read_bytes));
+                return Ok((Some(Value::Null), read_bytes));
             }
 
             let size = size as _;
@@ -618,7 +618,7 @@ impl BulkStringParser {
                 let string = String::from_utf8(mem::take(&mut self.buffer))?;
                 self.size = None;
 
-                return Ok((Some(Resp::BulkString(string)), read_bytes));
+                return Ok((Some(Value::BulkString(string)), read_bytes));
             }
         }
 
@@ -631,11 +631,11 @@ struct ArrayParser {
     integer_parser: IntegerParser,
     item_parser: Box<Parser>,
     size: Option<i64>,
-    items: Vec<Resp>,
+    items: Vec<Value>,
 }
 
 impl ArrayParser {
-    fn next(&mut self, value: &[u8]) -> Result<(Option<Resp>, usize), Error> {
+    fn next(&mut self, value: &[u8]) -> Result<(Option<Value>, usize), Error> {
         let mut read_bytes = 0;
         if self.size.is_none() {
             let (integer, n) = self.integer_parser.next(value)?;
@@ -647,7 +647,7 @@ impl ArrayParser {
 
         if let Some(size) = self.size {
             if size == -1 {
-                return Ok((Some(Resp::Null), read_bytes));
+                return Ok((Some(Value::Null), read_bytes));
             }
 
             while self.items.len() < size as _ {
@@ -662,7 +662,7 @@ impl ArrayParser {
                 };
             }
 
-            return Ok((Some(Resp::Array(mem::take(&mut self.items))), read_bytes));
+            return Ok((Some(Value::Array(mem::take(&mut self.items))), read_bytes));
         }
 
         Ok((None, read_bytes))
@@ -710,18 +710,18 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn parse(&mut self, value: &[u8]) -> Result<(Option<Resp>, usize), Error> {
+    pub fn parse(&mut self, value: &[u8]) -> Result<(Option<Value>, usize), Error> {
         let (resp, n) = match &mut self.state {
             ParserState::SimpleString(parser) => match parser.next(value)? {
-                (Some(string), n) => (Some(Resp::SimpleString(string)), n),
+                (Some(string), n) => (Some(Value::SimpleString(string)), n),
                 (None, n) => (None, n),
             },
             ParserState::SimpleError(parser) => match parser.next(value)? {
-                (Some(string), n) => (Some(Resp::SimpleError(string)), n),
+                (Some(string), n) => (Some(Value::SimpleError(string)), n),
                 (None, n) => (None, n),
             },
             ParserState::Integer(parser) => match parser.next(value)? {
-                (Some(integer), n) => (Some(Resp::Integer(integer)), n),
+                (Some(integer), n) => (Some(Value::Integer(integer)), n),
                 (None, n) => (None, n),
             },
             ParserState::BulkString(parser) => match parser.next(value)? {
@@ -749,7 +749,7 @@ impl Parser {
         Ok((resp, n))
     }
 
-    pub fn parse_all(&mut self, value: &[u8]) -> (Vec<Result<Resp, Error>>, usize) {
+    pub fn parse_all(&mut self, value: &[u8]) -> (Vec<Result<Value, Error>>, usize) {
         let mut read = 0;
         let mut parsed = vec![];
         while read < value.len() {
@@ -780,7 +780,7 @@ impl Default for Parser {
     }
 }
 
-pub fn parse_resp(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
+pub fn parse_resp(value: &[u8]) -> Result<(Option<Value>, &[u8]), Error> {
     if value.is_empty() {
         return Ok((None, value));
     }
@@ -796,7 +796,7 @@ pub fn parse_resp(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
     Ok(result)
 }
 
-fn parse_simple_string(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
+fn parse_simple_string(value: &[u8]) -> Result<(Option<Value>, &[u8]), Error> {
     let cr_pos = match value[1..].iter().position(|b| *b == b'\r') {
         Some(pos) => pos,
         None => return Ok((None, value)),
@@ -809,24 +809,24 @@ fn parse_simple_string(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
 
     let redis_str = String::from_utf8(data.into())?;
 
-    Ok((Some(Resp::SimpleString(redis_str)), &remaining[2..]))
+    Ok((Some(Value::SimpleString(redis_str)), &remaining[2..]))
 }
 
-fn parse_simple_error(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
+fn parse_simple_error(value: &[u8]) -> Result<(Option<Value>, &[u8]), Error> {
     match parse_simple_string(value)? {
-        (Some(Resp::SimpleString(s)), r) => Ok((Some(Resp::SimpleError(s)), r)),
+        (Some(Value::SimpleString(s)), r) => Ok((Some(Value::SimpleError(s)), r)),
         _ => Ok((None, value)),
     }
 }
 
-fn parse_integer(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
+fn parse_integer(value: &[u8]) -> Result<(Option<Value>, &[u8]), Error> {
     match parse_length(&value[1..])? {
-        (Some(number), r) => Ok((Some(Resp::Integer(number)), r)),
+        (Some(number), r) => Ok((Some(Value::Integer(number)), r)),
         _ => Ok((None, value)),
     }
 }
 
-fn parse_array(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
+fn parse_array(value: &[u8]) -> Result<(Option<Value>, &[u8]), Error> {
     let (length, remaining) = parse_length(&value[1..])?;
     if length.is_none() {
         return Ok((None, value));
@@ -850,16 +850,16 @@ fn parse_array(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
             }
             (None, r) => {
                 if r.is_empty() && array.len() == length {
-                    return Ok((Some(Resp::Array(array)), r));
+                    return Ok((Some(Value::Array(array)), r));
                 }
                 return Ok((None, r));
             }
         }
     }
-    Ok((Some(Resp::Array(array)), contents))
+    Ok((Some(Value::Array(array)), contents))
 }
 
-fn parse_bulk_string(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
+fn parse_bulk_string(value: &[u8]) -> Result<(Option<Value>, &[u8]), Error> {
     let (length, remaining) = parse_length(&value[1..])?;
     if length.is_none() {
         return Ok((None, value));
@@ -881,7 +881,7 @@ fn parse_bulk_string(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
     }
     let text = String::from_utf8(data.into())?;
 
-    Ok((Some(Resp::BulkString(text)), &remaining[2..]))
+    Ok((Some(Value::BulkString(text)), &remaining[2..]))
 }
 
 fn parse_length(value: &[u8]) -> Result<(Option<i64>, &[u8]), Error> {
@@ -899,13 +899,13 @@ fn parse_length(value: &[u8]) -> Result<(Option<i64>, &[u8]), Error> {
     Ok((Some(length), &remaining[2..]))
 }
 
-fn parse_null(value: &[u8]) -> Result<(Option<Resp>, &[u8]), Error> {
+fn parse_null(value: &[u8]) -> Result<(Option<Value>, &[u8]), Error> {
     if value.len() < 5 {
         return Ok((None, value));
     }
     let null = &value[1..5];
     match null {
-        b"-1\r\n" => Ok((Some(Resp::Null), &value[5..])),
+        b"-1\r\n" => Ok((Some(Value::Null), &value[5..])),
         _ => Err(Error::LengthMismatch),
     }
 }
@@ -921,7 +921,7 @@ mod tests {
     fn parse_null() -> Result<(), Box<dyn error::Error>> {
         let input = "$-1\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::Null), r) => {
+            (Some(Value::Null), r) => {
                 assert!(r.is_empty());
                 Ok(())
             }
@@ -933,11 +933,11 @@ mod tests {
     fn parse_array() -> Result<(), Box<dyn error::Error>> {
         let input = "*1\r\n$4\r\nping\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 1);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "ping"),
+                    Value::BulkString(s) => assert_eq!(s, "ping"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
                 Ok(())
@@ -954,15 +954,15 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(input, actual.unwrap().to_string());
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "echo"),
+                    Value::BulkString(s) => assert_eq!(s, "echo"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "hello world"),
+                    Value::BulkString(s) => assert_eq!(s, "hello world"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
                 Ok(())
@@ -975,15 +975,15 @@ mod tests {
     fn parse_array3() -> Result<(), Box<dyn error::Error>> {
         let input = "*2\r\n$3\r\nget\r\n$3\r\nkey\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert!(r.is_empty());
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "get"),
+                    Value::BulkString(s) => assert_eq!(s, "get"),
                     _ => return Err("Array should contain a bulk string".into()),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "key"),
+                    Value::BulkString(s) => assert_eq!(s, "key"),
                     _ => return Err("Array should contain a bulk string".into()),
                 }
                 Ok(())
@@ -996,35 +996,35 @@ mod tests {
     fn parse_array4() -> Result<(), Box<dyn error::Error>> {
         let input = "*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nsave\r\n*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert_eq!(arr.len(), 3);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                    Value::BulkString(s) => assert_eq!(s, "CONFIG"),
                     _ => return Err("Expected bulk string".into()),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "GET"),
+                    Value::BulkString(s) => assert_eq!(s, "GET"),
                     _ => return Err("Expected bulk string".into()),
                 }
                 match &arr[2] {
-                    Resp::BulkString(s) => assert_eq!(s, "save"),
+                    Value::BulkString(s) => assert_eq!(s, "save"),
                     _ => return Err("Expected bulk string".into()),
                 }
                 assert!(!r.is_empty());
                 match parse_resp(r)? {
-                    (Some(Resp::Array(arr)), r) => {
+                    (Some(Value::Array(arr)), r) => {
                         assert_eq!(arr.len(), 3);
                         assert!(r.is_empty());
                         match &arr[0] {
-                            Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                            Value::BulkString(s) => assert_eq!(s, "CONFIG"),
                             _ => return Err("Expected bulk string".into()),
                         }
                         match &arr[1] {
-                            Resp::BulkString(s) => assert_eq!(s, "GET"),
+                            Value::BulkString(s) => assert_eq!(s, "GET"),
                             _ => return Err("Expected bulk string".into()),
                         }
                         match &arr[2] {
-                            Resp::BulkString(s) => assert_eq!(s, "appendonly"),
+                            Value::BulkString(s) => assert_eq!(s, "appendonly"),
                             _ => return Err("Expected bulk string".into()),
                         }
                     }
@@ -1040,7 +1040,7 @@ mod tests {
     fn parse_simple_string() -> Result<(), Box<dyn error::Error>> {
         let input = "+OK\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::SimpleString(s)), _) => {
+            (Some(Value::SimpleString(s)), _) => {
                 assert_eq!(s, "OK");
                 Ok(())
             }
@@ -1052,7 +1052,7 @@ mod tests {
     fn parse_simple_error() -> Result<(), Box<dyn error::Error>> {
         let input = "-ERROR message\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::SimpleError(s)), _) => {
+            (Some(Value::SimpleError(s)), _) => {
                 assert_eq!(s, "ERROR message");
                 Ok(())
             }
@@ -1064,7 +1064,7 @@ mod tests {
     fn parse_empty_bulk_string() -> Result<(), Box<dyn error::Error>> {
         let input = "$0\r\n\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::BulkString(s)), _) => {
+            (Some(Value::BulkString(s)), _) => {
                 assert_eq!(s, "");
                 Ok(())
             }
@@ -1076,7 +1076,7 @@ mod tests {
     fn parse_simple_string2() -> Result<(), Box<dyn error::Error>> {
         let input = "+hello world\r\n";
         match parse_resp(input.as_bytes())? {
-            (Some(Resp::SimpleString(s)), _) => {
+            (Some(Value::SimpleString(s)), _) => {
                 assert_eq!(s, "hello world");
                 Ok(())
             }
@@ -1107,7 +1107,7 @@ mod tests {
         let input = "$-1\r\n".as_bytes();
         let mut parser = Decoder::new(input);
         match parser.next() {
-            Some(Ok(Resp::Null)) => Ok(()),
+            Some(Ok(Value::Null)) => Ok(()),
             _ => Err("Should be null".into()),
         }
     }
@@ -1130,7 +1130,7 @@ mod tests {
 
         sender.send(vec![input[4]]).map_err(|_| "Send error")?;
         match parser.next() {
-            Some(Ok(Resp::Null)) => Ok(()),
+            Some(Ok(Value::Null)) => Ok(()),
             _ => Err("Should be null".into()),
         }
     }
@@ -1139,7 +1139,7 @@ mod tests {
     fn parse_null_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "$-1\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::Null), r) => {
+            (Some(Value::Null), r) => {
                 assert_eq!(input.len(), r);
                 Ok(())
             }
@@ -1151,11 +1151,11 @@ mod tests {
     fn parse_array_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "*1\r\n$4\r\nping\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert_eq!(input.len(), r);
                 assert_eq!(arr.len(), 1);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "ping"),
+                    Value::BulkString(s) => assert_eq!(s, "ping"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
                 Ok(())
@@ -1168,15 +1168,15 @@ mod tests {
     fn parse_array2_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "*2\r\n$4\r\necho\r\n$11\r\nhello world\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert_eq!(input.len(), r);
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "echo"),
+                    Value::BulkString(s) => assert_eq!(s, "echo"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "hello world"),
+                    Value::BulkString(s) => assert_eq!(s, "hello world"),
                     _ => return Err("Array should contain a simple string".into()),
                 }
                 Ok(())
@@ -1189,15 +1189,15 @@ mod tests {
     fn parse_array3_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "*2\r\n$3\r\nget\r\n$3\r\nkey\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert_eq!(input.len(), r);
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "get"),
+                    Value::BulkString(s) => assert_eq!(s, "get"),
                     _ => return Err("Array should contain a bulk string".into()),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "key"),
+                    Value::BulkString(s) => assert_eq!(s, "key"),
                     _ => return Err("Array should contain a bulk string".into()),
                 }
                 Ok(())
@@ -1211,35 +1211,35 @@ mod tests {
         let input = "*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$4\r\nsave\r\n*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$10\r\nappendonly\r\n";
         let mut parser = Parser::default();
         match parser.parse(input.as_bytes())? {
-            (Some(Resp::Array(arr)), r) => {
+            (Some(Value::Array(arr)), r) => {
                 assert_eq!(arr.len(), 3);
                 match &arr[0] {
-                    Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                    Value::BulkString(s) => assert_eq!(s, "CONFIG"),
                     _ => return Err("Expected bulk string".into()),
                 }
                 match &arr[1] {
-                    Resp::BulkString(s) => assert_eq!(s, "GET"),
+                    Value::BulkString(s) => assert_eq!(s, "GET"),
                     _ => return Err("Expected bulk string".into()),
                 }
                 match &arr[2] {
-                    Resp::BulkString(s) => assert_eq!(s, "save"),
+                    Value::BulkString(s) => assert_eq!(s, "save"),
                     _ => return Err("Expected bulk string".into()),
                 }
                 assert_eq!(35, r);
                 match parser.parse(&input[r..].as_bytes())? {
-                    (Some(Resp::Array(arr)), r) => {
+                    (Some(Value::Array(arr)), r) => {
                         assert_eq!(arr.len(), 3);
                         assert_eq!(42, r);
                         match &arr[0] {
-                            Resp::BulkString(s) => assert_eq!(s, "CONFIG"),
+                            Value::BulkString(s) => assert_eq!(s, "CONFIG"),
                             _ => return Err("Expected bulk string".into()),
                         }
                         match &arr[1] {
-                            Resp::BulkString(s) => assert_eq!(s, "GET"),
+                            Value::BulkString(s) => assert_eq!(s, "GET"),
                             _ => return Err("Expected bulk string".into()),
                         }
                         match &arr[2] {
-                            Resp::BulkString(s) => assert_eq!(s, "appendonly"),
+                            Value::BulkString(s) => assert_eq!(s, "appendonly"),
                             _ => return Err("Expected bulk string".into()),
                         }
                     }
@@ -1255,7 +1255,7 @@ mod tests {
     fn parse_simple_string_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "+OK\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::SimpleString(s)), _) => {
+            (Some(Value::SimpleString(s)), _) => {
                 assert_eq!(s, "OK");
                 Ok(())
             }
@@ -1267,7 +1267,7 @@ mod tests {
     fn parse_simple_error_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "-ERROR message\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::SimpleError(s)), _) => {
+            (Some(Value::SimpleError(s)), _) => {
                 assert_eq!(s, "ERROR message");
                 Ok(())
             }
@@ -1279,7 +1279,7 @@ mod tests {
     fn parse_empty_bulk_string_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "$0\r\n\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::BulkString(s)), _) => {
+            (Some(Value::BulkString(s)), _) => {
                 assert_eq!(s, "");
                 Ok(())
             }
@@ -1291,7 +1291,7 @@ mod tests {
     fn parse_simple_string2_stateful() -> Result<(), Box<dyn error::Error>> {
         let input = "+hello world\r\n";
         match Parser::default().parse(input.as_bytes())? {
-            (Some(Resp::SimpleString(s)), _) => {
+            (Some(Value::SimpleString(s)), _) => {
                 assert_eq!(s, "hello world");
                 Ok(())
             }
@@ -1304,7 +1304,7 @@ mod tests {
         let input = "$-1\r\n".as_bytes();
         let mut parser = Decoder::new(input);
         match parser.next() {
-            Some(Ok(Resp::Null)) => Ok(()),
+            Some(Ok(Value::Null)) => Ok(()),
             _ => Err("Should be null".into()),
         }
     }
@@ -1325,7 +1325,7 @@ mod tests {
         let (resp, _) = parser.parse(&input[4..5])?;
 
         match resp {
-            Some(Resp::Null) => Ok(()),
+            Some(Value::Null) => Ok(()),
             _ => Err("Should be null".into()),
         }
     }

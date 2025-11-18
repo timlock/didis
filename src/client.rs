@@ -1,6 +1,6 @@
 use crate::parser::command::Command;
 use crate::parser::resp;
-use crate::parser::resp::Resp;
+use crate::parser::resp::Value;
 use std::io;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -19,7 +19,7 @@ impl Client {
         }
     }
 
-    pub fn send(&mut self, command: Command) -> Result<Resp, resp::Error> {
+    pub fn send(&mut self, command: Command) -> Result<Value, resp::Error> {
         println!("Sending command to server {}", command);
         let mut bytes = Vec::from(command);
 
@@ -53,7 +53,7 @@ impl Client {
     pub fn send_batch(
         &mut self,
         commands: Vec<Command>,
-    ) -> io::Result<Vec<Result<Resp, resp::Error>>> {
+    ) -> io::Result<Vec<Result<Value, resp::Error>>> {
         println!("Sending command batch to server {:?}", commands);
         let mut bytes = commands.into_iter().flat_map(Vec::from).collect::<Vec<_>>();
 

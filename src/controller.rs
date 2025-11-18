@@ -1,6 +1,6 @@
 use crate::dictionary::Dictionary;
 use crate::parser::command::Command;
-use crate::parser::resp::Resp;
+use crate::parser::resp::Value;
 
 #[derive(Default)]
 pub struct Controller {
@@ -12,14 +12,14 @@ impl Controller {
         Self { dictionary }
     }
 
-    pub fn handle_command(&mut self, command: Command) -> Resp {
+    pub fn handle_command(&mut self, command: Command) -> Value {
         match command {
-            Command::Ping(None) => Resp::SimpleString("PONG".to_string()),
-            Command::Ping(Some(text)) => Resp::BulkString(text),
-            Command::Echo(s) => Resp::BulkString(s),
+            Command::Ping(None) => Value::SimpleString("PONG".to_string()),
+            Command::Ping(Some(text)) => Value::BulkString(text),
+            Command::Echo(s) => Value::BulkString(s),
             Command::Get(key) => match self.dictionary.get(&key) {
-                Some(value) => Resp::BulkString(value.to_string()),
-                None => Resp::Null,
+                Some(value) => Value::BulkString(value.to_string()),
+                None => Value::Null,
             },
             Command::Set {
                 key,
@@ -32,25 +32,25 @@ impl Controller {
                     .dictionary
                     .set(key, value, overwrite_rule, get, expire_rule)
                 {
-                    Ok(Some(old_value)) => Resp::BulkString(old_value),
-                    Ok(None) if !get => Resp::ok(),
-                    Ok(None) => Resp::Null,
-                    Err(_) => Resp::Null,
+                    Ok(Some(old_value)) => Value::BulkString(old_value),
+                    Ok(None) if !get => Value::ok(),
+                    Ok(None) => Value::Null,
+                    Err(_) => Value::Null,
                 }
             }
             Command::ConfigGet(key) => {
                 if key == "appendonly" {
-                    return Resp::Array(vec![
-                        Resp::BulkString("appendonly".to_string()),
-                        Resp::BulkString("no".to_string()),
+                    return Value::Array(vec![
+                        Value::BulkString("appendonly".to_string()),
+                        Value::BulkString("no".to_string()),
                     ]);
                 }
-                Resp::Array(vec![
-                    Resp::BulkString("save".to_string()),
-                    Resp::BulkString("".to_string()),
+                Value::Array(vec![
+                    Value::BulkString("save".to_string()),
+                    Value::BulkString("".to_string()),
                 ])
             }
-            Command::Client => Resp::ok(),
+            Command::Client => Value::ok(),
             Command::Exists(keys) => {
                 let mut count = 0;
                 for key in keys {
@@ -59,7 +59,7 @@ impl Controller {
                     }
                 }
 
-                Resp::Integer(count)
+                Value::Integer(count)
             }
         }
     }
