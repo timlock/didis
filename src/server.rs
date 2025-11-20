@@ -143,8 +143,7 @@ impl Server {
 
         println!("Received {} bytes from client", received);
 
-        let (commands, parsed) = connection.command_parser.parse_all(&buffer[..received]);
-        connection.remaining_in.extend(&buffer[parsed..received]);
+        let commands = connection.command_parser.parse_all(&buffer[..received]);
 
         for command in commands {
             let serialized_response = match command {
@@ -177,7 +176,6 @@ impl Server {
 struct Connection {
     remaining_out: Vec<u8>,
     to_send: usize,
-    remaining_in: Vec<u8>,
     command_parser: Parser,
     address: SocketAddr,
     stream: TcpStream,
@@ -188,7 +186,6 @@ impl Connection {
         Self {
             remaining_out: Default::default(),
             to_send: 0,
-            remaining_in: Default::default(),
             command_parser: Default::default(),
             address,
             stream,

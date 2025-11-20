@@ -113,7 +113,7 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn parse_all(&mut self, buf: &[u8]) -> (Vec<Result<Command, Error>>, usize) {
+    pub fn parse_all(&mut self, buf: &[u8]) -> Vec<Result<Command, Error>> {
         let mut read = 0;
         let mut commands = Vec::new();
         while read < buf.len() {
@@ -136,7 +136,7 @@ impl Parser {
             }
         }
 
-        (commands, read)
+        commands
     }
 }
 
@@ -324,7 +324,7 @@ pub fn parse_command_bytes(value: &[u8]) -> Result<(impl Iterator<Item = Command
     Ok((result.into_iter(), remaining))
 }
 
-fn parse_ping(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
+fn parse_ping(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -341,7 +341,7 @@ fn parse_ping(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     Ok(Command::Ping(Some(text)))
 }
 
-fn parse_echo(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
+fn parse_echo(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -358,7 +358,7 @@ fn parse_echo(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     Ok(Command::Echo(text))
 }
 
-fn parse_get(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
+fn parse_get(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -478,7 +478,7 @@ impl From<OverwriteRule> for Value {
     }
 }
 
-fn parse_set(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
+fn parse_set(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -523,7 +523,7 @@ fn parse_set(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
     })
 }
 
-fn parse_config_get(mut iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
+fn parse_config_get(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     // Sub command like GET or SET
     let _ = match iter.next() {
         Some(resp) => match resp {
@@ -549,7 +549,7 @@ fn parse_config_get(mut iter: impl Iterator<Item =Value>) -> Result<Command, Err
     Ok(Command::ConfigGet(key))
 }
 
-fn parse_client(iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
+fn parse_client(iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     let (remaining, _) = iter.size_hint();
     if remaining > 0 {
         return Err(Error::InvalidNumberOfArguments(remaining));
@@ -557,7 +557,7 @@ fn parse_client(iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
 
     Ok(Command::Client)
 }
-fn parse_exists(iter: impl Iterator<Item =Value>) -> Result<Command, Error> {
+fn parse_exists(iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     let mut keys = Vec::new();
 
     for next in iter {
@@ -587,7 +587,10 @@ mod tests {
     fn parse_echo() -> Result<(), String> {
         let name = "ECHO".to_string();
         let arg = "test".to_string();
-        let resp = Value::Array(vec![Value::BulkString(name), Value::BulkString(arg.clone())]);
+        let resp = Value::Array(vec![
+            Value::BulkString(name),
+            Value::BulkString(arg.clone()),
+        ]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(Command::Echo(arg), command);
         Ok(())
