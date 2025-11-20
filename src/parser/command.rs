@@ -1,76 +1,10 @@
 use super::resp;
-use crate::parser::resp::{Value, parse_resp};
-use std::fmt::{Display, Formatter, write};
+use crate::parser::resp::Value;
+use std::fmt::{Display, Formatter};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
 use std::{error, fmt, io};
 
-pub struct RingDecoder<T> {
-    resp_decoder: resp::RingDecoder<T>,
-}
-
-impl<T> RingDecoder<T>
-where
-    T: io::Read,
-{
-    pub fn new(resp_decoder: resp::RingDecoder<T>) -> Self {
-        Self { resp_decoder }
-    }
-}
-
-impl<T> Iterator for RingDecoder<T>
-where
-    T: io::Read,
-{
-    type Item = Result<Command, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let resp = match self.resp_decoder.next() {
-            Some(Ok(resp)) => resp,
-            Some(Err(resp::Error::Io(err))) => return Some(Err(Error::Io(err))),
-            Some(Err(err)) => return Some(Err(Error::Parse(err))),
-            None => return None,
-        };
-
-        match parse_command(resp) {
-            Ok(command) => Some(Ok(command)),
-            Err(err) => Some(Err(err)),
-        }
-    }
-}
-
-pub struct Decoder<T> {
-    resp_decoder: resp::Decoder<T>,
-}
-
-impl<T> Decoder<T>
-where
-    T: io::Read,
-{
-    pub fn new(resp_decoder: resp::Decoder<T>) -> Self {
-        Self { resp_decoder }
-    }
-}
-
-impl<T> Iterator for Decoder<T>
-where
-    T: io::Read,
-{
-    type Item = Result<Command, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let resp = match self.resp_decoder.next() {
-            Some(Ok(resp)) => resp,
-            Some(Err(err)) => return Some(Err(err.into())),
-            None => return None,
-        };
-
-        match parse_command(resp) {
-            Ok(command) => Some(Ok(command)),
-            Err(err) => Some(Err(err)),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum Error {
@@ -114,21 +48,17 @@ pub struct Parser {
 
 impl Parser {
     pub fn parse_all(&mut self, buf: &[u8]) -> Vec<Result<Command, Error>> {
-        let mut read = 0;
+        let mut buffer = buf;
         let mut commands = Vec::new();
-        while read < buf.len() {
-            match self.resp_parser.parse(&buf[read..]) {
-                Ok((Some(resp), n)) => {
-                    read += n;
-                    let command = parse_command(resp);
-                    let is_err = command.is_err();
-                    commands.push(command);
 
-                    if is_err {
-                        break;
-                    }
+        while !buffer.is_empty(){
+            match self.resp_parser.parse(buffer){
+                Ok(Some((value, remaining))) => {
+                    let command = parse_command(value);
+                    commands.push(command);
+                    buffer = remaining;
                 }
-                Ok((None, n)) => read += n,
+                Ok(None) => {break}
                 Err(err) => {
                     commands.push(Err(err.into()));
                     break;
@@ -303,25 +233,6 @@ pub fn parse_command(resp: Value) -> Result<Command, Error> {
         "EXISTS" => parse_exists(segment_iter),
         _ => Err(Error::UnknownCommand(name)),
     }
-}
-
-pub fn parse_command_bytes(value: &[u8]) -> Result<(impl Iterator<Item = Command>, &[u8]), Error> {
-    let mut remaining = value;
-    let mut result = Vec::new();
-    loop {
-        match parse_resp(remaining)? {
-            (Some(resp), r) => {
-                let command = parse_command(resp)?;
-                result.push(command);
-                remaining = r;
-            }
-            (None, r) => {
-                remaining = r;
-                break;
-            }
-        };
-    }
-    Ok((result.into_iter(), remaining))
 }
 
 fn parse_ping(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {

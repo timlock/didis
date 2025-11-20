@@ -37,12 +37,10 @@ impl Client {
             }
         }
 
-        let (response, size) = self.resp_parser.parse(bytes.as_slice())?;
-        let response = response.expect("TODO error handling");
+        let (response, _) = self.resp_parser.parse(bytes.as_slice())?.ok_or(resp::Error::LengthMismatch)?;
 
         println!(
-            "Received response from server size={} bytes duration={:?} {}",
-            size,
+            "Received response from server  bytes duration={:?} {}",
             start.elapsed(),
             response
         );
@@ -53,7 +51,7 @@ impl Client {
     pub fn send_batch(
         &mut self,
         commands: Vec<Command>,
-    ) -> io::Result<Vec<Result<Value, resp::Error>>> {
+    ) -> Result<Vec<Value>, resp::Error> {
         println!("Sending command batch to server {:?}", commands);
         let mut bytes = commands.into_iter().flat_map(Vec::from).collect::<Vec<_>>();
 
@@ -71,11 +69,17 @@ impl Client {
             }
         }
 
-        let (results, size) = self.resp_parser.parse_all(bytes.as_slice());
+        let mut results = Vec::new();
+        let mut buffer = bytes.as_slice();
+        while !buffer.is_empty(){
+            let (response, remaining) = self.resp_parser.parse(buffer)?.ok_or(resp::Error::LengthMismatch)?;
+            results.push(response);
+            buffer = remaining;
+        }
 
         println!(
-            "Received response batch from server size={} bytes duration={:?} {:?}",
-            size,
+            "Received response batch of size {} from server duration={:?} {:?}",
+            results.len(),
             start.elapsed(),
             results
         );

@@ -315,13 +315,13 @@ mod test {
         ];
         let mut response = client.send_batch(cmd_batch)?;
         assert_eq!(4, response.len());
-        let first_result = response.remove(0)?;
+        let first_result = response.remove(0);
         assert_eq!(Value::ok(), first_result);
-        let second_result = response.remove(0)?;
+        let second_result = response.remove(0);
         assert_eq!(Value::ok(), second_result);
-        let third_result = response.remove(0)?;
+        let third_result = response.remove(0);
         assert_eq!(Value::BulkString(String::from("Value1")), third_result);
-        let fourth_result = response.remove(0)?;
+        let fourth_result = response.remove(0);
         assert_eq!(Value::BulkString(String::from("Value2")), fourth_result);
 
         server_handle.store(true, Ordering::SeqCst);
@@ -346,7 +346,7 @@ mod test {
         assert_eq!(Value::Null, response);
 
         let mut large_value = String::new();
-        for i in 0.. BUFFER_SIZE * 100 {
+        for i in 0.. BUFFER_SIZE * 1000 {
            large_value.push(char::from_digit((i % 10) as u32, 10).unwrap())
         }
 
