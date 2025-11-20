@@ -144,9 +144,9 @@ impl Server {
         println!("Received {} bytes from client", received);
 
         let commands = connection.command_parser.parse_all(&buffer[..received]);
-
+        let mut serialized_response = Vec::new();
         for command in commands {
-            let serialized_response = match command {
+             let response = match command {
                 Ok(command) => {
                     println!("Received command: {}", command);
                     let response = self.controller.handle_command(command);
@@ -159,9 +159,10 @@ impl Server {
                     Value::SimpleError(err.to_string()).to_bytes()
                 }
             };
+            serialized_response.extend(response);
 
-            connection.handle_sending_response(serialized_response, &mut buffer);
         }
+        connection.handle_sending_response(serialized_response, &mut buffer);
 
         if connection.to_send > 0 {
             io.send(stream, buffer, connection.to_send);
@@ -220,6 +221,7 @@ impl Connection {
 
 #[cfg(test)]
 mod test {
+    use std::borrow::Cow;
     use super::*;
     use crate::client::Client;
     use crate::parser::command::Command;
@@ -261,14 +263,14 @@ mod test {
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
         let mut client = Client::new(stream);
 
-        let get_cmd = Command::Get(String::from("Key"));
+        let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd)?;
 
         assert_eq!(Value::Null, response);
 
         let set_cmd = Command::Set {
-            key: "Key".to_string(),
-            value: "Value".to_string(),
+            key: Cow::Owned("Key".to_string()),
+            value: Cow::Owned("Value".to_string()),
             overwrite_rule: None,
             get: false,
             expire_rule: None,
@@ -276,7 +278,7 @@ mod test {
         let response = client.send(set_cmd)?;
         assert_eq!(Value::ok(), response);
 
-        let get_cmd = Command::Get(String::from("Key"));
+        let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd)?;
         assert_eq!(Value::BulkString(String::from("Value")), response);
 
@@ -297,21 +299,21 @@ mod test {
 
         let cmd_batch = vec![
             Command::Set {
-                key: "Key1".to_string(),
-                value: "Value1".to_string(),
+                key: Cow::Owned("Key1".to_string()),
+                value: Cow::Owned("Value1".to_string()),
                 overwrite_rule: None,
                 get: false,
                 expire_rule: None,
             },
             Command::Set {
-                key: "Key2".to_string(),
-                value: "Value2".to_string(),
+                key: Cow::Owned("Key2".to_string()),
+                value: Cow::Owned("Value2".to_string()),
                 overwrite_rule: None,
                 get: false,
                 expire_rule: None,
             },
-            Command::Get(String::from("Key1")),
-            Command::Get(String::from("Key2")),
+            Command::Get(Cow::Owned(String::from("Key1"))),
+            Command::Get(Cow::Owned(String::from("Key2"))),
         ];
         let mut response = client.send_batch(cmd_batch)?;
         assert_eq!(4, response.len());
@@ -340,7 +342,7 @@ mod test {
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
         let mut client = Client::new(stream);
 
-        let get_cmd = Command::Get(String::from("Key"));
+        let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd)?;
 
         assert_eq!(Value::Null, response);
@@ -351,8 +353,8 @@ mod test {
         }
 
         let set_cmd = Command::Set {
-            key: "Key".to_string(),
-            value: large_value.clone(),
+            key: Cow::Owned("Key".to_string()),
+            value: Cow::Owned(large_value.clone()),
             overwrite_rule: None,
             get: false,
             expire_rule: None,
@@ -360,7 +362,7 @@ mod test {
         let response = client.send(set_cmd)?;
         assert_eq!(Value::ok(), response);
 
-        let get_cmd = Command::Get(String::from("Key"));
+        let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd)?;
         assert_eq!(Value::BulkString(String::from(large_value)), response);
 

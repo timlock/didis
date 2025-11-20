@@ -15,8 +15,8 @@ impl Controller {
     pub fn handle_command(&mut self, command: Command) -> Value {
         match command {
             Command::Ping(None) => Value::SimpleString("PONG".to_string()),
-            Command::Ping(Some(text)) => Value::BulkString(text),
-            Command::Echo(s) => Value::BulkString(s),
+            Command::Ping(Some(text)) => Value::BulkString(text.into_owned()),
+            Command::Echo(s) => Value::BulkString(s.into_owned()),
             Command::Get(key) => match self.dictionary.get(&key) {
                 Some(value) => Value::BulkString(value.to_string()),
                 None => Value::Null,
@@ -30,7 +30,7 @@ impl Controller {
             } => {
                 match self
                     .dictionary
-                    .set(key, value, overwrite_rule, get, expire_rule)
+                    .set(key.into_owned(), value.into_owned(), overwrite_rule, get, expire_rule)
                 {
                     Ok(Some(old_value)) => Value::BulkString(old_value),
                     Ok(None) if !get => Value::ok(),

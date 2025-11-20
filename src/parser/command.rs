@@ -1,10 +1,9 @@
 use super::resp;
 use crate::parser::resp::Value;
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
-use std::ops::Add;
 use std::time::{Duration, SystemTime};
 use std::{error, fmt, io};
-
 
 #[derive(Debug)]
 pub enum Error {
@@ -18,8 +17,8 @@ pub enum Error {
 }
 
 impl error::Error for Error {}
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnknownCommand(name) => write!(f, "Command {name} is unknown"),
             Error::InvalidNumberOfArguments(amount) => {
@@ -46,19 +45,19 @@ pub struct Parser {
     resp_parser: resp::Parser,
 }
 
-impl Parser {
-    pub fn parse_all(&mut self, buf: &[u8]) -> Vec<Result<Command, Error>> {
+impl<'a> Parser {
+    pub fn parse_all(&mut self, buf: &'a [u8]) -> Vec<Result<Command<'a>, Error>> {
         let mut buffer = buf;
         let mut commands = Vec::new();
 
-        while !buffer.is_empty(){
-            match self.resp_parser.parse(buffer){
+        while !buffer.is_empty() {
+            match self.resp_parser.parse(buffer) {
                 Ok(Some((value, remaining))) => {
                     let command = parse_command(value);
                     commands.push(command);
                     buffer = remaining;
                 }
-                Ok(None) => {break}
+                Ok(None) => break,
                 Err(err) => {
                     commands.push(Err(err.into()));
                     break;
@@ -71,39 +70,39 @@ impl Parser {
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub enum Command {
-    Ping(Option<String>),
-    Echo(String),
-    Get(String),
+pub enum Command<'a> {
+    Ping(Option<Cow<'a, str>>),
+    Echo(Cow<'a, str>),
+    Get(Cow<'a, str>),
     Set {
-        key: String,
-        value: String,
+        key: Cow<'a, str>,
+        value: Cow<'a, str>,
         overwrite_rule: Option<OverwriteRule>,
         get: bool,
         expire_rule: Option<ExpireRule>,
     },
-    ConfigGet(String),
+    ConfigGet(Cow<'a, str>),
     Client,
-    Exists(Vec<String>),
+    Exists(Vec<Cow<'a, str>>),
 }
 
-impl Command {
+impl<'a> Command<'a> {
     pub fn to_resp(self) -> Value {
         match self {
             Command::Ping(message) => {
                 let mut command_parts = vec![Value::BulkString(String::from("PING"))];
                 if let Some(message) = message {
-                    command_parts.push(Value::BulkString(message));
+                    command_parts.push(Value::BulkString(message.into_owned()));
                 }
                 Value::Array(command_parts)
             }
             Command::Echo(message) => Value::Array(vec![
                 Value::BulkString(String::from("ECHO")),
-                Value::BulkString(message),
+                Value::BulkString(message.into_owned()),
             ]),
             Command::Get(key) => Value::Array(vec![
                 Value::BulkString(String::from("GET")),
-                Value::BulkString(key),
+                Value::BulkString(key.into_owned()),
             ]),
             Command::Set {
                 key,
@@ -114,8 +113,8 @@ impl Command {
             } => {
                 let mut command_parts = vec![
                     Value::BulkString(String::from("SET")),
-                    Value::BulkString(key),
-                    Value::BulkString(value),
+                    Value::BulkString(key.into_owned()),
+                    Value::BulkString(value.into_owned()),
                 ];
                 if let Some(overwrite_rule) = overwrite_rule {
                     command_parts.push(Value::from(overwrite_rule));
@@ -132,13 +131,13 @@ impl Command {
             Command::ConfigGet(c) => Value::Array(vec![
                 Value::BulkString(String::from("CONFIG")),
                 Value::BulkString(String::from("GET")),
-                Value::BulkString(c),
+                Value::BulkString(c.into_owned()),
             ]),
             Command::Client => Value::Array(vec![Value::BulkString(String::from("CLIENT"))]),
             Command::Exists(keys) => {
                 let mut command_parts = vec![Value::BulkString(String::from("EXISTS"))];
                 for key in keys {
-                    command_parts.push(Value::BulkString(key));
+                    command_parts.push(Value::BulkString(key.into_owned()));
                 }
 
                 Value::Array(command_parts)
@@ -150,7 +149,7 @@ impl Command {
     }
 }
 
-impl Display for Command {
+impl<'a> Display for Command<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Command::Ping(value) => match value {
@@ -197,19 +196,19 @@ impl Display for Command {
     }
 }
 
-impl From<Command> for Value {
+impl<'a> From<Command<'a>> for Value {
     fn from(value: Command) -> Self {
         value.to_resp()
     }
 }
 
-impl From<Command> for Vec<u8> {
+impl<'a> From<Command<'a>> for Vec<u8> {
     fn from(value: Command) -> Self {
         value.to_bytes()
     }
 }
 
-pub fn parse_command(resp: Value) -> Result<Command, Error> {
+pub fn parse_command<'a>(resp: Value) -> Result<Command<'a>, Error> {
     let mut segment_iter = match resp {
         Value::Array(vec) => vec.into_iter(),
         _ => return Err(Error::InvalidStart),
@@ -235,7 +234,7 @@ pub fn parse_command(resp: Value) -> Result<Command, Error> {
     }
 }
 
-fn parse_ping(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
+fn parse_ping<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -249,10 +248,10 @@ fn parse_ping(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
         return Err(Error::InvalidNumberOfArguments(remaining));
     }
 
-    Ok(Command::Ping(Some(text)))
+    Ok(Command::Ping(Some(Cow::Owned(text))))
 }
 
-fn parse_echo(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
+fn parse_echo<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
     let text = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -266,10 +265,10 @@ fn parse_echo(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
         return Err(Error::InvalidNumberOfArguments(remaining));
     }
 
-    Ok(Command::Echo(text))
+    Ok(Command::Echo(Cow::Owned(text)))
 }
 
-fn parse_get(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
+fn parse_get<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -283,7 +282,7 @@ fn parse_get(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
         return Err(Error::InvalidNumberOfArguments(remaining));
     }
 
-    Ok(Command::Get(key))
+    Ok(Command::Get(Cow::Owned(key)))
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
@@ -389,7 +388,7 @@ impl From<OverwriteRule> for Value {
     }
 }
 
-fn parse_set(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
+fn parse_set<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
     let key = match iter.next() {
         Some(resp) => match resp {
             Value::BulkString(text) => text,
@@ -426,15 +425,15 @@ fn parse_set(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
     }
 
     Ok(Command::Set {
-        key,
-        value,
+        key: Cow::Owned(key),
+        value: Cow::Owned(value),
         overwrite_rule,
         get,
         expire_rule,
     })
 }
 
-fn parse_config_get(mut iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
+fn parse_config_get<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
     // Sub command like GET or SET
     let _ = match iter.next() {
         Some(resp) => match resp {
@@ -457,10 +456,10 @@ fn parse_config_get(mut iter: impl Iterator<Item = Value>) -> Result<Command, Er
         return Err(Error::InvalidNumberOfArguments(remaining));
     }
 
-    Ok(Command::ConfigGet(key))
+    Ok(Command::ConfigGet(Cow::Owned(key)))
 }
 
-fn parse_client(iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
+fn parse_client<'a>(iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
     let (remaining, _) = iter.size_hint();
     if remaining > 0 {
         return Err(Error::InvalidNumberOfArguments(remaining));
@@ -468,13 +467,13 @@ fn parse_client(iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
 
     Ok(Command::Client)
 }
-fn parse_exists(iter: impl Iterator<Item = Value>) -> Result<Command, Error> {
+fn parse_exists<'a>(iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
     let mut keys = Vec::new();
 
     for next in iter {
         match next {
             Value::BulkString(text) => {
-                keys.push(text);
+                keys.push(Cow::Owned(text));
             }
             _ => return Err(Error::UnexpectedResp),
         }
@@ -503,7 +502,7 @@ mod tests {
             Value::BulkString(arg.clone()),
         ]);
         let command = parse_command(resp).map_err(|err| err.to_string())?;
-        assert_eq!(Command::Echo(arg), command);
+        assert_eq!(Command::Echo(Cow::Owned(arg)), command);
         Ok(())
     }
 
@@ -520,8 +519,8 @@ mod tests {
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(
             Command::Set {
-                key: "key".to_string(),
-                value: "value".to_string(),
+                key: Cow::Owned("key".to_string()),
+                value: Cow::Owned("value".to_string()),
                 overwrite_rule: Some(OverwriteRule::Exists),
                 get: true,
                 expire_rule: Some(ExpireRule::ExpiresInSecs(Duration::from_secs(10))),
@@ -541,8 +540,8 @@ mod tests {
         let command = parse_command(resp).map_err(|err| err.to_string())?;
         assert_eq!(
             Command::Set {
-                key: "key".to_string(),
-                value: "value".to_string(),
+                key: Cow::Owned("key".to_string()),
+                value: Cow::Owned("value".to_string()),
                 overwrite_rule: None,
                 get: false,
                 expire_rule: None,
