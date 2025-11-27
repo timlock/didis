@@ -1,9 +1,52 @@
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Formatter, write};
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::{error, str};
 use std::{io, mem};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ValOrRef<'a> {
+    Val(Value),
+    Ref(Reference<'a>),
+}
+
+impl<'a> ValOrRef<'a> {
+    pub fn to_bytes(self) -> Vec<u8> {
+        match self {
+            ValOrRef::Val(value) => value.to_bytes(),
+            ValOrRef::Ref(reference) => reference.to_bytes(),
+        }
+    }
+
+    pub fn as_ref(&self) -> Reference{
+        match self{
+            ValOrRef::Val(value) => {value.as_reference()}
+            ValOrRef::Ref(reference) => {reference.clone()}
+        }
+    }
+}
+
+impl<'a> Display for ValOrRef<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ValOrRef::Val(value) => value.fmt(f),
+            ValOrRef::Ref(reference) => reference.fmt(f),
+        }
+    }
+}
+
+impl<'a> From<Value> for ValOrRef<'a> {
+    fn from(value: Value) -> Self {
+        ValOrRef::Val(value)
+    }
+}
+
+impl<'a> From<Reference<'a>> for ValOrRef<'a> {
+    fn from(value: Reference<'a>) -> Self {
+        ValOrRef::Ref(value)
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -107,6 +150,19 @@ impl Value {
         }
         bytes
     }
+
+    pub fn as_reference(&self) -> Reference {
+        match self {
+            Value::SimpleString(value) => Reference::SimpleString(value),
+            Value::SimpleError(value) => Reference::SimpleError(value),
+            Value::Integer(value) => Reference::Integer(*value),
+            Value::BulkString(value) => Reference::BulkString(value),
+            Value::Array(value) => {
+                Reference::Array(value.iter().map(Value::as_reference).collect())
+            }
+            Value::Null => Reference::Null,
+        }
+    }
 }
 
 impl Display for Value {
@@ -184,7 +240,7 @@ impl From<&Value> for String {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Reference<'a> {
     SimpleString(&'a str),
     SimpleError(&'a str),
@@ -241,7 +297,31 @@ impl<'a> Reference<'a> {
 }
 impl<'a> Display for Reference<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", String::from(self))
+        match self {
+            Reference::SimpleString(value) => write!(f, "+{}\\r\\n", value),
+            Reference::SimpleError(value) => write!(f, "-{}\\r\\n", value),
+            Reference::Integer(value) => write!(f, ":{}\\r\\n", value),
+            Reference::BulkString(value) => {
+                if value.len() < 32 {
+                    write!(f, "${}\\r\\n{}\\r\\n", value.len(), value)
+                } else {
+                    write!(
+                        f,
+                        "${}\\r\\n{}...(shortened)\\r\\n",
+                        value.len(),
+                        &value[..32]
+                    )
+                }
+            }
+            Reference::Array(values) => {
+                write!(f, "*{}\\r\\n", values.len())?;
+                for value in values {
+                    write!(f, "{}", value)?;
+                }
+                write!(f, "\\r\\n",)
+            }
+            Reference::Null => write!(f, "_\\r\\n"),
+        }
     }
 }
 
@@ -290,7 +370,7 @@ impl<'a> From<&Reference<'a>> for String {
     }
 }
 
-enum ParsedValue<'a, C, I> {
+pub enum ParsedValue<'a, C, I> {
     Complete(C, &'a [u8]),
     Incomplete(I),
 }

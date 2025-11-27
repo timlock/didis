@@ -1,6 +1,6 @@
 use crate::dictionary::Dictionary;
 use crate::parser::command::Command;
-use crate::parser::resp::Value;
+use crate::parser::resp::{Reference, ValOrRef, Value};
 
 #[derive(Default)]
 pub struct Controller {
@@ -12,14 +12,14 @@ impl Controller {
         Self { dictionary }
     }
 
-    pub fn handle_command(&mut self, command: Command) -> Value {
+    pub fn handle_command(&mut self, command: Command) -> ValOrRef {
         match command {
-            Command::Ping(None) => Value::SimpleString("PONG".to_string()),
-            Command::Ping(Some(text)) => Value::BulkString(text.into_owned()),
-            Command::Echo(s) => Value::BulkString(s.into_owned()),
+            Command::Ping(None) => Reference::SimpleString("PONG").into(),
+            Command::Ping(Some(text)) => Value::BulkString(text.into_owned()).into(),
+            Command::Echo(s) => Value::BulkString(s.into_owned()).into(),
             Command::Get(key) => match self.dictionary.get(&key) {
-                Some(value) => Value::BulkString(value.to_string()),
-                None => Value::Null,
+                Some(value) => Reference::BulkString(value).into(),
+                None => Value::Null.into(),
             },
             Command::Set {
                 key,
@@ -30,27 +30,27 @@ impl Controller {
             } => {
                 match self
                     .dictionary
-                    .set(key.into_owned(), value.into_owned(), overwrite_rule, get, expire_rule)
+                    .set(key.as_ref(), value.into_owned(), overwrite_rule, get, expire_rule)
                 {
-                    Ok(Some(old_value)) => Value::BulkString(old_value),
-                    Ok(None) if !get => Value::ok(),
-                    Ok(None) => Value::Null,
-                    Err(_) => Value::Null,
+                    Ok(Some(old_value)) => Value::BulkString(old_value).into(),
+                    Ok(None) if !get => Value::ok().into(),
+                    Ok(None) => Value::Null.into(),
+                    Err(_) => Value::Null.into(),
                 }
             }
             Command::ConfigGet(key) => {
                 if key == "appendonly" {
-                    return Value::Array(vec![
-                        Value::BulkString("appendonly".to_string()),
-                        Value::BulkString("no".to_string()),
-                    ]);
+                    return Reference::Array(vec![
+                        Reference::BulkString("appendonly"),
+                        Reference::BulkString("no"),
+                    ]).into();
                 }
-                Value::Array(vec![
-                    Value::BulkString("save".to_string()),
-                    Value::BulkString("".to_string()),
-                ])
+                Reference::Array(vec![
+                    Reference::BulkString("save"),
+                    Reference::BulkString(""),
+                ]).into()
             }
-            Command::Client => Value::ok(),
+            Command::Client => Value::ok().into(),
             Command::Exists(keys) => {
                 let mut count = 0;
                 for key in keys {
@@ -59,7 +59,7 @@ impl Controller {
                     }
                 }
 
-                Value::Integer(count)
+                Value::Integer(count).into()
             }
         }
     }

@@ -24,17 +24,17 @@ impl Dictionary {
     }
     pub fn set(
         &mut self,
-        key: String,
+        key: &str,
         value: String,
         overwrite_rule: Option<OverwriteRule>,
         get: bool,
         expire_rule: Option<ExpireRule>,
     ) -> Result<Option<String>, Error> {
         match overwrite_rule {
-            Some(OverwriteRule::NotExists) if self.inner.contains_key(&key) => {
+            Some(OverwriteRule::NotExists) if self.inner.contains_key(key) => {
                 return Err(Error::OverrideConflict)
             }
-            Some(OverwriteRule::Exists) if !self.inner.contains_key(&key) => {
+            Some(OverwriteRule::Exists) if !self.inner.contains_key(key) => {
                 return Err(Error::OverrideConflict)
             }
             _ => {}
@@ -44,14 +44,14 @@ impl Dictionary {
             .as_ref()
             .map(|r| r.calculate_expire_time())
             .flatten();
-        let old = self.inner.remove(&key);
+        let old = self.inner.remove(key);
         if let Some(ref old) = old {
             if let Some(ExpireRule::KeepTTL) = expire_rule {
                 expires_at = old.expires_at;
             }
         }
         let entry = Entry::new(value, expires_at);
-        self.inner.insert(key, entry);
+        self.inner.insert(key.to_owned(), entry);
         match get {
             true => Ok(old.map(|e| e.value)),
             false => Ok(None),

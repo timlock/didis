@@ -1,5 +1,5 @@
 use super::resp;
-use crate::parser::resp::Value;
+use crate::parser::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, SystemTime};
@@ -53,7 +53,7 @@ impl<'a> Parser {
         while !buffer.is_empty() {
             match self.resp_parser.parse(buffer) {
                 Ok(Some((value, remaining))) => {
-                    let command = parse_command(value);
+                    let command = parse_command(ValOrRef::Val(value));
                     commands.push(command);
                     buffer = remaining;
                 }
@@ -63,6 +63,52 @@ impl<'a> Parser {
                     break;
                 }
             }
+        }
+
+        commands
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Parser2 {
+    resp_parser: Option<resp::Parser>,
+}
+
+impl<'a> Parser2 {
+    pub fn parse_all(&mut self, buf: &'a [u8]) -> Vec<Result<Command<'a>, Error>> {
+        let mut buffer = buf;
+        let mut commands = Vec::new();
+
+        while !buffer.is_empty() {
+            let parse_result: Result<Option<(ValOrRef, &[u8])>, Error> = match &mut self.resp_parser
+            {
+                Some(parser) => parser
+                    .parse(buffer)
+                    .map(|o| o.map(|(v, r)| (ValOrRef::Val(v), r)))
+                    .map_err(|err| err.into()),
+                None => match parse(buffer) {
+                    Ok(ParsedValue::Complete(reference, remaining)) => {
+                        Ok(Some((ValOrRef::Ref(reference), remaining)))
+                    }
+                    Ok(ParsedValue::Incomplete(parser)) => {
+                        self.resp_parser = Some(parser);
+                        Ok(None)
+                    }
+                    Err(err) => Err(err.into()),
+                },
+            };
+
+            match parse_result{
+                Ok(Some((valOrRef, remaining))) => {
+                    let command = parse_command(valOrRef);
+                    commands.push(command);
+                    buffer = remaining;
+                }
+                Ok(None) => {break}
+                Err(err) => {
+                    commands.push(Err(err.into()));
+                }
+            };
         }
 
         commands
@@ -208,9 +254,9 @@ impl<'a> From<Command<'a>> for Vec<u8> {
     }
 }
 
-pub fn parse_command<'a>(resp: Value) -> Result<Command<'a>, Error> {
-    let mut segment_iter = match resp {
-        Value::Array(vec) => vec.into_iter(),
+pub fn parse_command<'a>(resp: ValOrRef) -> Result<Command<'a>, Error> {
+    let mut segment_iter = match resp.as_ref() {
+        Reference::Array(vec) => vec.into_iter(),
         _ => return Err(Error::InvalidStart),
     };
 
