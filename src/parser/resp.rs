@@ -1,11 +1,11 @@
-use std::fmt::{self, Display, Formatter, write};
+use std::fmt::{self, Display, Formatter};
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::{error, str};
 use std::{io, mem};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ValOrRef<'a> {
     Val(Value),
     Ref(Reference<'a>),
@@ -19,10 +19,17 @@ impl<'a> ValOrRef<'a> {
         }
     }
 
-    pub fn as_ref(&self) -> Reference{
-        match self{
-            ValOrRef::Val(value) => {value.as_reference()}
-            ValOrRef::Ref(reference) => {reference.clone()}
+    pub fn as_ref(&self) -> Reference {
+        match self {
+            ValOrRef::Val(value) => value.as_reference(),
+            ValOrRef::Ref(reference) => reference.clone(),
+        }
+    }
+
+    pub fn to_value(self) -> Value {
+        match self {
+            ValOrRef::Val(value) => value,
+            ValOrRef::Ref(reference) => reference.to_value(),
         }
     }
 }
@@ -293,6 +300,23 @@ impl<'a> Reference<'a> {
             Reference::Null => bytes.extend_from_slice(b"*-1\r\n"),
         }
         bytes
+    }
+
+    pub fn to_value(self) -> Value {
+        match self {
+            Reference::SimpleString(value) => Value::SimpleString(value.to_owned()),
+            Reference::SimpleError(value) => Value::SimpleError(value.to_owned()),
+            Reference::Integer(value) => Value::Integer(value),
+            Reference::BulkString(value) => Value::BulkString(value.to_owned()),
+            Reference::Array(values) => {
+                let values = values
+                    .into_iter()
+                    .map(|value| value.to_value())
+                    .collect();
+                Value::Array(values)
+            }
+            Reference::Null => Value::Null,
+        }
     }
 }
 impl<'a> Display for Reference<'a> {

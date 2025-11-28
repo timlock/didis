@@ -1,6 +1,6 @@
 use crate::async_io::{AsyncIO, Completion, IO};
 use crate::controller::Controller;
-use crate::parser::command::Parser;
+use crate::parser::command::{Parser};
 use crate::parser::resp::Value;
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
@@ -146,7 +146,7 @@ impl Server {
         let commands = connection.command_parser.parse_all(&buffer[..received]);
         let mut serialized_response = Vec::new();
         for command in commands {
-             let response = match command {
+            let response = match command {
                 Ok(command) => {
                     println!("Received command: {}", command);
                     let response = self.controller.handle_command(command);
@@ -160,7 +160,6 @@ impl Server {
                 }
             };
             serialized_response.extend(response);
-
         }
         connection.handle_sending_response(serialized_response, &mut buffer);
 
@@ -221,10 +220,10 @@ impl Connection {
 
 #[cfg(test)]
 mod test {
-    use std::borrow::Cow;
     use super::*;
     use crate::client::Client;
     use crate::parser::command::Command;
+    use std::borrow::Cow;
     use std::str::FromStr;
     use std::thread;
     use std::thread::JoinHandle;
@@ -348,8 +347,8 @@ mod test {
         assert_eq!(Value::Null, response);
 
         let mut large_value = String::new();
-        for i in 0.. BUFFER_SIZE * 1000 {
-           large_value.push(char::from_digit((i % 10) as u32, 10).unwrap())
+        for i in 0..BUFFER_SIZE * 1000 {
+            large_value.push(char::from_digit((i % 10) as u32, 10).unwrap())
         }
 
         let set_cmd = Command::Set {

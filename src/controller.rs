@@ -28,10 +28,13 @@ impl Controller {
                 get,
                 expire_rule,
             } => {
-                match self
-                    .dictionary
-                    .set(key.as_ref(), value.into_owned(), overwrite_rule, get, expire_rule)
-                {
+                match self.dictionary.set(
+                    key.as_ref(),
+                    value.into_owned(),
+                    overwrite_rule,
+                    get,
+                    expire_rule,
+                ) {
                     Ok(Some(old_value)) => Value::BulkString(old_value).into(),
                     Ok(None) if !get => Value::ok().into(),
                     Ok(None) => Value::Null.into(),
@@ -39,18 +42,21 @@ impl Controller {
                 }
             }
             Command::ConfigGet(key) => {
-                if key == "appendonly" {
+                // minimal implementation to allow benchmarking with redis-cli
+                if key[0] == "appendonly" {
                     return Reference::Array(vec![
                         Reference::BulkString("appendonly"),
                         Reference::BulkString("no"),
-                    ]).into();
+                    ])
+                    .into();
                 }
                 Reference::Array(vec![
                     Reference::BulkString("save"),
                     Reference::BulkString(""),
-                ]).into()
+                ])
+                .into()
             }
-            Command::Client => Value::ok().into(),
+            Command::Client => Value::ok().into(), // minimal implementation to allow benchmarking with redis-cli
             Command::Exists(keys) => {
                 let mut count = 0;
                 for key in keys {

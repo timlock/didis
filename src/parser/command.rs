@@ -1,6 +1,7 @@
 use super::resp;
 use crate::parser::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, SystemTime};
 use std::{error, fmt, io};
@@ -40,80 +41,6 @@ impl From<resp::Error> for Error {
         }
     }
 }
-#[derive(Debug, Default)]
-pub struct Parser {
-    resp_parser: resp::Parser,
-}
-
-impl<'a> Parser {
-    pub fn parse_all(&mut self, buf: &'a [u8]) -> Vec<Result<Command<'a>, Error>> {
-        let mut buffer = buf;
-        let mut commands = Vec::new();
-
-        while !buffer.is_empty() {
-            match self.resp_parser.parse(buffer) {
-                Ok(Some((value, remaining))) => {
-                    let command = parse_command(ValOrRef::Val(value));
-                    commands.push(command);
-                    buffer = remaining;
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    commands.push(Err(err.into()));
-                    break;
-                }
-            }
-        }
-
-        commands
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct Parser2 {
-    resp_parser: Option<resp::Parser>,
-}
-
-impl<'a> Parser2 {
-    pub fn parse_all(&mut self, buf: &'a [u8]) -> Vec<Result<Command<'a>, Error>> {
-        let mut buffer = buf;
-        let mut commands = Vec::new();
-
-        while !buffer.is_empty() {
-            let parse_result: Result<Option<(ValOrRef, &[u8])>, Error> = match &mut self.resp_parser
-            {
-                Some(parser) => parser
-                    .parse(buffer)
-                    .map(|o| o.map(|(v, r)| (ValOrRef::Val(v), r)))
-                    .map_err(|err| err.into()),
-                None => match parse(buffer) {
-                    Ok(ParsedValue::Complete(reference, remaining)) => {
-                        Ok(Some((ValOrRef::Ref(reference), remaining)))
-                    }
-                    Ok(ParsedValue::Incomplete(parser)) => {
-                        self.resp_parser = Some(parser);
-                        Ok(None)
-                    }
-                    Err(err) => Err(err.into()),
-                },
-            };
-
-            match parse_result{
-                Ok(Some((valOrRef, remaining))) => {
-                    let command = parse_command(valOrRef);
-                    commands.push(command);
-                    buffer = remaining;
-                }
-                Ok(None) => {break}
-                Err(err) => {
-                    commands.push(Err(err.into()));
-                }
-            };
-        }
-
-        commands
-    }
-}
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum Command<'a> {
@@ -127,7 +54,7 @@ pub enum Command<'a> {
         get: bool,
         expire_rule: Option<ExpireRule>,
     },
-    ConfigGet(Cow<'a, str>),
+    ConfigGet(Vec<Cow<'a, str>>),
     Client,
     Exists(Vec<Cow<'a, str>>),
 }
@@ -174,11 +101,16 @@ impl<'a> Command<'a> {
 
                 Value::Array(command_parts)
             }
-            Command::ConfigGet(c) => Value::Array(vec![
-                Value::BulkString(String::from("CONFIG")),
-                Value::BulkString(String::from("GET")),
-                Value::BulkString(c.into_owned()),
-            ]),
+            Command::ConfigGet(config_params) => {
+                let mut command_parts = vec![
+                    Value::BulkString(String::from("CONFIG")),
+                    Value::BulkString(String::from("GET")),
+                ];
+                for config_param in config_params {
+                    command_parts.push(Value::BulkString(config_param.into_owned()));
+                }
+                Value::Array(command_parts)
+            }
             Command::Client => Value::Array(vec![Value::BulkString(String::from("CLIENT"))]),
             Command::Exists(keys) => {
                 let mut command_parts = vec![Value::BulkString(String::from("EXISTS"))];
@@ -229,8 +161,8 @@ impl<'a> Display for Command<'a> {
                 Ok(())
             }
 
-            Command::ConfigGet(value) => {
-                write!(f, "CONFIG GET {}", value)
+            Command::ConfigGet(values) => {
+                write!(f, "CONFIG GET {:?}", values)
             }
             Command::Client => {
                 write!(f, "CLIENT")
@@ -253,84 +185,6 @@ impl<'a> From<Command<'a>> for Vec<u8> {
         value.to_bytes()
     }
 }
-
-pub fn parse_command<'a>(resp: ValOrRef) -> Result<Command<'a>, Error> {
-    let mut segment_iter = match resp.as_ref() {
-        Reference::Array(vec) => vec.into_iter(),
-        _ => return Err(Error::InvalidStart),
-    };
-
-    let name = match segment_iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(name) => name,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Err(Error::MissingName),
-    };
-
-    match name.to_uppercase().as_str() {
-        "PING" => parse_ping(segment_iter),
-        "ECHO" => parse_echo(segment_iter),
-        "GET" => parse_get(segment_iter),
-        "SET" => parse_set(segment_iter),
-        "CONFIG" => parse_config_get(segment_iter),
-        "CLIENT" => parse_client(segment_iter),
-        "EXISTS" => parse_exists(segment_iter),
-        _ => Err(Error::UnknownCommand(name)),
-    }
-}
-
-fn parse_ping<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
-    let text = match iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(text) => text,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Ok(Command::Ping(None)),
-    };
-
-    let (remaining, _) = iter.size_hint();
-    if remaining > 0 {
-        return Err(Error::InvalidNumberOfArguments(remaining));
-    }
-
-    Ok(Command::Ping(Some(Cow::Owned(text))))
-}
-
-fn parse_echo<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
-    let text = match iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(text) => text,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Err(Error::InvalidNumberOfArguments(0)),
-    };
-
-    let (remaining, _) = iter.size_hint();
-    if remaining > 0 {
-        return Err(Error::InvalidNumberOfArguments(remaining));
-    }
-
-    Ok(Command::Echo(Cow::Owned(text)))
-}
-
-fn parse_get<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
-    let key = match iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(text) => text,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Err(Error::InvalidNumberOfArguments(0)),
-    };
-
-    let (remaining, _) = iter.size_hint();
-    if remaining > 0 {
-        return Err(Error::InvalidNumberOfArguments(remaining));
-    }
-
-    Ok(Command::Get(Cow::Owned(key)))
-}
-
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum ExpireRule {
     ExpiresInSecs(Duration),
@@ -387,6 +241,14 @@ impl TryFrom<&[u8]> for ExpireRule {
     }
 }
 
+impl TryFrom<&str> for ExpireRule {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        ExpireRule::try_from(value.as_bytes())
+    }
+}
+
 impl From<ExpireRule> for Value {
     fn from(value: ExpireRule) -> Self {
         match value {
@@ -414,14 +276,21 @@ pub enum OverwriteRule {
 }
 
 impl TryFrom<&[u8]> for OverwriteRule {
-    type Error = ();
+    type Error = Error;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         match value {
             b"NX" => Ok(OverwriteRule::NotExists),
             b"XX" => Ok(OverwriteRule::Exists),
-            _ => Err(()),
+            _ => Err(Error::UnexpectedResp),
         }
+    }
+}
+impl TryFrom<&str> for OverwriteRule {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        OverwriteRule::try_from(value.as_bytes())
     }
 }
 
@@ -434,95 +303,162 @@ impl From<OverwriteRule> for Value {
     }
 }
 
-fn parse_set<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
-    let key = match iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(text) => text,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Err(Error::InvalidNumberOfArguments(0)),
-    };
+#[derive(Debug, Default)]
+pub struct Parser {
+    resp_parser: Option<resp::Parser>,
+}
 
-    let value = match iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(text) => text,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Err(Error::InvalidNumberOfArguments(0)),
-    };
+impl<'a> Parser {
+    pub fn parse_all(&mut self, buf: &'a [u8]) -> Vec<Result<Command<'a>, Error>> {
+        let mut buffer = buf;
+        let mut commands = Vec::new();
+
+        while !buffer.is_empty() {
+            let parse_result: Result<Option<(ValOrRef, &[u8])>, Error> = match &mut self.resp_parser
+            {
+                Some(parser) => parser
+                    .parse(buffer)
+                    .map(|o| o.map(|(value, remaining)| (ValOrRef::Val(value), remaining)))
+                    .map_err(|err| err.into()),
+                None => match parse(buffer) {
+                    Ok(ParsedValue::Complete(reference, remaining)) => {
+                        Ok(Some((ValOrRef::Ref(reference), remaining)))
+                    }
+                    Ok(ParsedValue::Incomplete(parser)) => {
+                        self.resp_parser = Some(parser);
+                        Ok(None)
+                    }
+                    Err(err) => Err(err.into()),
+                },
+            };
+
+            match parse_result {
+                Ok(Some((valOrRef, remaining))) => {
+                    let command = Command::try_from(valOrRef);
+                    commands.push(command);
+                    buffer = remaining;
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    commands.push(Err(err.into()));
+                }
+            };
+        }
+
+        commands
+    }
+}
+
+impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
+    type Error = Error;
+
+    fn try_from(value: ValOrRef<'a>) -> Result<Self, Self::Error> {
+        let mut segment_iter: VecDeque<ValOrRef> = match value {
+            ValOrRef::Val(Value::Array(values)) => {
+                values.into_iter().map(|v| ValOrRef::Val(v)).collect()
+            }
+            ValOrRef::Ref(Reference::Array(references)) => {
+                references.into_iter().map(|r| ValOrRef::Ref(r)).collect()
+            }
+            _ => return Err(Error::InvalidStart),
+        };
+
+        let name = expect_string(&mut segment_iter)?;
+
+        let command = match name.as_ref() {
+            "PING" => parse_ping(&mut segment_iter)?,
+            "ECHO" => parse_echo(&mut segment_iter)?,
+            "GET" => parse_get(&mut segment_iter)?,
+            "SET" => parse_set(&mut segment_iter)?,
+            "CONFIG" => parse_config_get(&mut segment_iter)?,
+            "CLIENT" => Command::Client,
+            "EXISTS" => parse_exists(&mut segment_iter)?,
+            _ => return Err(Error::UnknownCommand(name.into_owned())),
+        };
+        if !segment_iter.is_empty() {
+            return Err(Error::InvalidNumberOfArguments(0));
+        }
+
+        Ok(command)
+    }
+}
+
+fn expect_string<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Cow<'a, str>, Error> {
+    match try_string(queue)? {
+        Some(string) => Ok(string),
+        None => Err(Error::MissingName),
+    }
+}
+
+fn try_string<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Option<Cow<'a, str>>, Error> {
+    match queue.pop_front() {
+        Some(ValOrRef::Ref(Reference::BulkString(string))) => Ok(Some(Cow::Borrowed(string))),
+        Some(ValOrRef::Val(Value::BulkString(string))) => Ok(Some(Cow::Owned(string))),
+        Some(other) => Err(Error::UnexpectedResp),
+        None => Ok(None),
+    }
+}
+
+fn parse_ping<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    match try_string(queue)? {
+        Some(string) => Ok(Command::Ping(Some(string))),
+        None => Ok(Command::Ping(None)),
+    }
+}
+
+fn parse_echo<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let string = expect_string(queue)?;
+    Ok(Command::Echo(string))
+}
+
+fn parse_get<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let string = expect_string(queue)?;
+    Ok(Command::Get(string))
+}
+
+fn parse_set<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let value = expect_string(queue)?;
 
     let mut overwrite_rule = None;
     let mut get = false;
     let mut expire_rule = None;
-    for next in iter {
-        match next {
-            Value::BulkString(text) => {
-                let uppercase = text.to_ascii_uppercase();
-                if let Ok(r) = OverwriteRule::try_from(uppercase.as_ref()) {
-                    overwrite_rule = Some(r);
-                } else if uppercase == "GET" {
-                    get = true;
-                } else if let Ok(p) = ExpireRule::try_from(uppercase.as_ref()) {
-                    expire_rule = Some(p);
-                }
-            }
-            _ => return Err(Error::UnexpectedResp),
+    while let Some(string) = try_string(queue)? {
+        if let Ok(r) = OverwriteRule::try_from(string.as_ref()) {
+            overwrite_rule = Some(r);
+        } else if string == "GET" {
+            get = true;
+        } else if let Ok(p) = ExpireRule::try_from(string.as_ref()) {
+            expire_rule = Some(p);
+        } else {
+            return Err(Error::UnexpectedResp);
         }
     }
 
     Ok(Command::Set {
-        key: Cow::Owned(key),
-        value: Cow::Owned(value),
+        key,
+        value,
         overwrite_rule,
         get,
         expire_rule,
     })
 }
 
-fn parse_config_get<'a>(mut iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
-    // Sub command like GET or SET
-    let _ = match iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(text) => text,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Err(Error::InvalidNumberOfArguments(0)),
-    };
-
-    let key = match iter.next() {
-        Some(resp) => match resp {
-            Value::BulkString(text) => text,
-            _ => return Err(Error::UnexpectedResp),
-        },
-        None => return Err(Error::InvalidNumberOfArguments(0)),
-    };
-
-    let (remaining, _) = iter.size_hint();
-    if remaining > 0 {
-        return Err(Error::InvalidNumberOfArguments(remaining));
+fn parse_config_get<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let config_param = expect_string(queue)?;
+    let mut config_params = vec![config_param];
+    while let Some(config_param) = try_string(queue)? {
+        config_params.push(config_param);
     }
 
-    Ok(Command::ConfigGet(Cow::Owned(key)))
+    Ok(Command::ConfigGet(config_params))
 }
 
-fn parse_client<'a>(iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
-    let (remaining, _) = iter.size_hint();
-    if remaining > 0 {
-        return Err(Error::InvalidNumberOfArguments(remaining));
-    }
-
-    Ok(Command::Client)
-}
-fn parse_exists<'a>(iter: impl Iterator<Item = Value>) -> Result<Command<'a>, Error> {
-    let mut keys = Vec::new();
-
-    for next in iter {
-        match next {
-            Value::BulkString(text) => {
-                keys.push(Cow::Owned(text));
-            }
-            _ => return Err(Error::UnexpectedResp),
-        }
+fn parse_exists<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let mut keys = vec![key];
+    while let Some(key) = try_string(queue)? {
+        keys.push(key);
     }
 
     Ok(Command::Exists(keys))
@@ -532,28 +468,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_ping() -> Result<(), String> {
+    fn parse_ping() -> Result<(), Box<dyn error::Error>> {
         let name = "PING".to_string();
-        let resp = Value::Array(vec![Value::BulkString(name)]);
-        let command = parse_command(resp).map_err(|err| err.to_string())?;
+        let resp = ValOrRef::Val(Value::Array(vec![Value::BulkString(name)]));
+        let command = Command::try_from(resp)?;
         assert_eq!(Command::Ping(None), command);
         Ok(())
     }
+    
     #[test]
-    fn parse_echo() -> Result<(), String> {
+    fn parse_echo() -> Result<(), Box<dyn error::Error>> {
         let name = "ECHO".to_string();
         let arg = "test".to_string();
         let resp = Value::Array(vec![
             Value::BulkString(name),
             Value::BulkString(arg.clone()),
         ]);
-        let command = parse_command(resp).map_err(|err| err.to_string())?;
+        let command = Command::try_from(ValOrRef::Val(resp))?;
         assert_eq!(Command::Echo(Cow::Owned(arg)), command);
         Ok(())
     }
 
     #[test]
-    fn parse_set() -> Result<(), String> {
+    fn parse_set() -> Result<(), Box<dyn error::Error>> {
         let resp = Value::Array(vec![
             Value::BulkString("SET".to_string()),
             Value::BulkString("key".to_string()),
@@ -562,7 +499,7 @@ mod tests {
             Value::BulkString("GET".to_string()),
             Value::BulkString("EX 10".to_string()),
         ]);
-        let command = parse_command(resp).map_err(|err| err.to_string())?;
+        let command = Command::try_from(ValOrRef::Val(resp))?;
         assert_eq!(
             Command::Set {
                 key: Cow::Owned("key".to_string()),
@@ -577,13 +514,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_set_no_options() -> Result<(), String> {
+    fn parse_set_references() -> Result<(), Box<dyn error::Error>> {
+        let resp = Reference::Array(vec![
+            Reference::BulkString("SET"),
+            Reference::BulkString("key"),
+            Reference::BulkString("value"),
+            Reference::BulkString("XX"),
+            Reference::BulkString("GET"),
+            Reference::BulkString("EX 10"),
+        ]);
+        let command = Command::try_from(ValOrRef::Ref(resp))?;
+        assert_eq!(
+            Command::Set {
+                key: Cow::Borrowed("key"),
+                value: Cow::Borrowed("value"),
+                overwrite_rule: Some(OverwriteRule::Exists),
+                get: true,
+                expire_rule: Some(ExpireRule::ExpiresInSecs(Duration::from_secs(10))),
+            },
+            command
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_set_no_options() -> Result<(), Box<dyn error::Error>> {
         let resp = Value::Array(vec![
             Value::BulkString("SET".to_string()),
             Value::BulkString("key".to_string()),
             Value::BulkString("value".to_string()),
         ]);
-        let command = parse_command(resp).map_err(|err| err.to_string())?;
+        let command = Command::try_from(ValOrRef::Val(resp))?;
         assert_eq!(
             Command::Set {
                 key: Cow::Owned("key".to_string()),
