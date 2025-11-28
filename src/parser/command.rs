@@ -1,35 +1,42 @@
 use super::resp;
-use crate::parser::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
+use crate::parser::resp::{parse, ParsedValue, Reference, ValOrRef, Value};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::fmt::{Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
+use std::num::ParseIntError;
+use std::str::Utf8Error;
+use std::string::FromUtf8Error;
 use std::time::{Duration, SystemTime};
-use std::{error, fmt, io};
+use std::{error, io};
 
 #[derive(Debug)]
 pub enum Error {
     UnknownCommand(String),
-    InvalidNumberOfArguments(usize),
-    InvalidStart,
-    MissingName,
-    UnexpectedResp,
-    Parse(resp::Error),
+    UnknownArguments(Vec<Value>),
+    Resp(resp::Error),
     Io(io::Error),
+    ExpectedArray(Value),
+    UnexpectedEnd,
+    UnexpectedResp(Value),
+    ParseInt(ParseIntError),
+    FromUtf8(FromUtf8Error),
+    Utf8Error(Utf8Error),
 }
 
 impl error::Error for Error {}
 impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnknownCommand(name) => write!(f, "Command {name} is unknown"),
-            Error::InvalidNumberOfArguments(amount) => {
-                write!(f, "Invalid amount of arguments {amount}")
-            }
-            Error::InvalidStart => write!(f, "Invalid begin for a command"),
-            Error::MissingName => write!(f, "Command lacks name"),
-            Error::UnexpectedResp => write!(f, "Unexpected format"),
-            Error::Parse(err) => write!(f, "Parse error: {}", err),
-            Error::Io(err) => write!(f, "IO error: {}", err),
+            Error::Resp(err) => write!(f,"{}", err),
+            Error::Io(err) => write!(f,"{}", err),
+            Error::FromUtf8(err) => write!(f,"{}", err),
+            Error::Utf8Error(err) => write!(f,"{}", err),
+            Error::UnknownArguments(arguments) => {write!(f,"Command contains unknown arguments {:?}", arguments)}
+            Error::ExpectedArray(other) => {write!(f, "Command should be of the RESP type array but is {}", other)}
+            Error::UnexpectedEnd => {write!(f, "Command ended abruptly")}
+            Error::UnexpectedResp(other) => {write!(f, "Command contains unexpected RESP value {}", other)}
+            Error::ParseInt(err) => write!(f,"{}", err),
         }
     }
 }
@@ -37,8 +44,24 @@ impl From<resp::Error> for Error {
     fn from(value: resp::Error) -> Self {
         match value {
             resp::Error::Io(err) => Error::Io(err),
-            _ => Error::Parse(value),
+            _ => Error::Resp(value),
         }
+    }
+}
+
+impl From<ParseIntError> for Error {
+    fn from(value: ParseIntError) -> Self {
+        Error::ParseInt(value)
+    }
+}
+impl From<FromUtf8Error> for Error {
+    fn from(value: FromUtf8Error) -> Self {
+        Error::FromUtf8(value)
+    }
+}
+impl From<Utf8Error> for Error {
+    fn from(value: Utf8Error) -> Self {
+        Error::Utf8Error(value)
     }
 }
 
@@ -185,6 +208,42 @@ impl<'a> From<Command<'a>> for Vec<u8> {
         value.to_bytes()
     }
 }
+
+impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
+    type Error = Error;
+
+    fn try_from(value: ValOrRef<'a>) -> Result<Self, Self::Error> {
+        let mut segment_iter: VecDeque<ValOrRef> = match value {
+            ValOrRef::Val(Value::Array(values)) => {
+                values.into_iter().map(|v| ValOrRef::Val(v)).collect()
+            }
+            ValOrRef::Ref(Reference::Array(references)) => {
+                references.into_iter().map(|r| ValOrRef::Ref(r)).collect()
+            }
+            other => return Err(Error::ExpectedArray(other.to_value())),
+        };
+
+        let name = expect_string(&mut segment_iter)?;
+
+        let command = match name.as_ref() {
+            "PING" => parse_ping(&mut segment_iter)?,
+            "ECHO" => parse_echo(&mut segment_iter)?,
+            "GET" => parse_get(&mut segment_iter)?,
+            "SET" => parse_set(&mut segment_iter)?,
+            "CONFIG" => parse_config_get(&mut segment_iter)?,
+            "CLIENT" => Command::Client,
+            "EXISTS" => parse_exists(&mut segment_iter)?,
+            _ => return Err(Error::UnknownCommand(name.into_owned())),
+        };
+        if !segment_iter.is_empty() {
+            let remaining_args = segment_iter.into_iter().map(ValOrRef::to_value).collect();
+            return Err(Error::UnknownArguments(remaining_args));
+        }
+
+        Ok(command)
+    }
+}
+
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum ExpireRule {
     ExpiresInSecs(Duration),
@@ -205,44 +264,44 @@ impl ExpireRule {
     }
 }
 impl TryFrom<&[u8]> for ExpireRule {
-    type Error = &'static str;
+    type Error = Error;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.starts_with(b"EX") {
             let trimmed = &value[2..].trim_ascii_start();
-            let ascii_number = std::str::from_utf8(trimmed).map_err(|_| "Invalid UTF-8 string")?;
-            let secs = ascii_number.parse().map_err(|_| "Invalid number")?;
+            let ascii_number = std::str::from_utf8(trimmed)?;
+            let secs = ascii_number.parse()?;
             let dur = Duration::from_secs(secs);
             return Ok(ExpireRule::ExpiresInSecs(dur));
         }
         if value.starts_with(b"PX") {
             let trimmed = &value[2..].trim_ascii_start();
-            let ascii_number = std::str::from_utf8(trimmed).map_err(|_| "Invalid UTF-8 string")?;
-            let millis = ascii_number.parse().map_err(|_| "Invalid number")?;
+            let ascii_number = std::str::from_utf8(trimmed)?;
+            let millis = ascii_number.parse()?;
             let dur = Duration::from_millis(millis);
             return Ok(ExpireRule::ExpiresInMillis(dur));
         }
         if value.starts_with(b"EXAT") {
             let trimmed = &value[4..].trim_ascii_start();
-            let ascii_number = std::str::from_utf8(trimmed).map_err(|_| "Invalid UTF-8 string")?;
-            let secs = ascii_number.parse().map_err(|_| "Invalid number")?;
+            let ascii_number = std::str::from_utf8(trimmed)?;
+            let secs = ascii_number.parse()?;
             return Ok(ExpireRule::ExpiresAtSecs(Duration::from_secs(secs)));
         }
         if value.starts_with(b"PXAT") {
             let trimmed = &value[4..].trim_ascii_start();
-            let ascii_number = std::str::from_utf8(trimmed).map_err(|_| "Invalid UTF-8 string")?;
-            let millis = ascii_number.parse().map_err(|_| "Invalid number")?;
+            let ascii_number = std::str::from_utf8(trimmed)?;
+            let millis = ascii_number.parse()?;
             return Ok(ExpireRule::ExpiresAtMillis(Duration::from_millis(millis)));
         }
         if value == b"KEEPTTL" {
             return Ok(ExpireRule::KeepTTL);
         }
 
-        Err("")
+        Err(Error::UnknownArguments(vec![Value::BulkString(String::from_utf8_lossy(value).into_owned())]))
     }
 }
 
 impl TryFrom<&str> for ExpireRule {
-    type Error = &'static str;
+    type Error = Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         ExpireRule::try_from(value.as_bytes())
@@ -275,22 +334,17 @@ pub enum OverwriteRule {
     Exists,
 }
 
-impl TryFrom<&[u8]> for OverwriteRule {
-    type Error = Error;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        match value {
-            b"NX" => Ok(OverwriteRule::NotExists),
-            b"XX" => Ok(OverwriteRule::Exists),
-            _ => Err(Error::UnexpectedResp),
-        }
-    }
-}
 impl TryFrom<&str> for OverwriteRule {
     type Error = Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        OverwriteRule::try_from(value.as_bytes())
+        match value {
+            "NX" => Ok(OverwriteRule::NotExists),
+            "XX" => Ok(OverwriteRule::Exists),
+            other =>
+                Err(Error::UnknownArguments(vec![Value::BulkString(other.to_string())]))
+
+        }
     }
 }
 
@@ -349,44 +403,10 @@ impl<'a> Parser {
     }
 }
 
-impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
-    type Error = Error;
-
-    fn try_from(value: ValOrRef<'a>) -> Result<Self, Self::Error> {
-        let mut segment_iter: VecDeque<ValOrRef> = match value {
-            ValOrRef::Val(Value::Array(values)) => {
-                values.into_iter().map(|v| ValOrRef::Val(v)).collect()
-            }
-            ValOrRef::Ref(Reference::Array(references)) => {
-                references.into_iter().map(|r| ValOrRef::Ref(r)).collect()
-            }
-            _ => return Err(Error::InvalidStart),
-        };
-
-        let name = expect_string(&mut segment_iter)?;
-
-        let command = match name.as_ref() {
-            "PING" => parse_ping(&mut segment_iter)?,
-            "ECHO" => parse_echo(&mut segment_iter)?,
-            "GET" => parse_get(&mut segment_iter)?,
-            "SET" => parse_set(&mut segment_iter)?,
-            "CONFIG" => parse_config_get(&mut segment_iter)?,
-            "CLIENT" => Command::Client,
-            "EXISTS" => parse_exists(&mut segment_iter)?,
-            _ => return Err(Error::UnknownCommand(name.into_owned())),
-        };
-        if !segment_iter.is_empty() {
-            return Err(Error::InvalidNumberOfArguments(0));
-        }
-
-        Ok(command)
-    }
-}
-
 fn expect_string<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Cow<'a, str>, Error> {
     match try_string(queue)? {
         Some(string) => Ok(string),
-        None => Err(Error::MissingName),
+        None => Err(Error::UnexpectedEnd),
     }
 }
 
@@ -394,7 +414,7 @@ fn try_string<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Option<Cow<'a, s
     match queue.pop_front() {
         Some(ValOrRef::Ref(Reference::BulkString(string))) => Ok(Some(Cow::Borrowed(string))),
         Some(ValOrRef::Val(Value::BulkString(string))) => Ok(Some(Cow::Owned(string))),
-        Some(other) => Err(Error::UnexpectedResp),
+        Some(other) => Err(Error::UnexpectedResp(other.to_value())),
         None => Ok(None),
     }
 }
@@ -431,7 +451,7 @@ fn parse_set<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Erro
         } else if let Ok(p) = ExpireRule::try_from(string.as_ref()) {
             expire_rule = Some(p);
         } else {
-            return Err(Error::UnexpectedResp);
+            return Err(Error::UnknownArguments(vec![Value::BulkString(string.into_owned())]));
         }
     }
 
@@ -475,7 +495,7 @@ mod tests {
         assert_eq!(Command::Ping(None), command);
         Ok(())
     }
-    
+
     #[test]
     fn parse_echo() -> Result<(), Box<dyn error::Error>> {
         let name = "ECHO".to_string();

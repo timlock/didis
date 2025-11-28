@@ -222,7 +222,7 @@ impl Connection {
 mod test {
     use super::*;
     use crate::client::Client;
-    use crate::parser::command::Command;
+    use crate::parser::command::{Command, OverwriteRule};
     use std::borrow::Cow;
     use std::str::FromStr;
     use std::thread;
@@ -298,32 +298,46 @@ mod test {
 
         let cmd_batch = vec![
             Command::Set {
-                key: Cow::Owned("Key1".to_string()),
-                value: Cow::Owned("Value1".to_string()),
+                key: Cow::Borrowed("Key1"),
+                value: Cow::Borrowed("Value1"),
                 overwrite_rule: None,
                 get: false,
                 expire_rule: None,
             },
             Command::Set {
-                key: Cow::Owned("Key2".to_string()),
-                value: Cow::Owned("Value2".to_string()),
+                key: Cow::Borrowed("Key2"),
+                value: Cow::Borrowed("Value2"),
                 overwrite_rule: None,
                 get: false,
                 expire_rule: None,
             },
-            Command::Get(Cow::Owned(String::from("Key1"))),
-            Command::Get(Cow::Owned(String::from("Key2"))),
+            Command::Get(Cow::Borrowed("Key1")),
+            Command::Get(Cow::Borrowed("Key2")),
+            Command::Set {
+                key: Cow::Borrowed("Key1"),
+                value: Cow::Borrowed("should not be applied"),
+                overwrite_rule: Some(OverwriteRule::NotExists),
+                get: true,
+                expire_rule: None,
+            },
+            Command::Set {
+                key: Cow::Borrowed("Key2"),
+                value: Cow::Borrowed("Value2 updated"),
+                overwrite_rule: None,
+                get: true,
+                expire_rule: None,
+            },
+            Command::Get(Cow::Borrowed("Key2"))
         ];
         let mut response = client.send_batch(cmd_batch)?;
-        assert_eq!(4, response.len());
-        let first_result = response.remove(0);
-        assert_eq!(Value::ok(), first_result);
-        let second_result = response.remove(0);
-        assert_eq!(Value::ok(), second_result);
-        let third_result = response.remove(0);
-        assert_eq!(Value::BulkString(String::from("Value1")), third_result);
-        let fourth_result = response.remove(0);
-        assert_eq!(Value::BulkString(String::from("Value2")), fourth_result);
+        assert_eq!(7, response.len());
+        assert_eq!(Value::ok(), response[0]);
+        assert_eq!(Value::ok(), response[1]);
+        assert_eq!(Value::BulkString(String::from("Value1")), response[2]);
+        assert_eq!(Value::BulkString(String::from("Value2")), response[3]);
+        assert_eq!(Value::Null, response[4]);
+        assert_eq!(Value::BulkString(String::from("Value2")), response[5]);
+        assert_eq!(Value::BulkString(String::from("Value2 updated")), response[6]);
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();

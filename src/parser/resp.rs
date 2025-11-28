@@ -309,10 +309,7 @@ impl<'a> Reference<'a> {
             Reference::Integer(value) => Value::Integer(value),
             Reference::BulkString(value) => Value::BulkString(value.to_owned()),
             Reference::Array(values) => {
-                let values = values
-                    .into_iter()
-                    .map(|value| value.to_value())
-                    .collect();
+                let values = values.into_iter().map(|value| value.to_value()).collect();
                 Value::Array(values)
             }
             Reference::Null => Value::Null,
@@ -477,6 +474,16 @@ impl<'a> Parser {
         self.state = ParserState::None;
 
         Ok(Some((value, remaining)))
+    }
+
+    pub fn parse_all(&mut self, mut bytes: &'a [u8]) -> Result<Vec<Value>, Error> {
+        let mut values = Vec::new();
+        while let Some((value, remaining)) = self.parse(bytes)? {
+            values.push(value);
+            bytes = remaining;
+        }
+        
+        Ok(values)
     }
 }
 

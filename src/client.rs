@@ -51,8 +51,9 @@ impl Client {
         &mut self,
         commands: Vec<Command>,
     ) -> Result<Vec<Value>, resp::Error> {
+
         println!("Sending command batch to server {:?}", commands);
-        let mut bytes = commands.into_iter().flat_map(Vec::from).collect::<Vec<_>>();
+        let mut bytes: Vec<u8> = commands.into_iter().flat_map(Vec::from).collect();
 
         let start = Instant::now();
 
@@ -68,21 +69,15 @@ impl Client {
             }
         }
 
-        let mut results = Vec::new();
-        let mut buffer = bytes.as_slice();
-        while !buffer.is_empty(){
-            let (response, remaining) = self.resp_parser.parse(buffer)?.ok_or(resp::Error::LengthMismatch)?;
-            results.push(response);
-            buffer = remaining;
-        }
+        let values = self.resp_parser.parse_all(bytes.as_slice())?;
 
         println!(
             "Received response batch of size {} from server duration={:?} {:?}",
-            results.len(),
+            values.len(),
             start.elapsed(),
-            results
+            values
         );
 
-        Ok(results)
+        Ok(values)
     }
 }
