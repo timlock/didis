@@ -111,6 +111,7 @@ pub enum Value {
     Integer(i64),
     BulkString(String),
     Array(Vec<Value>),
+    Push(Vec<Value>),
     Null,
 }
 
@@ -153,6 +154,15 @@ impl Value {
                     bytes.extend_from_slice(&serialized);
                 }
             }
+            Value::Push(resps) => {
+                bytes.push(b'>');
+                bytes.extend_from_slice(resps.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                for resp in resps {
+                    let serialized = resp.to_bytes();
+                    bytes.extend_from_slice(&serialized);
+                }
+            }
             Value::Null => bytes.extend_from_slice(b"*-1\r\n"),
         }
         bytes
@@ -167,13 +177,16 @@ impl Value {
             Value::Array(value) => {
                 Reference::Array(value.iter().map(Value::as_reference).collect())
             }
+            Value::Push(value) => {
+                Reference::Push(value.iter().map(Value::as_reference).collect())
+            }
             Value::Null => Reference::Null,
         }
     }
 }
 
 impl Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Value::SimpleString(value) => write!(f, "+{}\\r\\n", value),
             Value::SimpleError(value) => write!(f, "-{}\\r\\n", value),
@@ -197,55 +210,18 @@ impl Display for Value {
                 }
                 write!(f, "\\r\\n",)
             }
+            Value::Push(values) => {
+                write!(f, ">{}\\r\\n", values.len())?;
+                for value in values {
+                    write!(f, "{}", value)?;
+                }
+                write!(f, "\\r\\n",)
+            }
             Value::Null => write!(f, "_\\r\\n"),
         }
     }
 }
 
-impl From<&Value> for String {
-    fn from(value: &Value) -> Self {
-        let mut string = String::new();
-        const CLRF: &str = "\r\n";
-        match value {
-            Value::SimpleString(s) => {
-                string += "+";
-                string += s;
-                string += CLRF;
-            }
-            Value::SimpleError(e) => {
-                string += "-";
-                string += e;
-                string += CLRF;
-            }
-            Value::Integer(i) => {
-                string += ":";
-                string += i.to_string().as_str();
-                string += CLRF;
-            }
-            Value::BulkString(b) => {
-                string += "$";
-                string += b.len().to_string().as_str();
-                string += CLRF;
-                string += b;
-                string += CLRF;
-            }
-            Value::Array(a) => {
-                string += "*";
-                string += a.len().to_string().as_str();
-                string += CLRF;
-                for i in a {
-                    string += String::from(i).as_str();
-                }
-            }
-            Value::Null => {
-                string += "*";
-                string += "-1";
-                string += CLRF;
-            }
-        }
-        string
-    }
-}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Reference<'a> {
@@ -254,6 +230,7 @@ pub enum Reference<'a> {
     Integer(i64),
     BulkString(&'a str),
     Array(Vec<Reference<'a>>),
+    Push(Vec<Reference<'a>>),
     Null,
 }
 
@@ -297,6 +274,15 @@ impl<'a> Reference<'a> {
                     bytes.extend_from_slice(&serialized);
                 }
             }
+            Reference::Push(resps) => {
+                bytes.push(b'>');
+                bytes.extend_from_slice(resps.len().to_string().as_bytes());
+                bytes.extend_from_slice(CRLF);
+                for resp in resps {
+                    let serialized = resp.to_bytes();
+                    bytes.extend_from_slice(&serialized);
+                }
+            }
             Reference::Null => bytes.extend_from_slice(b"*-1\r\n"),
         }
         bytes
@@ -312,12 +298,16 @@ impl<'a> Reference<'a> {
                 let values = values.into_iter().map(|value| value.to_value()).collect();
                 Value::Array(values)
             }
+            Reference::Push(values) => {
+                let values = values.into_iter().map(|value| value.to_value()).collect();
+                Value::Push(values)
+            }
             Reference::Null => Value::Null,
         }
     }
 }
 impl<'a> Display for Reference<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Reference::SimpleString(value) => write!(f, "+{}\\r\\n", value),
             Reference::SimpleError(value) => write!(f, "-{}\\r\\n", value),
@@ -341,55 +331,18 @@ impl<'a> Display for Reference<'a> {
                 }
                 write!(f, "\\r\\n",)
             }
+            Reference::Push(values) => {
+                write!(f, ">{}\\r\\n", values.len())?;
+                for value in values {
+                    write!(f, "{}", value)?;
+                }
+                write!(f, "\\r\\n",)
+            }
             Reference::Null => write!(f, "_\\r\\n"),
         }
     }
 }
 
-impl<'a> From<&Reference<'a>> for String {
-    fn from(value: &Reference<'a>) -> Self {
-        let mut string = String::new();
-        const CLRF: &str = "\r\n";
-        match value {
-            Reference::SimpleString(s) => {
-                string += "+";
-                string += s;
-                string += CLRF;
-            }
-            Reference::SimpleError(e) => {
-                string += "-";
-                string += e;
-                string += CLRF;
-            }
-            Reference::Integer(i) => {
-                string += ":";
-                string += i.to_string().as_str();
-                string += CLRF;
-            }
-            Reference::BulkString(b) => {
-                string += "$";
-                string += b.len().to_string().as_str();
-                string += CLRF;
-                string += b;
-                string += CLRF;
-            }
-            Reference::Array(a) => {
-                string += "*";
-                string += a.len().to_string().as_str();
-                string += CLRF;
-                for i in a {
-                    string += String::from(i).as_str();
-                }
-            }
-            Reference::Null => {
-                string += "*";
-                string += "-1";
-                string += CLRF;
-            }
-        }
-        string
-    }
-}
 
 pub enum ParsedValue<'a, C, I> {
     Complete(C, &'a [u8]),
@@ -413,7 +366,8 @@ enum ParserState {
     SimpleError(LineParser),
     Integer(IntegerParser),
     BulkString(BulkStringParser),
-    Array(ArrayParser),
+    Array(ArrayParserNullable),
+    Push(ArrayParserNonNullable),
     None,
 }
 
@@ -426,7 +380,8 @@ impl TryFrom<u8> for ParserState {
             b'-' => Ok(ParserState::SimpleError(LineParser::default())),
             b':' => Ok(ParserState::Integer(IntegerParser::default())),
             b'$' => Ok(ParserState::BulkString(BulkStringParser::default())),
-            b'*' => Ok(ParserState::Array(ArrayParser::default())),
+            b'*' => Ok(ParserState::Array(ArrayParserNullable::default())),
+            b'>' => Ok(ParserState::Push(ArrayParserNonNullable::default())),
             _ => Err(Error::UnknownResp(value)),
         }
     }
@@ -458,7 +413,10 @@ impl<'a> Parser {
                 Some((value, remaining)) => (value, remaining),
                 None => return Ok(None),
             },
-
+            ParserState::Push(parser) => match parser.parse(value)? {
+                Some((value, remaining)) => (value, remaining),
+                None => return Ok(None),
+            },
             ParserState::None => match value.get(0) {
                 Some(identifier) => {
                     self.state = ParserState::try_from(*identifier)?;
@@ -482,7 +440,7 @@ impl<'a> Parser {
             values.push(value);
             bytes = remaining;
         }
-        
+
         Ok(values)
     }
 }
@@ -579,14 +537,14 @@ impl<'a> BulkStringParser {
 }
 
 #[derive(Debug, Default)]
-struct ArrayParser {
+struct ArrayParserNullable {
     integer_parser: IntegerParser,
     length: Option<i64>,
     items: Vec<Value>,
     parser: Box<Parser>,
 }
 
-impl<'a> ArrayParser {
+impl<'a> ArrayParserNullable {
     fn parse(&mut self, mut value: &'a [u8]) -> Result<Option<(Value, &'a [u8])>, Error> {
         if self.length.is_none() {
             match self.integer_parser.parse(value)? {
@@ -615,6 +573,43 @@ impl<'a> ArrayParser {
         }
 
         Ok(Some((Value::Array(mem::take(&mut self.items)), value)))
+    }
+}
+
+#[derive(Debug, Default)]
+struct ArrayParserNonNullable {
+    integer_parser: IntegerParser,
+    length: Option<u64>,
+    items: Vec<Value>,
+    parser: Box<Parser>,
+}
+
+impl<'a> ArrayParserNonNullable {
+    fn parse(&mut self, mut value: &'a [u8]) -> Result<Option<(Value, &'a [u8])>, Error> {
+        if self.length.is_none() {
+            match self.integer_parser.parse(value)? {
+                Some((length, remaining)) => {
+                    self.length = Some(length as u64);
+                    value = remaining;
+                }
+                None => return Ok(None),
+            };
+        }
+
+
+        if let Some(length) = self.length {
+            while self.items.len() < length as usize {
+                match self.parser.parse(value)? {
+                    Some((item, remaining)) => {
+                        self.items.push(item);
+                        value = remaining;
+                    }
+                    None => return Ok(None),
+                };
+            }
+        }
+
+        Ok(Some((Value::Push(mem::take(&mut self.items)), value)))
     }
 }
 
@@ -678,7 +673,14 @@ fn expect_simple_error(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error
     Ok(Some((Reference::SimpleError(line), remaining)))
 }
 
-fn expect_length(value: &[u8]) -> Result<Option<(i64, &[u8])>, Error> {
+fn expect_signed_length(value: &[u8]) -> Result<Option<(i64, &[u8])>, Error> {
+    match expect_line(value)? {
+        Some((line, remaining)) => Ok(Some((line.parse()?, remaining))),
+        None => Ok(None),
+    }
+}
+
+fn expect_unsigned_length(value: &[u8]) -> Result<Option<(u64, &[u8])>, Error> {
     match expect_line(value)? {
         Some((line, remaining)) => Ok(Some((line.parse()?, remaining))),
         None => Ok(None),
@@ -686,7 +688,7 @@ fn expect_length(value: &[u8]) -> Result<Option<(i64, &[u8])>, Error> {
 }
 
 fn expect_integer(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
-    let (integer, remaining) = match expect_length(value)? {
+    let (integer, remaining) = match expect_signed_length(value)? {
         Some((line, remaining)) => (line, remaining),
         None => return Ok(None),
     };
@@ -695,7 +697,7 @@ fn expect_integer(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
 }
 
 fn expect_bulk_string(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
-    let (length, remaining) = match expect_length(value)? {
+    let (length, remaining) = match expect_signed_length(value)? {
         Some((length, remaining)) => (length, remaining),
         None => return Ok(None),
     };
@@ -716,7 +718,7 @@ fn expect_bulk_string(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error>
 }
 
 fn expect_array(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
-    let (length, mut remaining) = match expect_length(value)? {
+    let (length, mut remaining) = match expect_signed_length(value)? {
         Some((length, remaining)) => (length, remaining),
         None => return Ok(None),
     };
@@ -738,6 +740,26 @@ fn expect_array(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
     Ok(Some((Reference::Array(items), remaining)))
 }
 
+fn expect_push(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+    let (length, mut remaining) = match expect_unsigned_length(value)? {
+        Some((length, remaining)) => (length, remaining),
+        None => return Ok(None),
+    };
+
+    let length = length as usize;
+    let mut items = Vec::with_capacity(length);
+    for _ in 0..length {
+        let (value, r) = match expect_value(remaining)? {
+            Some((value, remaining)) => (value, remaining),
+            None => return Ok(None),
+        };
+        items.push(value);
+        remaining = r;
+    }
+
+    Ok(Some((Reference::Push(items), remaining)))
+}
+
 fn expect_value(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
     if value.is_empty() {
         return Ok(None);
@@ -752,6 +774,7 @@ fn expect_value(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
         b':' => expect_integer(value)?,
         b'$' => expect_bulk_string(value)?,
         b'*' => expect_array(value)?,
+        b'>' => expect_push(value)?,
         _ => return Err(Error::UnknownResp(value[0])),
     };
 
@@ -841,6 +864,21 @@ mod tests {
                     }
                     _ => return Err("Should be of type array".into()),
                 }
+                Ok(())
+            }
+            _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_push() -> Result<(), Box<dyn error::Error>> {
+        let input = ">2\r\n$4\r\necho\r\n$11\r\nhello world\r\n";
+        match expect_value(input.as_bytes())? {
+            Some((Reference::Push(array), remaining)) => {
+                assert_eq!(b"", remaining);
+                assert_eq!(array.len(), 2);
+                assert_eq!(Reference::BulkString("echo"), array[0]);
+                assert_eq!(Reference::BulkString("hello world"), array[1]);
                 Ok(())
             }
             _ => Err("Should be of type array".into()),
@@ -947,6 +985,27 @@ mod tests {
                 Ok(())
             }
             _ => Err("Should be of type array".into()),
+        }
+    }
+
+    #[test]
+    fn parse_push_stateful() -> Result<(), Box<dyn error::Error>> {
+        let input = ">2\r\n$4\r\necho\r\n$11\r\nhello world\r\n";
+        match Parser::default().parse(input.as_bytes())? {
+            Some((Value::Push(array), remaining)) => {
+                assert_eq!(b"", remaining);
+                assert_eq!(array.len(), 2);
+                match &array[0] {
+                    Value::BulkString(s) => assert_eq!(s, "echo"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                match &array[1] {
+                    Value::BulkString(s) => assert_eq!(s, "hello world"),
+                    _ => return Err("Array should contain a simple string".into()),
+                }
+                Ok(())
+            }
+            _ => Err("Should be of type push".into()),
         }
     }
 
