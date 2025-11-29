@@ -1,8 +1,8 @@
 use super::resp;
-use crate::parser::resp::{parse, ParsedValue, Reference, ValOrRef, Value};
+use crate::parser::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::fmt::{self, Debug, Display, Formatter};
+use std::fmt::{self, write, Debug, Display, Formatter};
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
@@ -28,15 +28,27 @@ impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnknownCommand(name) => write!(f, "Command {name} is unknown"),
-            Error::Resp(err) => write!(f,"{}", err),
-            Error::Io(err) => write!(f,"{}", err),
-            Error::FromUtf8(err) => write!(f,"{}", err),
-            Error::Utf8Error(err) => write!(f,"{}", err),
-            Error::UnknownArguments(arguments) => {write!(f,"Command contains unknown arguments {:?}", arguments)}
-            Error::ExpectedArray(other) => {write!(f, "Command should be of the RESP type array but is {}", other)}
-            Error::UnexpectedEnd => {write!(f, "Command ended abruptly")}
-            Error::UnexpectedResp(other) => {write!(f, "Command contains unexpected RESP value {}", other)}
-            Error::ParseInt(err) => write!(f,"{}", err),
+            Error::Resp(err) => write!(f, "{}", err),
+            Error::Io(err) => write!(f, "{}", err),
+            Error::FromUtf8(err) => write!(f, "{}", err),
+            Error::Utf8Error(err) => write!(f, "{}", err),
+            Error::UnknownArguments(arguments) => {
+                write!(f, "Command contains unknown arguments {:?}", arguments)
+            }
+            Error::ExpectedArray(other) => {
+                write!(
+                    f,
+                    "Command should be of the RESP type array but is {}",
+                    other
+                )
+            }
+            Error::UnexpectedEnd => {
+                write!(f, "Command ended abruptly")
+            }
+            Error::UnexpectedResp(other) => {
+                write!(f, "Command contains unexpected RESP value {}", other)
+            }
+            Error::ParseInt(err) => write!(f, "{}", err),
         }
     }
 }
@@ -80,6 +92,12 @@ pub enum Command<'a> {
     ConfigGet(Vec<Cow<'a, str>>),
     Client,
     Exists(Vec<Cow<'a, str>>),
+    Subscribe(Vec<Cow<'a, str>>),
+    Unsubscribe(Vec<Cow<'a, str>>),
+    Publish {
+        channel: Cow<'a, str>,
+        message: Cow<'a, str>,
+    },
 }
 
 impl<'a> Command<'a> {
@@ -143,10 +161,31 @@ impl<'a> Command<'a> {
 
                 Value::Array(command_parts)
             }
+            Command::Subscribe(channels) => {
+                let mut command_parts = vec![Value::BulkString(String::from("SUBSCRIBE"))];
+                for channel in channels {
+                    command_parts.push(Value::BulkString(channel.into_owned()));
+                }
+
+                Value::Array(command_parts)
+            }
+            Command::Unsubscribe(channels) => {
+                let mut command_parts = vec![Value::BulkString(String::from("UNSUBSCRIBE"))];
+                for channel in channels {
+                    command_parts.push(Value::BulkString(channel.into_owned()));
+                }
+
+                Value::Array(command_parts)
+            }
+            Command::Publish { channel, message } => Value::Array(vec![
+                Value::BulkString(String::from("PUBLISH")),
+                Value::BulkString(channel.into_owned()),
+                Value::BulkString(message.into_owned()),
+            ]),
         }
     }
     pub fn to_bytes(self) -> Vec<u8> {
-        Value::from(self).to_bytes()
+        self.to_resp().to_bytes()
     }
 }
 
@@ -192,6 +231,15 @@ impl<'a> Display for Command<'a> {
             }
             Command::Exists(keys) => {
                 write!(f, "KEYS {:?}", keys)
+            }
+            Command::Subscribe(channels) => {
+                write!(f, "SUBSCRIBE {:?}", channels)
+            }
+            Command::Unsubscribe(channels) => {
+                write!(f, "UNSUBSCRIBE {:?}", channels)
+            }
+            Command::Publish { channel, message } => {
+                write!(f, "PUBLISH {} {}", channel, message)
             }
         }
     }
@@ -296,7 +344,9 @@ impl TryFrom<&[u8]> for ExpireRule {
             return Ok(ExpireRule::KeepTTL);
         }
 
-        Err(Error::UnknownArguments(vec![Value::BulkString(String::from_utf8_lossy(value).into_owned())]))
+        Err(Error::UnknownArguments(vec![Value::BulkString(
+            String::from_utf8_lossy(value).into_owned(),
+        )]))
     }
 }
 
@@ -341,9 +391,9 @@ impl TryFrom<&str> for OverwriteRule {
         match value {
             "NX" => Ok(OverwriteRule::NotExists),
             "XX" => Ok(OverwriteRule::Exists),
-            other =>
-                Err(Error::UnknownArguments(vec![Value::BulkString(other.to_string())]))
-
+            other => Err(Error::UnknownArguments(vec![Value::BulkString(
+                other.to_string(),
+            )])),
         }
     }
 }
@@ -451,7 +501,9 @@ fn parse_set<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Erro
         } else if let Ok(p) = ExpireRule::try_from(string.as_ref()) {
             expire_rule = Some(p);
         } else {
-            return Err(Error::UnknownArguments(vec![Value::BulkString(string.into_owned())]));
+            return Err(Error::UnknownArguments(vec![Value::BulkString(
+                string.into_owned(),
+            )]));
         }
     }
 

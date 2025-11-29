@@ -1,6 +1,6 @@
 use crate::async_io::{AsyncIO, Completion, IO};
 use crate::controller::Controller;
-use crate::parser::command::{Parser};
+use crate::parser::command::Parser;
 use crate::parser::resp::Value;
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
@@ -21,6 +21,7 @@ pub struct Server {
     connections: HashMap<RawFd, Connection>,
     controller: Controller,
     done: Arc<AtomicBool>,
+    id_counter: u64,
 }
 
 impl Server {
@@ -30,6 +31,7 @@ impl Server {
             connections: Default::default(),
             controller: Default::default(),
             done: Arc::new(AtomicBool::new(false)),
+            id_counter: 0,
         }
     }
 
@@ -84,8 +86,12 @@ impl Server {
         result: io::Result<(TcpStream, SocketAddr)>,
     ) -> io::Result<()> {
         let (stream, address) = result?;
-        println!["New client connected with address {}", address];
-        let client = Connection::new(stream.try_clone()?, address);
+
+        let client_id = self.id_counter;
+        self.id_counter +=1;
+        println!["New client connected with id {}", client_id];
+
+        let client = Connection::new(client_id, stream.try_clone()?, address);
         self.connections.insert(stream.as_raw_fd(), client);
 
         let buf = Box::new([0u8; BUFFER_SIZE]);
@@ -149,10 +155,13 @@ impl Server {
             let response = match command {
                 Ok(command) => {
                     println!("Received command: {}", command);
-                    let response = self.controller.handle_command(command);
-                    println!("Sending response {response}");
+                    if let Some(response) = self.controller.handle_command(connection.id, command) {
+                        println!("Sending response {response}");
 
-                    response.to_bytes()
+                        response.to_bytes()
+                    } else {
+                        Default::default()
+                    }
                 }
                 Err(err) => {
                     eprintln!("Received faulty command: {:?}", err);
@@ -174,20 +183,20 @@ impl Server {
 }
 
 struct Connection {
+    id: u64,
     remaining_out: Vec<u8>,
     to_send: usize,
     command_parser: Parser,
-    address: SocketAddr,
     stream: TcpStream,
 }
 
 impl Connection {
-    fn new(stream: TcpStream, address: SocketAddr) -> Self {
+    fn new(id: u64, stream: TcpStream, address: SocketAddr) -> Self {
         Self {
+            id,
             remaining_out: Default::default(),
             to_send: 0,
             command_parser: Default::default(),
-            address,
             stream,
         }
     }
@@ -327,7 +336,7 @@ mod test {
                 get: true,
                 expire_rule: None,
             },
-            Command::Get(Cow::Borrowed("Key2"))
+            Command::Get(Cow::Borrowed("Key2")),
         ];
         let mut response = client.send_batch(cmd_batch)?;
         assert_eq!(7, response.len());
@@ -337,7 +346,10 @@ mod test {
         assert_eq!(Value::BulkString(String::from("Value2")), response[3]);
         assert_eq!(Value::Null, response[4]);
         assert_eq!(Value::BulkString(String::from("Value2")), response[5]);
-        assert_eq!(Value::BulkString(String::from("Value2 updated")), response[6]);
+        assert_eq!(
+            Value::BulkString(String::from("Value2 updated")),
+            response[6]
+        );
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();
