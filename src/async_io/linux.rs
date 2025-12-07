@@ -33,25 +33,27 @@ impl From<&io_uring_cqe> for Completion {
                     Err(err) => Completion::Accept(listener, Err(err)),
                 }
             }
-            Task::Receive(socket, received) => {
+            Task::Receive(socket, received, id) => {
                 if cqe.res < 0 {
                     return Completion::Receive(
                         socket,
                         received,
                         Err(io::Error::from_raw_os_error(-cqe.res)),
+                        id
                     );
                 }
-                Completion::Receive(socket, received, Ok(cqe.res as _))
+                Completion::Receive(socket, received, Ok(cqe.res as _), id)
             }
-            Task::Send(socket, sent) => {
+            Task::Send(socket, sent, id) => {
                 if cqe.res < 0 {
                     return Completion::Send(
                         socket,
                         sent,
                         Err(io::Error::from_raw_os_error(-cqe.res)),
+                        id
                     );
                 }
-                Completion::Send(socket, sent, Ok(cqe.res as _))
+                Completion::Send(socket, sent, Ok(cqe.res as _), id)
             }
         }
     }
@@ -59,8 +61,8 @@ impl From<&io_uring_cqe> for Completion {
 
 enum Task {
     Accept(TcpListener),
-    Send(TcpStream, Box<[u8]>),
-    Receive(TcpStream, Box<[u8]>),
+    Send(TcpStream, Box<[u8]>, u64),
+    Receive(TcpStream, Box<[u8]>, u64),
 }
 
 pub struct IO {
@@ -143,17 +145,17 @@ impl AsyncIO for IO {
         }
     }
 
-    fn receive(&mut self, socket: TcpStream, mut buffer: Box<[u8]>) {
+    fn receive(&mut self, socket: TcpStream, mut buffer: Box<[u8]>, id: u64) {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            self.pending.push_back(Task::Receive(socket, buffer));
+            self.pending.push_back(Task::Receive(socket, buffer, id));
             return;
         }
 
         let fd = socket.as_raw_fd();
         let buf_ptr = buffer.as_mut_ptr();
         let buf_len = buffer.len();
-        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer)));
+        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer, id)));
 
         unsafe {
             io_uring_prep_recv(sqe, fd, buf_ptr as _, buf_len, 0);
@@ -161,17 +163,17 @@ impl AsyncIO for IO {
         }
     }
 
-    fn send(&mut self, socket: TcpStream, buffer: Box<[u8]>, len: usize) {
+    fn send(&mut self, socket: TcpStream, buffer: Box<[u8]>, len: usize, id: u64) {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            self.pending.push_back(Task::Send(socket, buffer));
+            self.pending.push_back(Task::Send(socket, buffer, id));
             return;
         }
 
         let fd = socket.as_raw_fd();
         let mut buffer = buffer;
         let buf_ptr = buffer.as_mut_ptr();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer)));
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, id)));
 
         unsafe {
             io_uring_prep_send(sqe, fd, buf_ptr as _, len, 0);
@@ -263,10 +265,10 @@ mod test {
         eprintln!("Client connected");
 
         let buf = Box::new([0u8; 1024]);
-        io.receive(socket, buf);
+        io.receive(socket, buf,1);
         results = io.flush(Duration::from_secs(1))?;
-        let (socket, buf, len) = match results.remove(0) {
-            Completion::Receive(socket, buf, len) => (socket, buf, len?),
+        let (socket, buf, len, id) = match results.remove(0) {
+            Completion::Receive(socket, buf, len, id) => (socket, buf, len?, id),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Received {len} bytes from client");
@@ -275,10 +277,10 @@ mod test {
 
         let mut buf = Box::new([0u8; 1024]);
         buf[..5].copy_from_slice(b"hello");
-        io.send(socket, buf, 5);
+        io.send(socket, buf, 5, id);
         results = io.flush(Duration::from_secs(1))?;
-        let (socket, buf, len) = match results.remove(0) {
-            Completion::Send(socket, buf, len) => (socket, buf, len?),
+        let (socket, buf, len, id) = match results.remove(0) {
+            Completion::Send(socket, buf, len, id) => (socket, buf, len?, id),
             _ => return Err("Should be accept".into()),
         };
         eprintln!("Sent {} bytes to client", len);

@@ -18,13 +18,13 @@ impl From<Task> for Completion {
                 let result = socket.accept();
                 Completion::Accept(socket, result)
             }
-            Task::Receive(mut socket, mut buf) => {
+            Task::Receive(mut socket, mut buf, id) => {
                 let n = socket.read(buf.as_mut());
-                Completion::Receive(socket, buf, n)
+                Completion::Receive(socket, buf, n, id)
             }
-            Task::Send(mut socket, mut buf, len) => {
+            Task::Send(mut socket, mut buf, len,id) => {
                 let n = socket.write(&mut buf[..len]);
-                Completion::Send(socket, buf, n)
+                Completion::Send(socket, buf, n, id)
             }
         }
     }
@@ -32,8 +32,8 @@ impl From<Task> for Completion {
 
 enum Task {
     Accept(TcpListener),
-    Receive(TcpStream, Box<[u8]>),
-    Send(TcpStream, Box<[u8]>, usize),
+    Receive(TcpStream, Box<[u8]>, u64),
+    Send(TcpStream, Box<[u8]>, usize, u64),
 }
 
 pub struct IO {
@@ -111,9 +111,9 @@ impl AsyncIO for IO {
         self.pending.push_back(event);
     }
 
-    fn receive(&mut self, socket: TcpStream, buf: Box<[u8]>) {
+    fn receive(&mut self, socket: TcpStream, buf: Box<[u8]>, id: u64) {
         let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buf)));
+        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buf, id)));
 
         let event = kevent {
             ident: fd as usize,
@@ -127,9 +127,9 @@ impl AsyncIO for IO {
         self.pending.push_back(event);
     }
 
-    fn send(&mut self, socket: TcpStream, buf: Box<[u8]>, len: usize) {
+    fn send(&mut self, socket: TcpStream, buf: Box<[u8]>, len: usize, id: u64) {
         let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buf, len)));
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buf, len, id)));
 
         let event = kevent {
             ident: fd as usize,
@@ -239,25 +239,25 @@ mod tests {
         eprintln!("Client connected");
 
         let buf = Box::new([0u8; 1024]);
-        io.receive(socket.try_clone().unwrap(), buf);
+        io.receive(socket.try_clone().unwrap(), buf, id);
         results = io.poll_timeout(Duration::from_secs(1))?;
-        let (buf, len) = match results.remove(0) {
-            Completion::Receive(_, buf, len) => (buf, len?),
+        let (buf, len, id) = match results.remove(0) {
+            Completion::Receive(_, buf, len, id) => (buf, len?, id),
             _ => return Err("Should be accept".into()),
         };
-        eprintln!("Received {len} bytes from client");
+        eprintln!("Received {len} bytes from client {id}");
         assert_eq!(5, len);
         assert_eq!(b"hello", buf[..5].iter().as_slice());
 
         let mut buf = Box::new([0u8; 1024]);
         buf[..5].copy_from_slice(b"hello");
-        io.send(socket.try_clone().unwrap(), buf, 5);
+        io.send(socket.try_clone().unwrap(), buf, 5, id);
         results = io.poll_timeout(Duration::from_secs(1))?;
-        let (_, len) = match results.remove(0) {
-            Completion::Send(_, buf, len) => (buf, len?),
+        let (_, len, id) = match results.remove(0) {
+            Completion::Send(_, buf, len, id) => (buf, len?, id),
             _ => return Err("Should be accept".into()),
         };
-        eprintln!("Sent {} bytes to client", len);
+        eprintln!("Sent {} bytes to client {}", len, id);
 
         handler.join().unwrap();
 

@@ -18,7 +18,7 @@ const BUFFER_SIZE: usize = 4096;
 
 pub struct Server {
     address: SocketAddr,
-    connections: HashMap<RawFd, Connection>,
+    connections: HashMap<u64, Connection>,
     controller: Controller,
     done: Arc<AtomicBool>,
     id_counter: u64,
@@ -49,17 +49,17 @@ impl Server {
                         self.handle_accept(io, result)?;
                         io.accept(listener);
                     }
-                    Completion::Send(stream, buf, result) => match result {
-                        Ok(sent) => self.handle_send(io, stream, buf, sent),
+                    Completion::Send(stream, buf, result, client_id) => match result {
+                        Ok(sent) => self.handle_send(io, stream, buf, sent,client_id),
                         Err(err) => {
-                            self.connections.remove(&stream.as_raw_fd());
+                            self.connections.remove(&client_id);
                             println!("Closed connection {stream:?}: {err}");
                         }
                     },
-                    Completion::Receive(stream, buf, result) => match result {
-                        Ok(received) => self.handle_receive(io, stream, buf, received),
+                    Completion::Receive(stream, buf, result,client_id) => match result {
+                        Ok(received) => self.handle_receive(io, stream, buf, received, client_id),
                         Err(err) => {
-                            self.connections.remove(&stream.as_raw_fd());
+                            self.connections.remove(&client_id);
                             println!("Closed connection {stream:?} IO error: {err}");
                         }
                     },
@@ -95,9 +95,9 @@ impl Server {
         let buffer_out = Box::new([0u8; BUFFER_SIZE]);
 
         let client = Connection::new(client_id, None, Some(buffer_out));
-        self.connections.insert(stream.as_raw_fd(), client);
+        self.connections.insert(client_id, client);
 
-        io.receive(stream, buffer_in);
+        io.receive(stream, buffer_in, client_id);
         Ok(())
     }
 
@@ -107,8 +107,9 @@ impl Server {
         stream: TcpStream,
         buffer_out: Box<[u8]>,
         sent: usize,
+        client_id: u64
     ) {
-        let connection = self.connections.get_mut(&stream.as_raw_fd()).expect(
+        let connection = self.connections.get_mut(&client_id).expect(
             format![
                 "Send data to unknown socket with file descriptor: {}",
                 stream.as_raw_fd()
@@ -125,12 +126,12 @@ impl Server {
         if connection.buffer_out_len > 0
             && let Some(buffer_out) = connection.buffer_out.take()
         {
-            io.send(stream, buffer_out, connection.buffer_out_len);
+            io.send(stream, buffer_out, connection.buffer_out_len, client_id);
             return;
         }
 
         if let Some(buffer_in) = connection.buffer_in.take() {
-            io.receive(stream, buffer_in);
+            io.receive(stream, buffer_in, client_id);
         }
     }
 
@@ -140,8 +141,9 @@ impl Server {
         stream: TcpStream,
         buffer_in: Box<[u8]>,
         received: usize,
+        client_id: u64,
     ) {
-        let connection = self.connections.get_mut(&stream.as_raw_fd()).expect(
+        let connection = self.connections.get_mut(&client_id).expect(
             format![
                 "Received data from unknown socket with file descriptor: {}",
                 stream.as_raw_fd()
@@ -150,7 +152,7 @@ impl Server {
         );
 
         if received == 0 {
-            self.connections.remove(&stream.as_raw_fd());
+            self.connections.remove(&client_id);
             println!("Closed connection {stream:?}");
             return;
         }
@@ -182,12 +184,12 @@ impl Server {
         if connection.buffer_out_len > 0
             && let Some(buffer_out) = connection.buffer_out.take()
         {
-            io.send(stream, buffer_out, connection.buffer_out_len);
+            io.send(stream, buffer_out, connection.buffer_out_len, client_id);
             return;
         }
 
         if let Some(buffer_in) = connection.buffer_in.take() {
-            io.receive(stream, buffer_in);
+            io.receive(stream, buffer_in, client_id);
         }
     }
 }
