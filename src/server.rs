@@ -88,14 +88,16 @@ impl Server {
         let (stream, address) = result?;
 
         let client_id = self.id_counter;
-        self.id_counter +=1;
+        self.id_counter += 1;
         println!["New client connected with id {}", client_id];
 
-        let client = Connection::new(client_id, stream.try_clone()?, address);
+        let buffer_in = Box::new([0u8; BUFFER_SIZE]);
+        let buffer_out = Box::new([0u8; BUFFER_SIZE]);
+
+        let client = Connection::new(client_id, None, Some(buffer_out));
         self.connections.insert(stream.as_raw_fd(), client);
 
-        let buf = Box::new([0u8; BUFFER_SIZE]);
-        io.receive(stream, buf);
+        io.receive(stream, buffer_in);
         Ok(())
     }
 
@@ -103,7 +105,7 @@ impl Server {
         &mut self,
         io: &mut impl AsyncIO,
         stream: TcpStream,
-        mut buf: Box<[u8]>,
+        buffer_out: Box<[u8]>,
         sent: usize,
     ) {
         let connection = self.connections.get_mut(&stream.as_raw_fd()).expect(
@@ -114,23 +116,29 @@ impl Server {
             .as_str(),
         );
 
-        connection.handle_sent(sent, &mut buf);
         println!(
             "Sent {} bytes to client, remaining bytes {}",
-            sent, connection.to_send
+            sent, connection.buffer_out_len
         );
-        if connection.to_send > 0 {
-            io.send(stream, buf, connection.to_send);
+
+        connection.handle_sent(sent, buffer_out);
+        if connection.buffer_out_len > 0
+            && let Some(buffer_out) = connection.buffer_out.take()
+        {
+            io.send(stream, buffer_out, connection.buffer_out_len);
             return;
         }
-        io.receive(stream, buf);
+
+        if let Some(buffer_in) = connection.buffer_in.take() {
+            io.receive(stream, buffer_in);
+        }
     }
 
     fn handle_receive(
         &mut self,
         io: &mut impl AsyncIO,
         stream: TcpStream,
-        mut buffer: Box<[u8]>,
+        buffer_in: Box<[u8]>,
         received: usize,
     ) {
         let connection = self.connections.get_mut(&stream.as_raw_fd()).expect(
@@ -149,8 +157,7 @@ impl Server {
 
         println!("Received {} bytes from client", received);
 
-        let commands = connection.command_parser.parse_all(&buffer[..received]);
-        let mut serialized_response = Vec::new();
+        let commands = connection.command_parser.parse_all(&buffer_in[..received]);
         for command in commands {
             let response = match command {
                 Ok(command) => {
@@ -164,66 +171,81 @@ impl Server {
                     }
                 }
                 Err(err) => {
-                    eprintln!("Received faulty command: {:?}", err);
+                    println!("Received faulty command: {:?}", err);
                     Value::SimpleError(err.to_string()).to_bytes()
                 }
             };
-            serialized_response.extend(response);
+            connection.fill_buffer_out(response);
         }
-        connection.handle_sending_response(serialized_response, &mut buffer);
+        connection.buffer_in = Some(buffer_in);
 
-        if connection.to_send > 0 {
-            io.send(stream, buffer, connection.to_send);
+        if connection.buffer_out_len > 0
+            && let Some(buffer_out) = connection.buffer_out.take()
+        {
+            io.send(stream, buffer_out, connection.buffer_out_len);
             return;
         }
 
-        println!("Received not enough bytes to handle message, receiving more bytes");
-        io.receive(stream, buffer);
+        if let Some(buffer_in) = connection.buffer_in.take() {
+            io.receive(stream, buffer_in);
+        }
     }
 }
 
 struct Connection {
     id: u64,
     remaining_out: Vec<u8>,
-    to_send: usize,
+    buffer_out_len: usize,
     command_parser: Parser,
-    stream: TcpStream,
+    buffer_in: Option<Box<[u8]>>,
+    buffer_out: Option<Box<[u8]>>,
 }
 
 impl Connection {
-    fn new(id: u64, stream: TcpStream, address: SocketAddr) -> Self {
+    fn new(id: u64, buffer_in: Option<Box<[u8]>>, buffer_out: Option<Box<[u8]>>) -> Self {
         Self {
             id,
             remaining_out: Default::default(),
-            to_send: 0,
+            buffer_out_len: 0,
             command_parser: Default::default(),
-            stream,
+            buffer_in,
+            buffer_out,
         }
     }
 
-    fn handle_sent(&mut self, sent: usize, buffer: &mut [u8]) {
-        if self.to_send > 0 {
-            buffer.copy_within(sent..self.to_send, 0);
-            self.to_send -= sent;
+    fn handle_sent(&mut self, sent: usize, mut buffer_out: Box<[u8]>) {
+        if self.buffer_out_len > 0 {
+            buffer_out.copy_within(sent..self.buffer_out_len, 0);
+            self.buffer_out_len -= sent;
         }
 
-        if !self.remaining_out.is_empty() && self.to_send < buffer.len() {
-            let to_copy = min(buffer.len() - self.to_send, self.remaining_out.len());
-            let copy_range = self.to_send..(self.to_send + to_copy);
+        if !self.remaining_out.is_empty() && self.buffer_out_len < buffer_out.len() {
+            let to_copy = min(
+                buffer_out.len() - self.buffer_out_len,
+                self.remaining_out.len(),
+            );
+            let copy_range = self.buffer_out_len..(self.buffer_out_len + to_copy);
 
-            buffer[copy_range].copy_from_slice(self.remaining_out.drain(..to_copy).as_slice());
+            buffer_out[copy_range].copy_from_slice(self.remaining_out.drain(..to_copy).as_slice());
 
-            self.to_send += to_copy;
+            self.buffer_out_len += to_copy;
         }
+
+        self.buffer_out = Some(buffer_out);
     }
 
-    fn handle_sending_response(&mut self, mut response: Vec<u8>, buffer: &mut [u8]) {
-        let to_send = min(buffer.len() - self.to_send, response.len());
+    fn fill_buffer_out(&mut self, mut response: Vec<u8>) {
+        match &mut self.buffer_out {
+            Some(buffer) => {
+                let to_send = min(buffer.len() - self.buffer_out_len, response.len());
 
-        buffer[self.to_send..self.to_send + to_send]
-            .copy_from_slice(response.drain(..to_send).as_slice());
-        self.remaining_out.extend_from_slice(response.as_slice());
-        self.to_send += to_send;
+                buffer[self.buffer_out_len..self.buffer_out_len + to_send]
+                    .copy_from_slice(response.drain(..to_send).as_slice());
+                self.remaining_out.extend_from_slice(response.as_slice());
+                self.buffer_out_len += to_send;
+            }
+            None => self.remaining_out.extend_from_slice(response.as_slice()),
+        }
     }
 }
 
