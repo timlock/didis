@@ -115,6 +115,8 @@ pub enum Value {
     Null,
 }
 
+
+
 impl Value {
     pub fn ok() -> Value {
         Value::SimpleString("OK".to_string())
@@ -177,9 +179,7 @@ impl Value {
             Value::Array(value) => {
                 Reference::Array(value.iter().map(Value::as_reference).collect())
             }
-            Value::Push(value) => {
-                Reference::Push(value.iter().map(Value::as_reference).collect())
-            }
+            Value::Push(value) => Reference::Push(value.iter().map(Value::as_reference).collect()),
             Value::Null => Reference::Null,
         }
     }
@@ -221,7 +221,6 @@ impl Display for Value {
         }
     }
 }
-
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Reference<'a> {
@@ -342,7 +341,6 @@ impl<'a> Display for Reference<'a> {
         }
     }
 }
-
 
 pub enum ParsedValue<'a, C, I> {
     Complete(C, &'a [u8]),
@@ -595,7 +593,6 @@ impl<'a> ArrayParserNonNullable {
                 None => return Ok(None),
             };
         }
-
 
         if let Some(length) = self.length {
             while self.items.len() < length as usize {

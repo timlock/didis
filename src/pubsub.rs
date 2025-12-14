@@ -1,3 +1,5 @@
+use crate::parser::resp;
+use crate::parser::resp::{ValOrRef, Value};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
@@ -50,10 +52,68 @@ impl ChannelStore {
         }
     }
 
-    pub fn subscribers(&self, channel: &str) -> impl Iterator<Item = &u64> {
+    pub fn subscribers(&self, channel: &str) -> impl Iterator<Item = u64> {
         match self.channels.get(channel) {
-            Some(subscribers) => subscribers.iter(),
+            Some(subscribers) => subscribers.iter().cloned(),
             None => Default::default(),
+        }
+    }
+}
+
+pub struct Message {
+    pub receivers: Vec<u64>,
+    pub value: Value,
+}
+
+impl Message {
+    pub fn subscribe(
+        receivers: impl IntoIterator<Item = u64>,
+        channel: String,
+        channel_count: i64,
+    ) -> Message {
+        let value = Value::Push(vec![
+            Value::BulkString(String::from("subscribe")),
+            Value::BulkString(channel),
+            Value::Integer(channel_count),
+        ]);
+
+        Message {
+            receivers: receivers.into_iter().collect(),
+            value,
+        }
+    }
+
+    pub fn unsubscribe(
+        receivers: impl IntoIterator<Item = u64>,
+        channel: String,
+        channel_count: i64,
+    ) -> Message {
+        let value = Value::Push(vec![
+            Value::BulkString(String::from("unsubscribe")),
+            Value::BulkString(channel),
+            Value::Integer(channel_count),
+        ]);
+
+        Message {
+            receivers: receivers.into_iter().collect(),
+            value,
+        }
+    }
+
+    pub fn publish(
+        receivers: impl IntoIterator<Item = u64>,
+        channel: String,
+        payload: String,
+    ) -> Message {
+        let value = Value::Push(vec![
+            Value::BulkString(String::from("message")),
+            Value::BulkString(channel),
+            Value::BulkString(payload),
+        ]);
+
+        Message {
+            receivers: receivers.into_iter().collect(),
+            value,
         }
     }
 }

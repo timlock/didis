@@ -8,6 +8,7 @@ use std::time::Instant;
 pub struct Client {
     tcp_stream: TcpStream,
     resp_parser: resp::Parser,
+    published: Vec<Value>,
 }
 
 impl Client {
@@ -15,6 +16,7 @@ impl Client {
         Self {
             tcp_stream,
             resp_parser: resp::Parser::default(),
+            published: Vec::new(),
         }
     }
 
@@ -36,7 +38,9 @@ impl Client {
             }
         }
 
-        let (response, _) = self.resp_parser.parse(bytes.as_slice())?.ok_or(resp::Error::LengthMismatch)?;
+        let values = self.resp_parser.parse_all(bytes.as_slice())?;
+        let mut values = self.extract_published(values);
+        let response = values.pop().unwrap_or(Value::Null); // subscribe and unsubscribe get no response
 
         println!(
             "Received response from server  bytes duration={:?} {}",
@@ -47,11 +51,7 @@ impl Client {
         Ok(response)
     }
 
-    pub fn send_batch(
-        &mut self,
-        commands: Vec<Command>,
-    ) -> Result<Vec<Value>, resp::Error> {
-
+    pub fn send_batch(&mut self, commands: Vec<Command>) -> Result<Vec<Value>, resp::Error> {
         println!("Sending command batch to server {:?}", commands);
         let mut bytes: Vec<u8> = commands.into_iter().flat_map(Vec::from).collect();
 
@@ -70,6 +70,7 @@ impl Client {
         }
 
         let values = self.resp_parser.parse_all(bytes.as_slice())?;
+        let values = self.extract_published(values);
 
         println!(
             "Received response batch of size {} from server duration={:?} {:?}",
@@ -79,5 +80,22 @@ impl Client {
         );
 
         Ok(values)
+    }
+
+    fn extract_published(&mut self, values: Vec<Value>) -> Vec<Value> {
+        values
+            .into_iter()
+            .filter_map(|value| match &value {
+                Value::Push(_) => {
+                    self.published.push(value);
+                    None
+                }
+                _ => Some(value),
+            })
+            .collect()
+    }
+
+    pub fn published(&mut self) -> Vec<Value> {
+        self.published.drain(..).collect()
     }
 }

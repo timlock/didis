@@ -1,13 +1,16 @@
 use crate::dictionary::Dictionary;
 use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
-use crate::pubsub::ChannelStore;
+use crate::pubsub::{ChannelStore, Message};
+use std::collections::VecDeque;
 
 #[derive(Default)]
 pub struct Controller {
     dictionary: Dictionary,
     channel_store: ChannelStore,
+    messages: VecDeque<Message>,
 }
+
 
 impl Controller {
     pub fn handle_command(&mut self, client_id: u64, command: Command) -> Option<ValOrRef> {
@@ -68,27 +71,59 @@ impl Controller {
             }
             Command::Subscribe(channels) => {
                 for channel in channels {
-                    let subscribed_channels = self
-                        .channel_store
-                        .subscribe(client_id, channel.into_owned());
-                    //TODO publish message
+                    let channel = channel.into_owned();
+                    let subscribed_channels =
+                        self.channel_store.subscribe(client_id, channel.clone());
+
+                    let subscribers: Vec<u64> =
+                        self.channel_store.subscribers(channel.as_ref()).collect();
+
+                    let message =
+                        Message::subscribe(subscribers, channel, subscribed_channels as i64);
+                    self.messages.push_back(message);
                 }
                 return None;
             }
             Command::Unsubscribe(channels) => {
                 for channel in channels {
+                    let subscribers: Vec<u64> =
+                        self.channel_store.subscribers(channel.as_ref()).collect();
+
                     let subscribed_channels =
                         self.channel_store.unsubscribe(client_id, channel.as_ref());
-                    //TODO publish message
+
+                    let message = Message::unsubscribe(
+                        subscribers,
+                        channel.into_owned(),
+                        subscribed_channels as i64,
+                    );
+                    self.messages.push_back(message);
                 }
                 return None;
             }
             Command::Publish { channel, message } => {
-                let subscribers = self.channel_store.subscribers(channel.as_ref());
-                //TODO publish message
-                Value::Integer(subscribers.size_hint().0 as i64).into()
+                let subscribers: Vec<u64> =
+                    self.channel_store.subscribers(channel.as_ref()).collect();
+                let subscribers_len = subscribers.len() as i64;
+
+                let message =
+                    Message::publish(subscribers, channel.into_owned(), message.into_owned());
+                self.messages.push_back(message);
+
+                Value::Integer(subscribers_len).into()
             }
         };
         Some(result)
+    }
+
+    pub fn remove_client(&mut self, client_id: &u64) {
+        self.channel_store.remove_client(*client_id);
+    }
+
+    pub fn has_messages(&self) -> bool{
+        !self.messages.is_empty()
+    }
+    pub fn messages(&mut self) -> Vec<Message>{
+        self.messages.drain(..).collect()
     }
 }

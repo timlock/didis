@@ -50,20 +50,30 @@ impl Server {
                         io.accept(listener);
                     }
                     Completion::Send(stream, buf, result, client_id) => match result {
-                        Ok(sent) => self.handle_send(io, stream, buf, sent,client_id),
+                        Ok(sent) => self.handle_send(stream, buf, sent, client_id),
                         Err(err) => {
                             self.connections.remove(&client_id);
+                            self.controller.remove_client(&client_id);
                             println!("Closed connection {stream:?}: {err}");
                         }
                     },
-                    Completion::Receive(stream, buf, result,client_id) => match result {
-                        Ok(received) => self.handle_receive(io, stream, buf, received, client_id),
+                    Completion::Receive(stream, buf, result, client_id) => match result {
+                        Ok(received) => self.handle_receive(stream, buf, received, client_id)?,
                         Err(err) => {
                             self.connections.remove(&client_id);
+                            self.controller.remove_client(&client_id);
                             println!("Closed connection {stream:?} IO error: {err}");
                         }
                     },
                 }
+            }
+
+            if self.controller.has_messages() {
+                self.publish_messages(io)?;
+            }
+
+            for (_, connection) in &mut self.connections {
+                connection.flush(io)?;
             }
 
             if self.done.load(Ordering::SeqCst) {
@@ -94,7 +104,7 @@ impl Server {
         let buffer_in = Box::new([0u8; BUFFER_SIZE]);
         let buffer_out = Box::new([0u8; BUFFER_SIZE]);
 
-        let client = Connection::new(client_id, None, Some(buffer_out));
+        let client = Connection::new(client_id, stream.try_clone()?, None, Some(buffer_out));
         self.connections.insert(client_id, client);
 
         io.receive(stream, buffer_in, client_id);
@@ -103,11 +113,10 @@ impl Server {
 
     fn handle_send(
         &mut self,
-        io: &mut impl AsyncIO,
         stream: TcpStream,
         buffer_out: Box<[u8]>,
         sent: usize,
-        client_id: u64
+        client_id: u64,
     ) {
         let connection = self.connections.get_mut(&client_id).expect(
             format![
@@ -123,26 +132,15 @@ impl Server {
         );
 
         connection.handle_sent(sent, buffer_out);
-        if connection.buffer_out_len > 0
-            && let Some(buffer_out) = connection.buffer_out.take()
-        {
-            io.send(stream, buffer_out, connection.buffer_out_len, client_id);
-            return;
-        }
-
-        if let Some(buffer_in) = connection.buffer_in.take() {
-            io.receive(stream, buffer_in, client_id);
-        }
     }
 
     fn handle_receive(
         &mut self,
-        io: &mut impl AsyncIO,
         stream: TcpStream,
         buffer_in: Box<[u8]>,
         received: usize,
         client_id: u64,
-    ) {
+    ) -> io::Result<()> {
         let connection = self.connections.get_mut(&client_id).expect(
             format![
                 "Received data from unknown socket with file descriptor: {}",
@@ -153,8 +151,9 @@ impl Server {
 
         if received == 0 {
             self.connections.remove(&client_id);
+            self.controller.remove_client(&client_id);
             println!("Closed connection {stream:?}");
-            return;
+            return Ok(());
         }
 
         println!("Received {} bytes from client", received);
@@ -177,20 +176,26 @@ impl Server {
                     Value::SimpleError(err.to_string()).to_bytes()
                 }
             };
-            connection.fill_buffer_out(response);
+            connection.send(response);
         }
         connection.buffer_in = Some(buffer_in);
 
-        if connection.buffer_out_len > 0
-            && let Some(buffer_out) = connection.buffer_out.take()
-        {
-            io.send(stream, buffer_out, connection.buffer_out_len, client_id);
-            return;
+        Ok(())
+    }
+
+    fn publish_messages(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
+        let messages = self.controller.messages();
+        for message in messages {
+            let bytes = message.value.to_bytes();
+
+            for receiver_id in &message.receivers {
+                if let Some(connection) = self.connections.get_mut(receiver_id) {
+                    connection.send(bytes.clone());
+                }
+            }
         }
 
-        if let Some(buffer_in) = connection.buffer_in.take() {
-            io.receive(stream, buffer_in, client_id);
-        }
+        Ok(())
     }
 }
 
@@ -201,12 +206,19 @@ struct Connection {
     command_parser: Parser,
     buffer_in: Option<Box<[u8]>>,
     buffer_out: Option<Box<[u8]>>,
+    tcp_stream: TcpStream,
 }
 
 impl Connection {
-    fn new(id: u64, buffer_in: Option<Box<[u8]>>, buffer_out: Option<Box<[u8]>>) -> Self {
+    fn new(
+        id: u64,
+        tcp_stream: TcpStream,
+        buffer_in: Option<Box<[u8]>>,
+        buffer_out: Option<Box<[u8]>>,
+    ) -> Self {
         Self {
             id,
+            tcp_stream,
             remaining_out: Default::default(),
             buffer_out_len: 0,
             command_parser: Default::default(),
@@ -236,7 +248,7 @@ impl Connection {
         self.buffer_out = Some(buffer_out);
     }
 
-    fn fill_buffer_out(&mut self, mut response: Vec<u8>) {
+    fn send(&mut self, mut response: Vec<u8>) {
         match &mut self.buffer_out {
             Some(buffer) => {
                 let to_send = min(buffer.len() - self.buffer_out_len, response.len());
@@ -248,6 +260,24 @@ impl Connection {
             }
             None => self.remaining_out.extend_from_slice(response.as_slice()),
         }
+    }
+
+    fn flush(&mut self, io: &mut dyn AsyncIO) -> io::Result<()> {
+        if self.buffer_out_len > 0
+            && let Some(buffer_out) = self.buffer_out.take()
+        {
+            io.send(
+                self.tcp_stream.try_clone()?,
+                buffer_out,
+                self.buffer_out_len,
+                self.id,
+            );
+        } else if self.buffer_out_len == 0
+            && let Some(buffer_in) = self.buffer_in.take()
+        {
+            io.receive(self.tcp_stream.try_clone()?, buffer_in, self.id);
+        }
+        Ok(())
     }
 }
 
@@ -414,6 +444,92 @@ mod test {
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd)?;
         assert_eq!(Value::BulkString(String::from(large_value)), response);
+
+        server_handle.store(true, Ordering::SeqCst);
+        thread_handle.join().unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
+        let address = SocketAddr::from_str("127.0.0.1:10004")?;
+
+        let (server_handle, thread_handle) = launch_server(address);
+
+        println!("Connecting to server on {}", address);
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+        let mut client = Client::new(stream);
+
+        let subscribe_cmd = Command::Subscribe(vec![
+            Cow::Owned(String::from("first")),
+            Cow::Owned(String::from("second")),
+        ]);
+        let response = client.send(subscribe_cmd)?;
+        assert_eq!(Value::Null, response);
+
+        let published = client.published();
+        assert_eq!(2, published.len());
+        assert_eq!(
+            Value::Push(vec![
+                Value::BulkString(String::from("subscribe")),
+                Value::BulkString(String::from("first")),
+                Value::Integer(1),
+            ]),
+            published[0]
+        );
+        assert_eq!(
+            Value::Push(vec![
+                Value::BulkString(String::from("subscribe")),
+                Value::BulkString(String::from("second")),
+                Value::Integer(2),
+            ]),
+            published[1]
+        );
+
+        let publish_cmd = Command::Publish {
+            channel: Cow::Owned(String::from("first")),
+            message: Cow::Owned(String::from("hello first")),
+        };
+        let response = client.send(publish_cmd)?;
+        assert_eq!(Value::Integer(1), response);
+
+        let published = client.published();
+        assert_eq!(1, published.len());
+        assert_eq!(
+            Value::Push(vec![
+                Value::BulkString(String::from("message")),
+                Value::BulkString(String::from("first")),
+                Value::BulkString(String::from("hello first")),
+            ]),
+            published[0]
+        );
+
+        let unsubscribe_cmd = Command::Unsubscribe(vec![
+            Cow::Owned(String::from("first")),
+            Cow::Owned(String::from("second")),
+        ]);
+        let response = client.send(unsubscribe_cmd)?;
+        assert_eq!(Value::Null, response);
+
+        let published = client.published();
+        assert_eq!(2, published.len());
+        assert_eq!(
+            Value::Push(vec![
+                Value::BulkString(String::from("unsubscribe")),
+                Value::BulkString(String::from("first")),
+                Value::Integer(1),
+            ]),
+            published[0]
+        );
+        assert_eq!(
+            Value::Push(vec![
+                Value::BulkString(String::from("unsubscribe")),
+                Value::BulkString(String::from("second")),
+                Value::Integer(0),
+            ]),
+            published[1]
+        );
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();

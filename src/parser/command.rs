@@ -2,7 +2,7 @@ use super::resp;
 use crate::parser::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::fmt::{self, write, Debug, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter, write};
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
@@ -281,6 +281,9 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             "CONFIG" => parse_config_get(&mut segment_iter)?,
             "CLIENT" => Command::Client,
             "EXISTS" => parse_exists(&mut segment_iter)?,
+            "SUBSCRIBE" => parse_subscribe(&mut segment_iter)?,
+            "UNSUBSCRIBE" => parse_unsubscribe(&mut segment_iter)?,
+            "PUBLISH" => parse_publish(&mut segment_iter)?,
             _ => return Err(Error::UnknownCommand(name.into_owned())),
         };
         if !segment_iter.is_empty() {
@@ -534,6 +537,33 @@ fn parse_exists<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, E
     }
 
     Ok(Command::Exists(keys))
+}
+
+fn parse_subscribe<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let channel = expect_string(queue)?;
+    let mut channels = vec![channel];
+    while let Some(channel) = try_string(queue)? {
+        channels.push(channel);
+    }
+
+    Ok(Command::Subscribe(channels))
+}
+
+fn parse_unsubscribe<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let channel = expect_string(queue)?;
+    let mut channels = vec![channel];
+    while let Some(channel) = try_string(queue)? {
+        channels.push(channel);
+    }
+
+    Ok(Command::Unsubscribe(channels))
+}
+
+fn parse_publish<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let channel = expect_string(queue)?;
+    let message = expect_string(queue)?;
+
+    Ok(Command::Publish { channel, message })
 }
 
 mod tests {
