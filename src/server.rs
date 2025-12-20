@@ -344,6 +344,14 @@ mod test {
         let response = client.send(get_cmd)?;
         assert_eq!(Value::BulkString(String::from("Value")), response);
 
+        let get_cmd = Command::Exists(vec![Cow::Owned(String::from("Key"))]);
+        let response = client.send(get_cmd)?;
+        assert_eq!(Value::Integer(1), response);
+
+        let get_cmd = Command::Delete(vec![Cow::Owned(String::from("Key"))]);
+        let response = client.send(get_cmd)?;
+        assert_eq!(Value::Integer(1), response);
+
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();
 
@@ -530,6 +538,50 @@ mod test {
             ]),
             published[1]
         );
+
+        server_handle.store(true, Ordering::SeqCst);
+        thread_handle.join().unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
+        let address = SocketAddr::from_str("127.0.0.1:10005")?;
+
+        let (server_handle, thread_handle) = launch_server(address);
+
+        println!("Connecting to server on {}", address);
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+        let mut client = Client::new(stream);
+
+        let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
+        let response = client.send(get_cmd)?;
+
+        assert_eq!(Value::Null, response);
+
+        let incr_cmd = Command::Increment(Cow::Borrowed("Key"));
+        let response = client.send(incr_cmd)?;
+        assert_eq!(Value::Integer(1), response);
+
+        let decr_cmd = Command::Decrement(Cow::Borrowed("Key"));
+        let response = client.send(decr_cmd)?;
+        assert_eq!(Value::Integer(0), response);
+
+        let set_cmd = Command::Set {
+            key: Cow::Owned("faulty".to_string()),
+            value: Cow::Owned("Value".to_string()),
+            overwrite_rule: None,
+            get: false,
+            expire_rule: None,
+        };
+        let response = client.send(set_cmd)?;
+        assert_eq!(Value::ok(), response);
+
+        let incr_faulty_key_cmd = Command::Increment(Cow::Borrowed("faulty"));
+        let response = client.send(incr_faulty_key_cmd)?;
+        assert_eq!(Value::SimpleError(String::from("value is not an integer or out of range")), response);
+
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();

@@ -1,6 +1,7 @@
 use crate::parser::command::{ExpireRule, OverwriteRule};
 use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, error, time::SystemTime};
+use std::num::ParseIntError;
 
 #[derive(Default)]
 pub struct Dictionary {
@@ -22,6 +23,43 @@ impl Dictionary {
             })
             .flatten()
     }
+
+    pub fn delete(&mut self, key: &str) -> Option<String> {
+        self.inner.remove(key).map(|entry| entry.value)
+    }
+
+    pub fn increment(&mut self, key: &str) -> Result<i64, ParseIntError> {
+        let entry = match self.inner.get_mut(key) {
+            Some(entry) => { entry }
+            None => {
+                self.inner.insert(key.to_string(), Entry::new(String::from("0"), None));
+                self.inner.get_mut(key).expect("map entry should be populated after an insert")
+            }
+        };
+
+        let mut value :i64 = entry.value.parse()?;
+        value += 1;
+        entry.value = value.to_string();
+
+        Ok(value)
+    }
+
+    pub fn decrement(&mut self, key: &str) -> Result<i64, ParseIntError> {
+        let entry = match self.inner.get_mut(key) {
+            Some(entry) => { entry }
+            None => {
+                self.inner.insert(key.to_string(), Entry::new(String::from("0"), None));
+                self.inner.get_mut(key).expect("map entry should be populated after an insert")
+            }
+        };
+
+        let mut value :i64 = entry.value.parse()?;
+        value -= 1;
+        entry.value = value.to_string();
+
+        Ok(value)
+    }
+
     pub fn set(
         &mut self,
         key: &str,
@@ -32,10 +70,10 @@ impl Dictionary {
     ) -> Result<Option<String>, Error> {
         match overwrite_rule {
             Some(OverwriteRule::NotExists) if self.inner.contains_key(key) => {
-                return Err(Error::OverrideConflict)
+                return Err(Error::OverrideConflict);
             }
             Some(OverwriteRule::Exists) if !self.inner.contains_key(key) => {
-                return Err(Error::OverrideConflict)
+                return Err(Error::OverrideConflict);
             }
             _ => {}
         };

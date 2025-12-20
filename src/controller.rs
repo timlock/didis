@@ -3,6 +3,7 @@ use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
 use crate::pubsub::{ChannelStore, Message};
 use std::collections::VecDeque;
+use std::num::ParseIntError;
 
 #[derive(Default)]
 pub struct Controller {
@@ -10,7 +11,6 @@ pub struct Controller {
     channel_store: ChannelStore,
     messages: VecDeque<Message>,
 }
-
 
 impl Controller {
     pub fn handle_command(&mut self, client_id: u64, command: Command) -> Option<ValOrRef> {
@@ -69,6 +69,28 @@ impl Controller {
 
                 Value::Integer(count).into()
             }
+            Command::Delete(keys) => {
+                let mut count = 0;
+                for key in keys {
+                    if self.dictionary.delete(&key).is_some() {
+                        count += 1;
+                    }
+                }
+
+                Value::Integer(count).into()
+            }
+            Command::Increment(key) => match self.dictionary.increment(key.as_ref()) {
+                Ok(value) => ValOrRef::Val(Value::Integer(value)),
+                Err(err) => ValOrRef::Val(Value::SimpleError(String::from(
+                    "value is not an integer or out of range",
+                ))),
+            },
+            Command::Decrement(key) => match self.dictionary.decrement(key.as_ref()) {
+                Ok(value) => ValOrRef::Val(Value::Integer(value)),
+                Err(err) => ValOrRef::Val(Value::SimpleError(String::from(
+                    "value is not an integer or out of range",
+                ))),
+            },
             Command::Subscribe(channels) => {
                 for channel in channels {
                     let channel = channel.into_owned();
@@ -120,10 +142,10 @@ impl Controller {
         self.channel_store.remove_client(*client_id);
     }
 
-    pub fn has_messages(&self) -> bool{
+    pub fn has_messages(&self) -> bool {
         !self.messages.is_empty()
     }
-    pub fn messages(&mut self) -> Vec<Message>{
+    pub fn messages(&mut self) -> Vec<Message> {
         self.messages.drain(..).collect()
     }
 }

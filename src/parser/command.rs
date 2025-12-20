@@ -92,6 +92,9 @@ pub enum Command<'a> {
     ConfigGet(Vec<Cow<'a, str>>),
     Client,
     Exists(Vec<Cow<'a, str>>),
+    Delete(Vec<Cow<'a, str>>),
+    Increment(Cow<'a, str>),
+    Decrement(Cow<'a, str>),
     Subscribe(Vec<Cow<'a, str>>),
     Unsubscribe(Vec<Cow<'a, str>>),
     Publish {
@@ -161,6 +164,22 @@ impl<'a> Command<'a> {
 
                 Value::Array(command_parts)
             }
+            Command::Delete(keys) => {
+                let mut command_parts = vec![Value::BulkString(String::from("DELETE"))];
+                for key in keys {
+                    command_parts.push(Value::BulkString(key.into_owned()));
+                }
+
+                Value::Array(command_parts)
+            }
+            Command::Increment(key) => Value::Array(vec![
+                Value::BulkString(String::from("INCR")),
+                Value::BulkString(key.into_owned()),
+            ]),
+            Command::Decrement(key) => Value::Array(vec![
+                Value::BulkString(String::from("DECR")),
+                Value::BulkString(key.into_owned()),
+            ]),
             Command::Subscribe(channels) => {
                 let mut command_parts = vec![Value::BulkString(String::from("SUBSCRIBE"))];
                 for channel in channels {
@@ -230,7 +249,16 @@ impl<'a> Display for Command<'a> {
                 write!(f, "CLIENT")
             }
             Command::Exists(keys) => {
-                write!(f, "KEYS {:?}", keys)
+                write!(f, "EXISTS {:?}", keys)
+            }
+            Command::Delete(keys) => {
+                write!(f, "DELETE {:?}", keys)
+            }
+            Command::Increment(key) => {
+                write!(f, "INCR {:?}", key)
+            }
+            Command::Decrement(key) => {
+                write!(f, "DECR {:?}", key)
             }
             Command::Subscribe(channels) => {
                 write!(f, "SUBSCRIBE {:?}", channels)
@@ -281,6 +309,9 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             "CONFIG" => parse_config_get(&mut segment_iter)?,
             "CLIENT" => Command::Client,
             "EXISTS" => parse_exists(&mut segment_iter)?,
+            "DELETE" => parse_delete(&mut segment_iter)?,
+            "INCR" => parse_increment(&mut segment_iter)?,
+            "DECR" => parse_decrement(&mut segment_iter)?,
             "SUBSCRIBE" => parse_subscribe(&mut segment_iter)?,
             "UNSUBSCRIBE" => parse_unsubscribe(&mut segment_iter)?,
             "PUBLISH" => parse_publish(&mut segment_iter)?,
@@ -537,6 +568,26 @@ fn parse_exists<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, E
     }
 
     Ok(Command::Exists(keys))
+}
+
+fn parse_delete<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let mut keys = vec![key];
+    while let Some(key) = try_string(queue)? {
+        keys.push(key);
+    }
+
+    Ok(Command::Delete(keys))
+}
+
+fn parse_increment<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    Ok(Command::Increment(key))
+}
+
+fn parse_decrement<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    Ok(Command::Decrement(key))
 }
 
 fn parse_subscribe<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
