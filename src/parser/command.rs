@@ -2,7 +2,7 @@ use super::resp;
 use crate::parser::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::fmt::{self, Debug, Display, Formatter, write};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
@@ -97,6 +97,9 @@ pub enum Command<'a> {
     IncrementBy(Cow<'a, str>, i64),
     Decrement(Cow<'a, str>),
     DecrementBy(Cow<'a, str>, i64),
+    LeftPush(Cow<'a, str>, Vec<Cow<'a, str>>),
+    RightPush(Cow<'a, str>, Vec<Cow<'a, str>>),
+    ListRange(Cow<'a, str>, i64, i64),
     Subscribe(Vec<Cow<'a, str>>),
     Unsubscribe(Vec<Cow<'a, str>>),
     Publish {
@@ -192,6 +195,34 @@ impl<'a> Command<'a> {
                 Value::BulkString(key.into_owned()),
                 Value::BulkString(by.to_string()),
             ]),
+            Command::ListRange(key, start, end) => Value::Array(vec![
+                Value::BulkString(String::from("LRANGE")),
+                Value::BulkString(key.into_owned()),
+                Value::BulkString(start.to_string()),
+                Value::BulkString(end.to_string()),
+            ]),
+            Command::LeftPush(key, items) => {
+                let mut command_parts = vec![
+                    Value::BulkString(String::from("LPUSH")),
+                    Value::BulkString(key.into_owned()),
+                ];
+                for item in items {
+                    command_parts.push(Value::BulkString(item.into_owned()));
+                }
+
+                Value::Array(command_parts)
+            }
+            Command::RightPush(key, items) => {
+                let mut command_parts = vec![
+                    Value::BulkString(String::from("RPUSH")),
+                    Value::BulkString(key.into_owned()),
+                ];
+                for item in items {
+                    command_parts.push(Value::BulkString(item.into_owned()));
+                }
+
+                Value::Array(command_parts)
+            }
             Command::Subscribe(channels) => {
                 let mut command_parts = vec![Value::BulkString(String::from("SUBSCRIBE"))];
                 for channel in channels {
@@ -278,6 +309,15 @@ impl<'a> Display for Command<'a> {
             Command::DecrementBy(key, by) => {
                 write!(f, "DECRBY {:?} {}", key, *by)
             }
+            Command::ListRange(key, start, end) => {
+                write!(f, "LRANGE {:?} {:?} {:?}", key, *start, *end)
+            }
+            Command::LeftPush(key, items) => {
+                write!(f, "LPUSH {:?} {:?}", key, items)
+            }
+            Command::RightPush(key, items) => {
+                write!(f, "RPUSH {:?} {:?}", key, items)
+            }
             Command::Subscribe(channels) => {
                 write!(f, "SUBSCRIBE {:?}", channels)
             }
@@ -332,6 +372,9 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             "INCRBY" => parse_increment_by(&mut segment_iter)?,
             "DECR" => parse_decrement(&mut segment_iter)?,
             "DECRBY" => parse_decrement_by(&mut segment_iter)?,
+            "LRANGE" => parse_list_range(&mut segment_iter)?,
+            "LPUSH" => parse_left_push(&mut segment_iter)?,
+            "RPUSH" => parse_right_push(&mut segment_iter)?,
             "SUBSCRIBE" => parse_subscribe(&mut segment_iter)?,
             "UNSUBSCRIBE" => parse_unsubscribe(&mut segment_iter)?,
             "PUBLISH" => parse_publish(&mut segment_iter)?,
@@ -620,6 +663,34 @@ fn parse_decrement_by<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<
     let key = expect_string(queue)?;
     let by = expect_string(queue)?.parse()?;
     Ok(Command::DecrementBy(key, by))
+}
+
+fn parse_list_range<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let start = expect_string(queue)?.parse()?;
+    let end = expect_string(queue)?.parse()?;
+
+    Ok(Command::ListRange(key, start, end))
+}
+
+fn parse_left_push<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let mut items = vec![];
+    while let Some(channel) = try_string(queue)? {
+        items.push(channel);
+    }
+
+    Ok(Command::LeftPush(key, items))
+}
+
+fn parse_right_push<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let mut items = vec![];
+    while let Some(channel) = try_string(queue)? {
+        items.push(channel);
+    }
+
+    Ok(Command::RightPush(key, items))
 }
 
 fn parse_subscribe<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {

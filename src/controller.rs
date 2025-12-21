@@ -1,4 +1,4 @@
-use crate::dictionary::Dictionary;
+use crate::dictionary::{Dictionary, Error};
 use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
 use crate::pubsub::{ChannelStore, Message};
@@ -19,8 +19,9 @@ impl Controller {
             Command::Ping(Some(text)) => Value::BulkString(text.into_owned()).into(),
             Command::Echo(s) => Value::BulkString(s.into_owned()).into(),
             Command::Get(key) => match self.dictionary.get(&key) {
-                Some(value) => Reference::BulkString(value).into(),
-                None => Value::Null.into(),
+                Ok(Some(value)) => Reference::BulkString(value).into(),
+                Ok(None) => Value::Null.into(),
+                Err(err) => Value::SimpleError(err.to_string()).into(),
             },
             Command::Set {
                 key,
@@ -39,7 +40,8 @@ impl Controller {
                     Ok(Some(old_value)) => Value::BulkString(old_value).into(),
                     Ok(None) if !get => Value::ok().into(),
                     Ok(None) => Value::Null.into(),
-                    Err(_) => Value::Null.into(),
+                    Err(Error::OverrideConflict) => Value::Null.into(),
+                    Err(err) => Value::SimpleError(err.to_string()).into(),
                 }
             }
             Command::ConfigGet(key) => {
@@ -62,7 +64,7 @@ impl Controller {
             Command::Exists(keys) => {
                 let mut count = 0;
                 for key in keys {
-                    if self.dictionary.get(&key).is_some() {
+                    if self.dictionary.exists(key.as_ref()) {
                         count += 1;
                     }
                 }
@@ -72,27 +74,49 @@ impl Controller {
             Command::Delete(keys) => {
                 let mut count = 0;
                 for key in keys {
-                    if self.dictionary.delete(&key).is_some() {
+                    if self.dictionary.delete(&key) {
                         count += 1;
                     }
                 }
 
                 Value::Integer(count).into()
             }
-            Command::Increment(key) => match self.dictionary.increment(key.as_ref(),1) {
+            Command::Increment(key) => match self.dictionary.increment(key.as_ref(), 1) {
                 Ok(value) => ValOrRef::Val(Value::Integer(value)),
                 Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
             },
-            Command::IncrementBy(key,by) => match self.dictionary.increment(key.as_ref(),by) {
+            Command::IncrementBy(key, by) => match self.dictionary.increment(key.as_ref(), by) {
                 Ok(value) => ValOrRef::Val(Value::Integer(value)),
                 Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
             },
-            Command::Decrement(key) => match self.dictionary.decrement(key.as_ref(),1) {
+            Command::Decrement(key) => match self.dictionary.decrement(key.as_ref(), 1) {
                 Ok(value) => ValOrRef::Val(Value::Integer(value)),
                 Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
             },
-            Command::DecrementBy(key,by) => match self.dictionary.decrement(key.as_ref(),by) {
+            Command::DecrementBy(key, by) => match self.dictionary.decrement(key.as_ref(), by) {
                 Ok(value) => ValOrRef::Val(Value::Integer(value)),
+                Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
+            },
+            Command::ListRange(key, start, end) => {
+                match self.dictionary.list_range(key.as_ref(), start, end) {
+                    Ok(items) => {
+                        let references = items
+                            .into_iter()
+                            .map(|item| Reference::BulkString(item))
+                            .collect();
+
+                        ValOrRef::Ref(Reference::Array(references))
+                    }
+                    Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
+                }
+            }
+            Command::LeftPush(key, items) => match self.dictionary.left_push(key.as_ref(), items) {
+                Ok(len) => ValOrRef::Val(Value::Integer(len)),
+                Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
+            },
+            Command::RightPush(key, items) => match self.dictionary.right_push(key.as_ref(), items)
+            {
+                Ok(len) => ValOrRef::Val(Value::Integer(len)),
                 Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
             },
             Command::Subscribe(channels) => {

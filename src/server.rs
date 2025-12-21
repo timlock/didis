@@ -588,8 +588,117 @@ mod test {
 
         let incr_faulty_key_cmd = Command::Increment(Cow::Borrowed("faulty"));
         let response = client.send(incr_faulty_key_cmd)?;
-        assert_eq!(Value::SimpleError(String::from("value is not an integer or out of range")), response);
+        assert_eq!(
+            Value::SimpleError(String::from("value is not an integer or out of range")),
+            response
+        );
 
+        server_handle.store(true, Ordering::SeqCst);
+        thread_handle.join().unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn list() -> Result<(), Box<dyn std::error::Error>> {
+        let address = SocketAddr::from_str("127.0.0.1:10005")?;
+
+        let (server_handle, thread_handle) = launch_server(address);
+
+        println!("Connecting to server on {}", address);
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+        let mut client = Client::new(stream);
+
+        let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
+        let response = client.send(get_cmd)?;
+
+        assert_eq!(Value::Null, response);
+
+        let lpush_cmd = Command::LeftPush(
+            Cow::Borrowed("Key"),
+            vec![Cow::Borrowed("first"), Cow::Borrowed("second")],
+        );
+        let response = client.send(lpush_cmd)?;
+        assert_eq!(Value::Integer(2), response);
+
+        let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 0, -1);
+        let response = client.send(lrange_cmd)?;
+        assert_eq!(
+            Value::Array(vec![
+                Value::BulkString(String::from("second")),
+                Value::BulkString(String::from("first")),
+            ]),
+            response
+        );
+
+        let rpush_cmd = Command::RightPush(
+            Cow::Borrowed("Key"),
+            vec![Cow::Borrowed("third"), Cow::Borrowed("fourth")],
+        );
+        let response = client.send(rpush_cmd)?;
+        assert_eq!(Value::Integer(4), response);
+
+        let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 0, -1);
+        let response = client.send(lrange_cmd)?;
+        assert_eq!(
+            Value::Array(vec![
+                Value::BulkString(String::from("second")),
+                Value::BulkString(String::from("first")),
+                Value::BulkString(String::from("third")),
+                Value::BulkString(String::from("fourth")),
+            ]),
+            response
+        );
+
+        let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 1, 0);
+        let response = client.send(lrange_cmd)?;
+        assert_eq!(
+            Value::Array(vec![]),
+            response
+        );
+
+        let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), -2, -1);
+        let response = client.send(lrange_cmd)?;
+        assert_eq!(
+            Value::Array(vec![
+                Value::BulkString(String::from("third")),
+                Value::BulkString(String::from("fourth")),
+            ]),
+            response
+        );
+
+        let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 0, 0);
+        let response = client.send(lrange_cmd)?;
+        assert_eq!(
+            Value::Array(vec![
+                Value::BulkString(String::from("second")),
+            ]),
+            response
+        );
+
+        let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), -4, 3);
+        let response = client.send(lrange_cmd)?;
+        assert_eq!(
+            Value::Array(vec![
+                Value::BulkString(String::from("second")),
+                Value::BulkString(String::from("first")),
+                Value::BulkString(String::from("third")),
+                Value::BulkString(String::from("fourth")),
+            ]),
+            response
+        );
+
+        let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), -100, 100);
+        let response = client.send(lrange_cmd)?;
+        assert_eq!(
+            Value::Array(vec![
+                Value::BulkString(String::from("second")),
+                Value::BulkString(String::from("first")),
+                Value::BulkString(String::from("third")),
+                Value::BulkString(String::from("fourth")),
+            ]),
+            response
+        );
 
         server_handle.store(true, Ordering::SeqCst);
         thread_handle.join().unwrap();
