@@ -4,9 +4,9 @@ use crate::parser::command::Parser;
 use crate::parser::resp::Value;
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{
     collections::HashMap,

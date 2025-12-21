@@ -1,9 +1,8 @@
 use crate::parser::command::{ExpireRule, OverwriteRule};
 use std::borrow::Cow;
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
-use std::ops::RangeInclusive;
 use std::{collections::HashMap, error, time::SystemTime};
 
 enum Entry {

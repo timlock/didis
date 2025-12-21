@@ -3,7 +3,6 @@ use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
 use crate::pubsub::{ChannelStore, Message};
 use std::collections::VecDeque;
-use std::num::ParseIntError;
 
 #[derive(Default)]
 pub struct Controller {
