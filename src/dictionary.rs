@@ -1,11 +1,10 @@
 use crate::parser::command::{ExpireRule, OverwriteRule};
 use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, error, time::SystemTime};
-use std::num::ParseIntError;
 
 #[derive(Default)]
 pub struct Dictionary {
-    inner: HashMap<String, Entry>,
+    inner: HashMap<String, StringEntry>,
 }
 impl Dictionary {
     pub fn new() -> Self {
@@ -14,50 +13,37 @@ impl Dictionary {
         }
     }
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.inner
-            .get(key)
-            .map(|value| match value.expires_at {
-                Some(t) if t > SystemTime::now() => Some(value.value.as_str()),
-                Some(_) => None,
-                None => Some(value.value.as_str()),
-            })
-            .flatten()
+        let entry = match self.inner.get(key) {
+            Some(entry) => entry,
+            None => return None,
+        };
+
+        let expires_at = match entry.expires_at {
+            Some(expires_at) => expires_at,
+            None => return Some(entry.value.as_str()),
+        };
+
+        if expires_at < SystemTime::now() {
+            return None;
+        }
+
+        Some(entry.value.as_str())
     }
 
     pub fn delete(&mut self, key: &str) -> Option<String> {
         self.inner.remove(key).map(|entry| entry.value)
     }
 
-    pub fn increment(&mut self, key: &str) -> Result<i64, ParseIntError> {
-        let entry = match self.inner.get_mut(key) {
-            Some(entry) => { entry }
-            None => {
-                self.inner.insert(key.to_string(), Entry::new(String::from("0"), None));
-                self.inner.get_mut(key).expect("map entry should be populated after an insert")
-            }
-        };
+    pub fn increment(&mut self, key: &str, by: i64) -> Result<i64, Error> {
+        let entry = self.set_if_absent(key, StringEntry::new(String::from("0"), None));
 
-        let mut value :i64 = entry.value.parse()?;
-        value += 1;
-        entry.value = value.to_string();
-
-        Ok(value)
+        entry.increment(by)
     }
 
-    pub fn decrement(&mut self, key: &str) -> Result<i64, ParseIntError> {
-        let entry = match self.inner.get_mut(key) {
-            Some(entry) => { entry }
-            None => {
-                self.inner.insert(key.to_string(), Entry::new(String::from("0"), None));
-                self.inner.get_mut(key).expect("map entry should be populated after an insert")
-            }
-        };
+    pub fn decrement(&mut self, key: &str, by: i64) -> Result<i64, Error> {
+        let entry = self.set_if_absent(key, StringEntry::new(String::from("0"), None));
 
-        let mut value :i64 = entry.value.parse()?;
-        value -= 1;
-        entry.value = value.to_string();
-
-        Ok(value)
+        entry.decrement(by)
     }
 
     pub fn set(
@@ -88,18 +74,30 @@ impl Dictionary {
                 expires_at = old.expires_at;
             }
         }
-        let entry = Entry::new(value, expires_at);
+        let entry = StringEntry::new(value, expires_at);
         self.inner.insert(key.to_owned(), entry);
         match get {
             true => Ok(old.map(|e| e.value)),
             false => Ok(None),
         }
     }
+
+    fn set_if_absent(&mut self, key: &str, entry: StringEntry) -> &mut StringEntry {
+        if let None = self.inner.get(key) {
+            self.inner.insert(key.to_string(), entry);
+        }
+
+        self.inner
+            .get_mut(key)
+            .expect("map entry should be populated after an insert")
+    }
 }
 
 #[derive(Debug)]
 pub enum Error {
     OverrideConflict,
+    NoInteger,
+    WrongType,
 }
 
 impl Display for Error {
@@ -108,19 +106,48 @@ impl Display for Error {
             Error::OverrideConflict => {
                 write!(f, "Override conflict")
             }
+            Error::NoInteger => {
+                write!(f, "value is not an integer or out of range")
+            }
+            Error::WrongType => {
+                write!(
+                    f,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value"
+                )
+            }
         }
     }
 }
 
 impl error::Error for Error {}
 
-struct Entry {
+struct StringEntry {
     value: String,
     expires_at: Option<SystemTime>,
 }
 
-impl Entry {
+impl StringEntry {
     fn new(value: String, expires_at: Option<SystemTime>) -> Self {
         Self { value, expires_at }
+    }
+
+    fn increment(&mut self, by: i64) -> Result<i64, Error> {
+        let mut integer_value: i64 = self.value.parse().map_err(|err| Error::NoInteger)?;
+        integer_value = integer_value
+            .checked_add(by)
+            .ok_or_else(|| Error::NoInteger)?;
+        self.value = integer_value.to_string();
+
+        Ok(integer_value)
+    }
+
+    fn decrement(&mut self, by: i64) -> Result<i64, Error> {
+        let mut integer_value: i64 = self.value.parse().map_err(|err| Error::NoInteger)?;
+        integer_value = integer_value
+            .checked_sub(by)
+            .ok_or_else(|| Error::NoInteger)?;
+        self.value = integer_value.to_string();
+
+        Ok(integer_value)
     }
 }

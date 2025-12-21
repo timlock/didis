@@ -94,7 +94,9 @@ pub enum Command<'a> {
     Exists(Vec<Cow<'a, str>>),
     Delete(Vec<Cow<'a, str>>),
     Increment(Cow<'a, str>),
+    IncrementBy(Cow<'a, str>, i64),
     Decrement(Cow<'a, str>),
+    DecrementBy(Cow<'a, str>, i64),
     Subscribe(Vec<Cow<'a, str>>),
     Unsubscribe(Vec<Cow<'a, str>>),
     Publish {
@@ -176,9 +178,19 @@ impl<'a> Command<'a> {
                 Value::BulkString(String::from("INCR")),
                 Value::BulkString(key.into_owned()),
             ]),
+            Command::IncrementBy(key, by) => Value::Array(vec![
+                Value::BulkString(String::from("INCRBY")),
+                Value::BulkString(key.into_owned()),
+                Value::BulkString(by.to_string()),
+            ]),
             Command::Decrement(key) => Value::Array(vec![
                 Value::BulkString(String::from("DECR")),
                 Value::BulkString(key.into_owned()),
+            ]),
+            Command::DecrementBy(key, by) => Value::Array(vec![
+                Value::BulkString(String::from("DECRBY")),
+                Value::BulkString(key.into_owned()),
+                Value::BulkString(by.to_string()),
             ]),
             Command::Subscribe(channels) => {
                 let mut command_parts = vec![Value::BulkString(String::from("SUBSCRIBE"))];
@@ -257,8 +269,14 @@ impl<'a> Display for Command<'a> {
             Command::Increment(key) => {
                 write!(f, "INCR {:?}", key)
             }
+            Command::IncrementBy(key, by) => {
+                write!(f, "INCRBY {:?} {}", key, *by)
+            }
             Command::Decrement(key) => {
                 write!(f, "DECR {:?}", key)
+            }
+            Command::DecrementBy(key, by) => {
+                write!(f, "DECRBY {:?} {}", key, *by)
             }
             Command::Subscribe(channels) => {
                 write!(f, "SUBSCRIBE {:?}", channels)
@@ -311,7 +329,9 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             "EXISTS" => parse_exists(&mut segment_iter)?,
             "DELETE" => parse_delete(&mut segment_iter)?,
             "INCR" => parse_increment(&mut segment_iter)?,
+            "INCRBY" => parse_increment_by(&mut segment_iter)?,
             "DECR" => parse_decrement(&mut segment_iter)?,
+            "DECRBY" => parse_decrement_by(&mut segment_iter)?,
             "SUBSCRIBE" => parse_subscribe(&mut segment_iter)?,
             "UNSUBSCRIBE" => parse_unsubscribe(&mut segment_iter)?,
             "PUBLISH" => parse_publish(&mut segment_iter)?,
@@ -585,9 +605,21 @@ fn parse_increment<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>
     Ok(Command::Increment(key))
 }
 
+fn parse_increment_by<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let by = expect_string(queue)?.parse()?;
+    Ok(Command::IncrementBy(key, by))
+}
+
 fn parse_decrement<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
     let key = expect_string(queue)?;
     Ok(Command::Decrement(key))
+}
+
+fn parse_decrement_by<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let by = expect_string(queue)?.parse()?;
+    Ok(Command::DecrementBy(key, by))
 }
 
 fn parse_subscribe<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {

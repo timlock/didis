@@ -79,17 +79,21 @@ impl Controller {
 
                 Value::Integer(count).into()
             }
-            Command::Increment(key) => match self.dictionary.increment(key.as_ref()) {
+            Command::Increment(key) => match self.dictionary.increment(key.as_ref(),1) {
                 Ok(value) => ValOrRef::Val(Value::Integer(value)),
-                Err(err) => ValOrRef::Val(Value::SimpleError(String::from(
-                    "value is not an integer or out of range",
-                ))),
+                Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
             },
-            Command::Decrement(key) => match self.dictionary.decrement(key.as_ref()) {
+            Command::IncrementBy(key,by) => match self.dictionary.increment(key.as_ref(),by) {
                 Ok(value) => ValOrRef::Val(Value::Integer(value)),
-                Err(err) => ValOrRef::Val(Value::SimpleError(String::from(
-                    "value is not an integer or out of range",
-                ))),
+                Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
+            },
+            Command::Decrement(key) => match self.dictionary.decrement(key.as_ref(),1) {
+                Ok(value) => ValOrRef::Val(Value::Integer(value)),
+                Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
+            },
+            Command::DecrementBy(key,by) => match self.dictionary.decrement(key.as_ref(),by) {
+                Ok(value) => ValOrRef::Val(Value::Integer(value)),
+                Err(err) => ValOrRef::Val(Value::SimpleError(err.to_string())),
             },
             Command::Subscribe(channels) => {
                 for channel in channels {

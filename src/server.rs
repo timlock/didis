@@ -568,6 +568,14 @@ mod test {
         let response = client.send(decr_cmd)?;
         assert_eq!(Value::Integer(0), response);
 
+        let incr_cmd = Command::IncrementBy(Cow::Borrowed("Key"), 5);
+        let response = client.send(incr_cmd)?;
+        assert_eq!(Value::Integer(5), response);
+
+        let decr_cmd = Command::DecrementBy(Cow::Borrowed("Key"), 5);
+        let response = client.send(decr_cmd)?;
+        assert_eq!(Value::Integer(0), response);
+
         let set_cmd = Command::Set {
             key: Cow::Owned("faulty".to_string()),
             value: Cow::Owned("Value".to_string()),
