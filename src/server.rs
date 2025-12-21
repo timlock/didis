@@ -601,7 +601,7 @@ mod test {
 
     #[test]
     fn list() -> Result<(), Box<dyn std::error::Error>> {
-        let address = SocketAddr::from_str("127.0.0.1:10005")?;
+        let address = SocketAddr::from_str("127.0.0.1:10006")?;
 
         let (server_handle, thread_handle) = launch_server(address);
 
