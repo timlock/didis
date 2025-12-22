@@ -1,5 +1,5 @@
 use super::resp;
-use crate::parser::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
+use crate::parser::resp::{parse, ParsedValue, Reference, ValOrRef, Value};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -357,7 +357,7 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             other => return Err(Error::ExpectedArray(other.to_value())),
         };
 
-        let name = expect_string(&mut segment_iter)?;
+        let name = expect_string(&mut segment_iter)?.to_ascii_uppercase();
 
         let command = match name.as_ref() {
             "PING" => parse_ping(&mut segment_iter)?,
@@ -378,7 +378,7 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             "SUBSCRIBE" => parse_subscribe(&mut segment_iter)?,
             "UNSUBSCRIBE" => parse_unsubscribe(&mut segment_iter)?,
             "PUBLISH" => parse_publish(&mut segment_iter)?,
-            _ => return Err(Error::UnknownCommand(name.into_owned())),
+            _ => return Err(Error::UnknownCommand(name)),
         };
         if !segment_iter.is_empty() {
             let remaining_args = segment_iter.into_iter().map(ValOrRef::to_value).collect();
@@ -398,13 +398,13 @@ pub enum ExpireRule {
     KeepTTL,
 }
 impl ExpireRule {
-    pub fn calculate_expire_time(&self) -> Option<SystemTime> {
+    pub fn calculate_expire_time(&self, old_expires_at: Option<SystemTime>) -> Option<SystemTime> {
         match self {
             ExpireRule::ExpiresInSecs(s) => SystemTime::now().checked_add(*s),
             ExpireRule::ExpiresInMillis(ms) => SystemTime::now().checked_add(*ms),
             ExpireRule::ExpiresAtSecs(s) => Some(SystemTime::UNIX_EPOCH.checked_add(*s)?),
             ExpireRule::ExpiresAtMillis(ms) => Some(SystemTime::UNIX_EPOCH.checked_add(*ms)?),
-            ExpireRule::KeepTTL => None,
+            ExpireRule::KeepTTL => old_expires_at,
         }
     }
 }

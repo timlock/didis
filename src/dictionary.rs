@@ -5,11 +5,6 @@ use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, error, time::SystemTime};
 
-enum Entry {
-    String(StringEntry),
-    List(VecDeque<String>),
-}
-
 #[derive(Default)]
 pub struct Dictionary {
     inner: HashMap<String, Entry>,
@@ -27,21 +22,18 @@ impl Dictionary {
             None => return Ok(None),
         };
 
-        let entry = match entry {
-            Entry::String(entry) => entry,
-            Entry::List(_) => return Err(Error::WrongType),
-        };
+        let string_value = entry.get_string()?;
 
         let expires_at = match entry.expires_at {
             Some(expires_at) => expires_at,
-            None => return Ok(Some(entry.value.as_str())),
+            None => return Ok(Some(string_value)),
         };
 
         if expires_at < SystemTime::now() {
             return Ok(None);
         }
 
-        Ok(Some(entry.value.as_str()))
+        Ok(Some(string_value))
     }
 
     pub fn exists(&mut self, key: &str) -> bool {
@@ -56,15 +48,15 @@ impl Dictionary {
     }
 
     pub fn increment(&mut self, key: &str, by: i64) -> Result<i64, Error> {
-        let entry = self.get_string_or_insert_mut(key, "0")?;
+        let value = self.get_string_or_insert_mut(key, "0")?;
 
-        entry.increment(by)
+        increment(value, by)
     }
 
     pub fn decrement(&mut self, key: &str, by: i64) -> Result<i64, Error> {
         let entry = self.get_string_or_insert_mut(key, "0")?;
 
-        entry.decrement(by)
+        decrement(entry, by)
     }
 
     pub fn set(
@@ -87,28 +79,24 @@ impl Dictionary {
 
         let keep_ttl = matches!(expire_rule, Some(ExpireRule::KeepTTL));
 
-        let old_value = if keep_ttl || get {
-            self.remove_string(key).transpose()?
+        let (old_value, old_expires_at) = if keep_ttl || get {
+            self.remove_string(key)?
         } else {
             self.inner.remove(key);
-            None
+            (None, None)
         };
 
-        let mut expires_at = expire_rule.as_ref().and_then(|r| r.calculate_expire_time());
-
-        if let Some(old_value) = &old_value
-            && keep_ttl
-        {
-            expires_at = old_value.expires_at;
-        }
+        let expires_at = expire_rule
+            .as_ref()
+            .and_then(|r| r.calculate_expire_time(old_expires_at));
 
         self.inner.insert(
             key.to_string(),
-            Entry::String(StringEntry::new(value, expires_at)),
+            Entry::new(EntryType::String(value), expires_at),
         );
 
         match get {
-            true => Ok(old_value.map(|entry| entry.value)),
+            true => Ok(old_value),
             false => Ok(None),
         }
     }
@@ -146,15 +134,11 @@ impl Dictionary {
         Ok(list.len() as i64)
     }
 
-    fn get_string_or_insert_mut(
-        &mut self,
-        key: &str,
-        value: &str,
-    ) -> Result<&mut StringEntry, Error> {
+    fn get_string_or_insert_mut(&mut self, key: &str, value: &str) -> Result<&mut String, Error> {
         if let None = self.inner.get(key) {
             self.inner.insert(
                 key.to_string(),
-                Entry::String(StringEntry::new(String::from(value), None)),
+                Entry::new(EntryType::String(String::from(value)), None),
             );
         }
 
@@ -164,52 +148,50 @@ impl Dictionary {
 
     fn get_list_or_insert_mut(&mut self, key: &str) -> Result<&mut VecDeque<String>, Error> {
         if let None = self.inner.get(key) {
-            self.inner
-                .insert(key.to_string(), Entry::List(Default::default()));
+            self.inner.insert(
+                key.to_string(),
+                Entry::new(EntryType::List(Default::default()), None),
+            );
         }
 
         self.get_list_mut(key)
             .expect("map entry should be populated after an insert")
     }
 
-    fn get_string(&self, key: &str) -> Option<Result<&StringEntry, Error>> {
-        match self.inner.get(key)? {
-            Entry::String(string_entry) => Some(Ok(string_entry)),
-            Entry::List(_) => Some(Err(Error::WrongType)),
-        }
+    fn get_string(&self, key: &str) -> Option<Result<&String, Error>> {
+        let entry = self.inner.get(key)?;
+        Some(entry.get_string())
     }
 
-    fn get_string_mut(&mut self, key: &str) -> Option<Result<&mut StringEntry, Error>> {
-        match self.inner.get_mut(key)? {
-            Entry::String(string_entry) => Some(Ok(string_entry)),
-            Entry::List(_) => Some(Err(Error::WrongType)),
-        }
+    fn get_string_mut(&mut self, key: &str) -> Option<Result<&mut String, Error>> {
+        let entry = self.inner.get_mut(key)?;
+        Some(entry.get_string_mut())
     }
 
     fn get_list(&self, key: &str) -> Option<Result<&VecDeque<String>, Error>> {
-        match self.inner.get(key)? {
-            Entry::String(_) => Some(Err(Error::WrongType)),
-            Entry::List(list) => Some(Ok(list)),
-        }
+        let entry = self.inner.get(key)?;
+        Some(entry.get_list())
     }
     fn get_list_mut(&mut self, key: &str) -> Option<Result<&mut VecDeque<String>, Error>> {
-        match self.inner.get_mut(key)? {
-            Entry::String(_) => Some(Err(Error::WrongType)),
-            Entry::List(list) => Some(Ok(list)),
-        }
+        let entry = self.inner.get_mut(key)?;
+        Some(entry.get_list_mut())
     }
 
-    fn remove_string(&mut self, key: &str) -> Option<Result<StringEntry, Error>> {
-        match self.inner.get(key)? {
-            Entry::String(_) => {}
-            _ => return Some(Err(Error::WrongType)),
+    fn remove_string(&mut self, key: &str) -> Result<(Option<String>, Option<SystemTime>), Error> {
+        match self.inner.get(key) {
+            Some(entry) => match entry.entry_type {
+                EntryType::String(_) => {}
+                _ => return Err(Error::WrongType),
+            },
+            None => return Ok((None, None)),
         };
+
         let old = self
             .inner
             .remove(key)
             .expect("map entry should exist after a get call");
-        match old {
-            Entry::String(string_entry) => Some(Ok(string_entry)),
+        match old.entry_type {
+            EntryType::String(value) => Ok((Some(value), old.expires_at)),
             _ => {
                 panic!("map entry should not change its type after a get call")
             }
@@ -254,33 +236,68 @@ impl Display for Error {
 
 impl error::Error for Error {}
 
-struct StringEntry {
-    value: String,
+enum EntryType {
+    String(String),
+    List(VecDeque<String>),
+}
+
+struct Entry {
+    entry_type: EntryType,
     expires_at: Option<SystemTime>,
 }
 
-impl StringEntry {
-    fn new(value: String, expires_at: Option<SystemTime>) -> Self {
-        Self { value, expires_at }
+impl Entry {
+    fn new(entry_type: EntryType, expires_at: Option<SystemTime>) -> Entry {
+        Entry {
+            entry_type,
+            expires_at,
+        }
+    }
+    fn get_string(&self) -> Result<&String, Error> {
+        match &self.entry_type {
+            EntryType::String(entry) => Ok(entry),
+            EntryType::List(_) => Err(Error::WrongType),
+        }
     }
 
-    fn increment(&mut self, by: i64) -> Result<i64, Error> {
-        let mut integer_value: i64 = self.value.parse().map_err(|err| Error::NoInteger)?;
-        integer_value = integer_value
-            .checked_add(by)
-            .ok_or_else(|| Error::NoInteger)?;
-        self.value = integer_value.to_string();
-
-        Ok(integer_value)
+    fn get_string_mut(&mut self) -> Result<&mut String, Error> {
+        match &mut self.entry_type {
+            EntryType::String(entry) => Ok(entry),
+            EntryType::List(_) => Err(Error::WrongType),
+        }
     }
 
-    fn decrement(&mut self, by: i64) -> Result<i64, Error> {
-        let mut integer_value: i64 = self.value.parse().map_err(|err| Error::NoInteger)?;
-        integer_value = integer_value
-            .checked_sub(by)
-            .ok_or_else(|| Error::NoInteger)?;
-        self.value = integer_value.to_string();
-
-        Ok(integer_value)
+    fn get_list(&self) -> Result<&VecDeque<String>, Error> {
+        match &self.entry_type {
+            EntryType::String(_) => Err(Error::WrongType),
+            EntryType::List(list) => Ok(list),
+        }
     }
+
+    fn get_list_mut(&mut self) -> Result<&mut VecDeque<String>, Error> {
+        match &mut self.entry_type {
+            EntryType::String(_) => Err(Error::WrongType),
+            EntryType::List(list) => Ok(list),
+        }
+    }
+}
+
+fn increment(string: &mut String, by: i64) -> Result<i64, Error> {
+    let mut integer_value: i64 = string.parse().map_err(|err| Error::NoInteger)?;
+    integer_value = integer_value
+        .checked_add(by)
+        .ok_or_else(|| Error::NoInteger)?;
+    *string = integer_value.to_string();
+
+    Ok(integer_value)
+}
+
+fn decrement(string: &mut String, by: i64) -> Result<i64, Error> {
+    let mut integer_value: i64 = string.parse().map_err(|err| Error::NoInteger)?;
+    integer_value = integer_value
+        .checked_sub(by)
+        .ok_or_else(|| Error::NoInteger)?;
+    *string = integer_value.to_string();
+
+    Ok(integer_value)
 }
