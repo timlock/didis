@@ -5,5 +5,7 @@ edition = "2024"
 
 [dependencies]
 libc ="0.2"
+lzf = "1.0.0"
+crc64 = "2.0.0"
 
 [build-dependencies]

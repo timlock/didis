@@ -8,3 +8,4 @@ Inspired by John Cricketts Coding Challenges: https://codingchallenges.fyi/chall
 - generating io_uring binds: https://www.thespatula.io/rust/rust_io_uring_bindings/
 - sans-io: https://www.firezone.dev/blog/sans-io
 - viewstamped replication: http://pmg.csail.mit.edu/papers/vr-revisited.pdf
+- rdb format: https://rdb.fnordig.de/file_format.html
