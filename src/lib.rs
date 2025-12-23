@@ -7,4 +7,4 @@ pub mod replication;
 pub mod server;
 pub mod client;
 pub mod pubsub;
-pub mod snapshot;
+pub mod persistence;
