@@ -28,11 +28,15 @@ impl From<&RDB> for Vec<u8> {
         let mut bytes = Vec::new();
 
         bytes.extend_from_slice(MAGIC_NUMBER);
-        let mut version = rdb.version.to_be_bytes().as_mut_slice();
-        bytes.extend_from_slice(rdb.version.to_be_bytes().as_slice());
 
-        bytes.push(AUX);
+        let mut version_string = rdb.version.to_string();
+        while version_string.len() < 4 {
+            version_string.insert(0, '0');
+        }
+        bytes.extend_from_slice(version_string.as_bytes());
+
         for (key, value) in &rdb.auxiliary_fields {
+            bytes.push(AUX);
             bytes.extend_from_slice(encode_string(key).as_slice());
             bytes.extend_from_slice(encode_string(value).as_slice());
         }
@@ -40,6 +44,7 @@ impl From<&RDB> for Vec<u8> {
         for (db, hash_map) in &rdb.db_hash_maps {
             bytes.push(SELECTDB);
             bytes.push(*db);
+            bytes.push(RESIZEDB);
             bytes.extend_from_slice(Size::Length(hash_map.len()).encode().as_slice());
             let keys_with_expires = hash_map
                 .values()
@@ -79,7 +84,7 @@ impl TryFrom<Vec<u8>> for RDB {
     type Error = Error;
 
     fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
-        let checksum = checksum(&bytes)?;
+        validate_checksum(&bytes)?;
 
         let mut iter = bytes.into_iter().peekable();
 
@@ -95,7 +100,10 @@ impl TryFrom<Vec<u8>> for RDB {
         let auxiliary_fields = parse_auxiliary_fields(&mut iter)?;
 
         let mut db_hash_maps = HashMap::new();
-        while let Some(SELECTDB) = iter.next() {
+        while &SELECTDB == iter.peek().ok_or(Error::Truncated)? {
+            iter.next()
+                .expect("when peek() returns Some(..) next() should also return Some(..)");
+
             let db_number = iter.next().ok_or(Error::Truncated)?;
 
             let hash_map = match iter.peek() {
@@ -115,7 +123,10 @@ impl TryFrom<Vec<u8>> for RDB {
                 "get(key) should return Some(..) after an entry has been inserted for key ",
             );
 
-            while &SELECTDB != iter.peek().ok_or(Error::Truncated)? {
+            while {
+                let next = *iter.peek().ok_or(Error::Truncated)?;
+                next != SELECTDB && next != EOF
+            } {
                 let expires_at = try_timestamp(&mut iter)?;
                 let value_type = parse_value_type(&mut iter)?;
                 let key = decode_string(&mut iter)?;
@@ -144,7 +155,7 @@ impl TryFrom<Vec<u8>> for RDB {
         })
     }
 }
-fn checksum(bytes: &[u8]) -> Result<u64, Error> {
+fn validate_checksum(bytes: &[u8]) -> Result<u64, Error> {
     let (bytes, checksum_bytes) = bytes.split_at(bytes.len() - 8);
     if checksum_bytes.len() < 8 {
         return Err(Error::Truncated);
