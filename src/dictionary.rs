@@ -1,12 +1,12 @@
-use crate::parser::command::{ExpireRule, OverwriteRule};
+use crate::parser::command::{ExpireRule, OverwriteRule, SetValueExpireRule};
 use crate::persistence;
-use crate::persistence::{ValueType, RDB};
+use crate::persistence::{Value, ValueType, RDB};
 use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
-use std::{collections::HashMap, error, time::SystemTime};
+use std::{collections::HashMap, error, io, time::SystemTime};
 
 #[derive(Default)]
 pub struct Dictionary {
@@ -68,7 +68,7 @@ impl Dictionary {
         value: String,
         overwrite_rule: Option<OverwriteRule>,
         get: bool,
-        expire_rule: Option<ExpireRule>,
+        expire_rule: Option<SetValueExpireRule>,
     ) -> Result<Option<String>, Error> {
         match overwrite_rule {
             Some(OverwriteRule::NotExists) if self.inner.contains_key(key) => {
@@ -80,7 +80,7 @@ impl Dictionary {
             _ => {}
         };
 
-        let keep_ttl = matches!(expire_rule, Some(ExpireRule::KeepTTL));
+        let keep_ttl = matches!(expire_rule, Some(SetValueExpireRule::KeepTTL));
 
         let (old_value, old_expires_at) = if keep_ttl || get {
             self.remove_string(key)?
@@ -135,6 +135,52 @@ impl Dictionary {
         }
 
         Ok(list.len() as i64)
+    }
+
+    pub fn expire(&mut self, key: &str, seconds: u64, expire_rule: Option<ExpireRule>) -> bool {
+        let entry = match self.inner.get_mut(key) {
+            Some(entry) => entry,
+            None => return false,
+        };
+        let new_expires_at = SystemTime::now() + Duration::from_secs(seconds);
+
+        match expire_rule {
+            Some(ExpireRule::HasExpiry) => {
+                if entry.expires_at.is_none() {
+                    return false;
+                }
+            }
+            Some(ExpireRule::NoExpiry) => {
+                if entry.expires_at.is_some() {
+                    return false;
+                }
+            }
+            Some(ExpireRule::GreaterThan) => {
+                if let Some(expires_at) = entry.expires_at
+                    && new_expires_at
+                        < SystemTime::UNIX_EPOCH + Duration::from_millis(expires_at.milliseconds())
+                {
+                    return false;
+                }
+            }
+            Some(ExpireRule::LessThan) => {
+                if let Some(expires_at) = entry.expires_at
+                    && new_expires_at
+                        > SystemTime::UNIX_EPOCH + Duration::from_millis(expires_at.milliseconds())
+                {
+                    return false;
+                }
+            }
+            None => {}
+        };
+
+        let expires_at_secs = new_expires_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        entry.expires_at = Some(Timestamp::Seconds(expires_at_secs as u32));
+
+        true
     }
 
     pub fn snapshot(&self) -> RDB {
@@ -225,6 +271,8 @@ pub enum Error {
     OverrideConflict,
     NoInteger,
     WrongType,
+    Io(io::Error),
+    Persistence(persistence::Error),
 }
 
 impl Display for Error {
@@ -242,7 +290,21 @@ impl Display for Error {
                     "WRONGTYPE Operation against a key holding the wrong kind of value"
                 )
             }
+            Error::Io(err) => err.fmt(f),
+            Error::Persistence(err) => err.fmt(f),
         }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Error::Io(value)
+    }
+}
+
+impl From<persistence::Error> for Error {
+    fn from(value: persistence::Error) -> Self {
+        Error::Persistence(value)
     }
 }
 
@@ -258,6 +320,21 @@ enum EntryType {
 pub enum Timestamp {
     Seconds(u32),
     Milliseconds(u64),
+}
+
+impl Timestamp {
+    pub fn milliseconds(&self) -> u64 {
+        match self {
+            Timestamp::Seconds(s) => *s as u64 * 1000,
+            Timestamp::Milliseconds(ms) => *ms,
+        }
+    }
+    pub fn seconds(&self) -> u32 {
+        match self {
+            Timestamp::Seconds(s) => *s,
+            Timestamp::Milliseconds(ms) => (*ms / 1000) as u32,
+        }
+    }
 }
 
 impl From<Timestamp> for Duration {
@@ -321,6 +398,20 @@ impl From<Entry> for persistence::Value {
                 persistence::Value::new(value.expires_at, ValueType::List(Vec::from(list)))
             }
         }
+    }
+}
+
+impl From<persistence::Value> for Entry {
+    fn from(value: Value) -> Self {
+        let entry_type = match value.value_type {
+            ValueType::String(string) => EntryType::String(string),
+            ValueType::List(list) => EntryType::List(VecDeque::from(list)),
+            ValueType::Set(set) => {
+                todo!()
+            }
+        };
+
+        Entry::new(entry_type, value.expires_at)
     }
 }
 

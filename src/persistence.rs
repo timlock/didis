@@ -20,7 +20,7 @@ const AUX: u8 = 0xFA;
 pub struct RDB {
     version: u32,
     auxiliary_fields: HashMap<String, String>,
-    db_hash_maps: HashMap<u8, HashMap<String, Value>>,
+   pub db_hash_maps: HashMap<u8, HashMap<String, Value>>,
 }
 
 impl RDB {
@@ -269,8 +269,8 @@ fn expect_op_code(expected_op_code: u8, iter: &mut impl Iterator<Item = u8>) -> 
 
 #[derive(Debug, PartialEq)]
 pub struct Value {
-    expires_at: Option<Timestamp>,
-    value_type: ValueType,
+    pub expires_at: Option<Timestamp>,
+    pub value_type: ValueType,
 }
 
 impl Value {

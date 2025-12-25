@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{
     collections::HashMap,
+    fs,
     io::{self},
     net::SocketAddr,
 };
@@ -36,6 +37,16 @@ impl Server {
     }
 
     pub fn run(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
+        if fs::exists("save.rdb")? {
+            println!("Loading save.rdb file");
+            if let Err(err) = self.controller.restore_from_snapshot("save.rdb") {
+                println!("Failed to restore database from save.rdb {err}");
+                return Ok(());
+            }
+
+            println!("Restored database from save.rdb");
+        }
+
         println!("Server starts listening on {}", self.address);
 
         let listener = TcpListener::bind(self.address)?;
@@ -652,10 +663,7 @@ mod test {
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 1, 0);
         let response = client.send(lrange_cmd)?;
-        assert_eq!(
-            Value::Array(vec![]),
-            response
-        );
+        assert_eq!(Value::Array(vec![]), response);
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), -2, -1);
         let response = client.send(lrange_cmd)?;
@@ -670,9 +678,7 @@ mod test {
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 0, 0);
         let response = client.send(lrange_cmd)?;
         assert_eq!(
-            Value::Array(vec![
-                Value::BulkString(String::from("second")),
-            ]),
+            Value::Array(vec![Value::BulkString(String::from("second")),]),
             response
         );
 

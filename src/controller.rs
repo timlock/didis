@@ -1,8 +1,11 @@
 use crate::dictionary::{Dictionary, Error};
 use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
+use crate::persistence::{ValueType, RDB};
 use crate::pubsub::{ChannelStore, Message};
+use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::fs;
 
 #[derive(Default)]
 pub struct Controller {
@@ -161,6 +164,19 @@ impl Controller {
 
                 Value::Integer(subscribers_len).into()
             }
+            Command::Save => match self.create_snapshot() {
+                Ok(()) => ValOrRef::Ref(Reference::SimpleString("ok")),
+                Err(simple_error) => ValOrRef::Val(simple_error),
+            },
+
+            Command::Expire {
+                key,
+                seconds,
+                expire_rule,
+            } => match self.dictionary.expire(key.as_ref(), seconds, expire_rule) {
+                true => ValOrRef::Val(Value::Integer(1)),
+                false => ValOrRef::Val(Value::Integer(0)),
+            },
         };
         Some(result)
     }
@@ -174,5 +190,42 @@ impl Controller {
     }
     pub fn messages(&mut self) -> Vec<Message> {
         self.messages.drain(..).collect()
+    }
+
+    pub fn restore_from_snapshot(&mut self, snapshot_path: &str) -> Result<(), Error> {
+        let bytes = fs::read(snapshot_path)?;
+        let rdb = RDB::try_from(bytes)?;
+        for (_db, db_hash_map) in rdb.db_hash_maps {
+            for (key, value) in db_hash_map {
+                match value.value_type {
+                    ValueType::String(string) => {
+                        self.dictionary
+                            .set(key.as_str(), string, None, false, None)?;
+                    }
+                    ValueType::List(list) => {
+                        self.dictionary
+                            .left_push(key.as_str(), list.into_iter().map(Cow::Owned).collect())?;
+                    }
+                    ValueType::Set(set) => {
+                        todo!()
+                    }
+                };
+                if let Some(timestamp) = value.expires_at {
+                    self.dictionary
+                        .expire(key.as_str(), timestamp.seconds() as u64, None);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn create_snapshot(&self) -> Result<(), Value> {
+        let rdb = self.dictionary.snapshot();
+        let bytes = Vec::<u8>::try_from(&rdb)
+            .map_err(|err| Value::SimpleError(format!("failed to serialize database {err}")))?;
+        fs::write("dump.rdb", bytes.as_slice())
+            .map_err(|err| Value::SimpleError(format!("failed to create dump file {err}")))?;
+        fs::rename("dump.rdb", "save.rdb")
+            .map_err(|err| Value::SimpleError(format!("remove old dump file {err}")))
     }
 }

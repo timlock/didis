@@ -88,7 +88,7 @@ pub enum Command<'a> {
         value: Cow<'a, str>,
         overwrite_rule: Option<OverwriteRule>,
         get: bool,
-        expire_rule: Option<ExpireRule>,
+        expire_rule: Option<SetValueExpireRule>,
     },
     ConfigGet(Vec<Cow<'a, str>>),
     Client,
@@ -106,6 +106,12 @@ pub enum Command<'a> {
     Publish {
         channel: Cow<'a, str>,
         message: Cow<'a, str>,
+    },
+    Save,
+    Expire {
+        key: Cow<'a, str>,
+        seconds: u64,
+        expire_rule: Option<ExpireRule>,
     },
 }
 
@@ -245,6 +251,24 @@ impl<'a> Command<'a> {
                 Value::BulkString(channel.into_owned()),
                 Value::BulkString(message.into_owned()),
             ]),
+            Command::Save => Value::Array(vec![Value::BulkString(String::from("SAVE"))]),
+            Command::Expire {
+                key,
+                seconds,
+                expire_rule,
+            } => {
+                let mut command_parts = vec![
+                    Value::BulkString(String::from("EXPIRE")),
+                    Value::BulkString(key.into_owned()),
+                    Value::BulkString(seconds.to_string()),
+                ];
+
+                if let Some(expire_rule) = expire_rule {
+                    command_parts.push(Value::BulkString(expire_rule.to_string()));
+                }
+
+                Value::Array(command_parts)
+            }
         }
     }
     pub fn to_bytes(self) -> Vec<u8> {
@@ -328,6 +352,18 @@ impl<'a> Display for Command<'a> {
             Command::Publish { channel, message } => {
                 write!(f, "PUBLISH {} {}", channel, message)
             }
+            Command::Save => write!(f, "SAVE"),
+            Command::Expire {
+                key,
+                seconds,
+                expire_rule,
+            } => {
+                write!(f, "EXPIRE {} {}", key, seconds)?;
+                if let Some(expire_rule) = expire_rule {
+                    write!(f, "{}", expire_rule)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -348,7 +384,7 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
     type Error = Error;
 
     fn try_from(value: ValOrRef<'a>) -> Result<Self, Self::Error> {
-        let mut segment_iter: VecDeque<ValOrRef> = match value {
+        let mut iter: VecDeque<ValOrRef> = match value {
             ValOrRef::Val(Value::Array(values)) => {
                 values.into_iter().map(|v| ValOrRef::Val(v)).collect()
             }
@@ -358,31 +394,33 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             other => return Err(Error::ExpectedArray(other.to_value())),
         };
 
-        let name = expect_string(&mut segment_iter)?.to_ascii_uppercase();
+        let name = expect_string(&mut iter)?.to_ascii_uppercase();
 
         let command = match name.as_ref() {
-            "PING" => parse_ping(&mut segment_iter)?,
-            "ECHO" => parse_echo(&mut segment_iter)?,
-            "GET" => parse_get(&mut segment_iter)?,
-            "SET" => parse_set(&mut segment_iter)?,
-            "CONFIG" => parse_config_get(&mut segment_iter)?,
+            "PING" => parse_ping(&mut iter)?,
+            "ECHO" => parse_echo(&mut iter)?,
+            "GET" => parse_get(&mut iter)?,
+            "SET" => parse_set(&mut iter)?,
+            "EXPIRE" => parse_expire(&mut iter)?,
+            "CONFIG" => parse_config_get(&mut iter)?,
             "CLIENT" => Command::Client,
-            "EXISTS" => parse_exists(&mut segment_iter)?,
-            "DELETE" => parse_delete(&mut segment_iter)?,
-            "INCR" => parse_increment(&mut segment_iter)?,
-            "INCRBY" => parse_increment_by(&mut segment_iter)?,
-            "DECR" => parse_decrement(&mut segment_iter)?,
-            "DECRBY" => parse_decrement_by(&mut segment_iter)?,
-            "LRANGE" => parse_list_range(&mut segment_iter)?,
-            "LPUSH" => parse_left_push(&mut segment_iter)?,
-            "RPUSH" => parse_right_push(&mut segment_iter)?,
-            "SUBSCRIBE" => parse_subscribe(&mut segment_iter)?,
-            "UNSUBSCRIBE" => parse_unsubscribe(&mut segment_iter)?,
-            "PUBLISH" => parse_publish(&mut segment_iter)?,
+            "EXISTS" => parse_exists(&mut iter)?,
+            "DELETE" => parse_delete(&mut iter)?,
+            "INCR" => parse_increment(&mut iter)?,
+            "INCRBY" => parse_increment_by(&mut iter)?,
+            "DECR" => parse_decrement(&mut iter)?,
+            "DECRBY" => parse_decrement_by(&mut iter)?,
+            "LRANGE" => parse_list_range(&mut iter)?,
+            "LPUSH" => parse_left_push(&mut iter)?,
+            "RPUSH" => parse_right_push(&mut iter)?,
+            "SUBSCRIBE" => parse_subscribe(&mut iter)?,
+            "UNSUBSCRIBE" => parse_unsubscribe(&mut iter)?,
+            "PUBLISH" => parse_publish(&mut iter)?,
+            "SAVE" => Command::Save,
             _ => return Err(Error::UnknownCommand(name)),
         };
-        if !segment_iter.is_empty() {
-            let remaining_args = segment_iter.into_iter().map(ValOrRef::to_value).collect();
+        if !iter.is_empty() {
+            let remaining_args = iter.into_iter().map(ValOrRef::to_value).collect();
             return Err(Error::UnknownArguments(remaining_args));
         }
 
@@ -392,16 +430,63 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum ExpireRule {
+    NoExpiry,
+    HasExpiry,
+    GreaterThan,
+    LessThan,
+}
+impl TryFrom<&str> for ExpireRule {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        ExpireRule::try_from(value.as_bytes())
+    }
+}
+impl TryFrom<&[u8]> for ExpireRule {
+    type Error = Error;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        match value {
+            b"NX" => Ok(ExpireRule::NoExpiry),
+            b"XX" => Ok(ExpireRule::HasExpiry),
+            b"GT" => Ok(ExpireRule::GreaterThan),
+            b"LT" => Ok(ExpireRule::LessThan),
+            _ => Err(Error::UnknownArguments(vec![Value::BulkString(
+                String::from_utf8_lossy(value).into_owned(),
+            )])),
+        }
+    }
+}
+
+impl Display for ExpireRule {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ExpireRule::NoExpiry => write!(f, "NX"),
+            ExpireRule::HasExpiry => {
+                write!(f, "XX")
+            }
+            ExpireRule::GreaterThan => {
+                write!(f, "GT")
+            }
+            ExpireRule::LessThan => {
+                write!(f, "LT")
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, PartialOrd)]
+pub enum SetValueExpireRule {
     ExpiresInSecs(u64),
     ExpiresInMillis(u64),
     ExpiresAtSecs(u64),
     ExpiresAtMillis(u64),
     KeepTTL,
 }
-impl ExpireRule {
+impl SetValueExpireRule {
     pub fn calculate_expire_time(&self, old_expires_at: Option<Timestamp>) -> Option<Timestamp> {
         match self {
-            ExpireRule::ExpiresInSecs(s) => {
+            SetValueExpireRule::ExpiresInSecs(s) => {
                 let expires_at = SystemTime::now() + Duration::from_secs(*s);
                 let expires_at_secs = expires_at
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -409,7 +494,7 @@ impl ExpireRule {
                     .as_secs();
                 Some(Timestamp::Seconds(expires_at_secs as u32))
             }
-            ExpireRule::ExpiresInMillis(ms) => {
+            SetValueExpireRule::ExpiresInMillis(ms) => {
                 let expires_at = SystemTime::now() + Duration::from_secs(*ms);
                 let expires_at_in_millis = expires_at
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -417,41 +502,51 @@ impl ExpireRule {
                     .as_millis();
                 Some(Timestamp::Milliseconds(expires_at_in_millis as u64))
             }
-            ExpireRule::ExpiresAtSecs(s) => Some(Timestamp::Seconds(*s as u32)),
-            ExpireRule::ExpiresAtMillis(ms) => Some(Timestamp::Milliseconds(*ms)),
-            ExpireRule::KeepTTL => old_expires_at,
+            SetValueExpireRule::ExpiresAtSecs(s) => Some(Timestamp::Seconds(*s as u32)),
+            SetValueExpireRule::ExpiresAtMillis(ms) => Some(Timestamp::Milliseconds(*ms)),
+            SetValueExpireRule::KeepTTL => old_expires_at,
         }
     }
 }
-impl TryFrom<&[u8]> for ExpireRule {
+
+impl From<Timestamp> for SetValueExpireRule {
+    fn from(value: Timestamp) -> Self {
+        match value {
+            Timestamp::Seconds(s) => SetValueExpireRule::ExpiresAtSecs(s as u64),
+            Timestamp::Milliseconds(ms) => SetValueExpireRule::ExpiresAtMillis(ms),
+        }
+    }
+}
+
+impl TryFrom<&[u8]> for SetValueExpireRule {
     type Error = Error;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.starts_with(b"EX") {
             let trimmed = &value[2..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let secs = ascii_number.parse()?;
-            return Ok(ExpireRule::ExpiresInSecs(secs));
+            return Ok(SetValueExpireRule::ExpiresInSecs(secs));
         }
         if value.starts_with(b"PX") {
             let trimmed = &value[2..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let millis = ascii_number.parse()?;
-            return Ok(ExpireRule::ExpiresInMillis(millis));
+            return Ok(SetValueExpireRule::ExpiresInMillis(millis));
         }
         if value.starts_with(b"EXAT") {
             let trimmed = &value[4..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let secs = ascii_number.parse()?;
-            return Ok(ExpireRule::ExpiresAtSecs(secs));
+            return Ok(SetValueExpireRule::ExpiresAtSecs(secs));
         }
         if value.starts_with(b"PXAT") {
             let trimmed = &value[4..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let millis = ascii_number.parse()?;
-            return Ok(ExpireRule::ExpiresAtMillis(millis));
+            return Ok(SetValueExpireRule::ExpiresAtMillis(millis));
         }
         if value == b"KEEPTTL" {
-            return Ok(ExpireRule::KeepTTL);
+            return Ok(SetValueExpireRule::KeepTTL);
         }
 
         Err(Error::UnknownArguments(vec![Value::BulkString(
@@ -460,24 +555,30 @@ impl TryFrom<&[u8]> for ExpireRule {
     }
 }
 
-impl TryFrom<&str> for ExpireRule {
+impl TryFrom<&str> for SetValueExpireRule {
     type Error = Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        ExpireRule::try_from(value.as_bytes())
+        SetValueExpireRule::try_from(value.as_bytes())
     }
 }
 
-impl From<ExpireRule> for Value {
-    fn from(value: ExpireRule) -> Self {
+impl From<SetValueExpireRule> for Value {
+    fn from(value: SetValueExpireRule) -> Self {
         match value {
-            ExpireRule::ExpiresInSecs(duration) => Value::BulkString(format!("EX {}", duration)),
-            ExpireRule::ExpiresInMillis(duration) => Value::BulkString(format!("PX {}", duration)),
-            ExpireRule::ExpiresAtSecs(duration) => Value::BulkString(format!("EXAT {}", duration)),
-            ExpireRule::ExpiresAtMillis(duration) => {
+            SetValueExpireRule::ExpiresInSecs(duration) => {
+                Value::BulkString(format!("EX {}", duration))
+            }
+            SetValueExpireRule::ExpiresInMillis(duration) => {
+                Value::BulkString(format!("PX {}", duration))
+            }
+            SetValueExpireRule::ExpiresAtSecs(duration) => {
+                Value::BulkString(format!("EXAT {}", duration))
+            }
+            SetValueExpireRule::ExpiresAtMillis(duration) => {
                 Value::BulkString(format!("PXAT {}", duration))
             }
-            ExpireRule::KeepTTL => Value::BulkString(String::from("KEEPTTL")),
+            SetValueExpireRule::KeepTTL => Value::BulkString(String::from("KEEPTTL")),
         }
     }
 }
@@ -602,7 +703,7 @@ fn parse_set<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Erro
             overwrite_rule = Some(r);
         } else if string == "GET" {
             get = true;
-        } else if let Ok(p) = ExpireRule::try_from(string.as_ref()) {
+        } else if let Ok(p) = SetValueExpireRule::try_from(string.as_ref()) {
             expire_rule = Some(p);
         } else {
             return Err(Error::UnknownArguments(vec![Value::BulkString(
@@ -616,6 +717,28 @@ fn parse_set<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Erro
         value,
         overwrite_rule,
         get,
+        expire_rule,
+    })
+}
+
+fn parse_expire<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let key = expect_string(queue)?;
+    let seconds = expect_string(queue)?.parse()?;
+
+    let mut expire_rule = None;
+    if let Some(string) = try_string(queue)? {
+        if let Ok(p) = ExpireRule::try_from(string.as_ref()) {
+            expire_rule = Some(p);
+        } else {
+            return Err(Error::UnknownArguments(vec![Value::BulkString(
+                string.into_owned(),
+            )]));
+        }
+    }
+
+    Ok(Command::Expire {
+        key,
+        seconds,
         expire_rule,
     })
 }
@@ -769,7 +892,7 @@ mod tests {
                 value: Cow::Owned("value".to_string()),
                 overwrite_rule: Some(OverwriteRule::Exists),
                 get: true,
-                expire_rule: Some(ExpireRule::ExpiresInSecs(10)),
+                expire_rule: Some(SetValueExpireRule::ExpiresInSecs(10)),
             },
             command
         );
@@ -793,7 +916,7 @@ mod tests {
                 value: Cow::Borrowed("value"),
                 overwrite_rule: Some(OverwriteRule::Exists),
                 get: true,
-                expire_rule: Some(ExpireRule::ExpiresInSecs(10)),
+                expire_rule: Some(SetValueExpireRule::ExpiresInSecs(10)),
             },
             command
         );
