@@ -1,8 +1,11 @@
 use crate::parser::command::{ExpireRule, OverwriteRule};
+use crate::persistence;
+use crate::persistence::{ValueType, RDB};
 use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
+use std::time::Duration;
 use std::{collections::HashMap, error, time::SystemTime};
 
 #[derive(Default)]
@@ -29,7 +32,7 @@ impl Dictionary {
             None => return Ok(Some(string_value)),
         };
 
-        if expires_at < SystemTime::now() {
+        if SystemTime::UNIX_EPOCH + Duration::from(expires_at) < SystemTime::now() {
             return Ok(None);
         }
 
@@ -134,6 +137,15 @@ impl Dictionary {
         Ok(list.len() as i64)
     }
 
+    pub fn snapshot(&self) -> RDB {
+        let mut hash_map = HashMap::new();
+        for (key, entry) in &self.inner {
+            hash_map.insert(key.clone(), persistence::Value::from(entry.clone()));
+        }
+
+        RDB::new(HashMap::new(), HashMap::from([(0, hash_map)]))
+    }
+
     fn get_string_or_insert_mut(&mut self, key: &str, value: &str) -> Result<&mut String, Error> {
         if let None = self.inner.get(key) {
             self.inner.insert(
@@ -177,7 +189,7 @@ impl Dictionary {
         Some(entry.get_list_mut())
     }
 
-    fn remove_string(&mut self, key: &str) -> Result<(Option<String>, Option<SystemTime>), Error> {
+    fn remove_string(&mut self, key: &str) -> Result<(Option<String>, Option<Timestamp>), Error> {
         match self.inner.get(key) {
             Some(entry) => match entry.entry_type {
                 EntryType::String(_) => {}
@@ -236,18 +248,35 @@ impl Display for Error {
 
 impl error::Error for Error {}
 
+#[derive(Debug, Clone)]
 enum EntryType {
     String(String),
     List(VecDeque<String>),
 }
 
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum Timestamp {
+    Seconds(u32),
+    Milliseconds(u64),
+}
+
+impl From<Timestamp> for Duration {
+    fn from(value: Timestamp) -> Self {
+        match value {
+            Timestamp::Seconds(s) => Duration::from_secs(s as u64),
+            Timestamp::Milliseconds(ms) => Duration::from_millis(ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Entry {
     entry_type: EntryType,
-    expires_at: Option<SystemTime>,
+    expires_at: Option<Timestamp>,
 }
 
 impl Entry {
-    fn new(entry_type: EntryType, expires_at: Option<SystemTime>) -> Entry {
+    fn new(entry_type: EntryType, expires_at: Option<Timestamp>) -> Entry {
         Entry {
             entry_type,
             expires_at,
@@ -278,6 +307,19 @@ impl Entry {
         match &mut self.entry_type {
             EntryType::String(_) => Err(Error::WrongType),
             EntryType::List(list) => Ok(list),
+        }
+    }
+}
+
+impl From<Entry> for persistence::Value {
+    fn from(value: Entry) -> Self {
+        match value.entry_type {
+            EntryType::String(string) => {
+                persistence::Value::new(value.expires_at, ValueType::String(string))
+            }
+            EntryType::List(list) => {
+                persistence::Value::new(value.expires_at, ValueType::List(Vec::from(list)))
+            }
         }
     }
 }

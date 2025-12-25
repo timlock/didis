@@ -1,10 +1,10 @@
+use crate::dictionary::Timestamp;
 use lzf::LzfError;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::iter::Peekable;
 use std::num::ParseIntError;
-use std::ops::Add;
 use std::string::FromUtf8Error;
 
 const MAGIC_NUMBER: &'static [u8] = b"REDIS";
@@ -23,8 +23,23 @@ pub struct RDB {
     db_hash_maps: HashMap<u8, HashMap<String, Value>>,
 }
 
-impl From<&RDB> for Vec<u8> {
-    fn from(rdb: &RDB) -> Self {
+impl RDB {
+    pub fn new(
+        auxiliary_fields: HashMap<String, String>,
+        db_hash_maps: HashMap<u8, HashMap<String, Value>>,
+    ) -> RDB {
+        RDB {
+            version: 7,
+            auxiliary_fields,
+            db_hash_maps,
+        }
+    }
+}
+
+impl TryFrom<&RDB> for Vec<u8> {
+    type Error = Error;
+
+    fn try_from(rdb: &RDB) -> Result<Self, Self::Error> {
         let mut bytes = Vec::new();
 
         bytes.extend_from_slice(MAGIC_NUMBER);
@@ -37,8 +52,8 @@ impl From<&RDB> for Vec<u8> {
 
         for (key, value) in &rdb.auxiliary_fields {
             bytes.push(AUX);
-            bytes.extend_from_slice(encode_string(key).as_slice());
-            bytes.extend_from_slice(encode_string(value).as_slice());
+            bytes.extend_from_slice(encode_string(key)?.as_slice());
+            bytes.extend_from_slice(encode_string(value)?.as_slice());
         }
 
         for (db, hash_map) in &rdb.db_hash_maps {
@@ -56,19 +71,19 @@ impl From<&RDB> for Vec<u8> {
                 match value.expires_at {
                     Some(Timestamp::Milliseconds(ms)) => {
                         bytes.push(EXPIRETIMEMS);
-                        bytes.extend_from_slice(ms.to_le_bytes().as_slice());
+                        bytes.extend_from_slice(ms.to_be_bytes().as_slice());
                     }
                     Some(Timestamp::Seconds(s)) => {
                         bytes.push(EXPIRETIME);
-                        bytes.extend_from_slice(s.to_le_bytes().as_slice());
+                        bytes.extend_from_slice(s.to_be_bytes().as_slice());
                     }
                     None => {}
                 }
 
                 let value_type = ValueTypeIdentifier::from(&value.value_type);
                 bytes.push(value_type.into());
-                bytes.extend_from_slice(encode_string(key).as_slice());
-                bytes.extend_from_slice(encode_value(value).as_slice());
+                bytes.extend_from_slice(encode_string(key)?.as_slice());
+                bytes.extend_from_slice(encode_value(value)?.as_slice());
             }
         }
 
@@ -76,7 +91,7 @@ impl From<&RDB> for Vec<u8> {
         let checksum = crc64::crc64(0, bytes.as_slice());
         bytes.extend_from_slice(checksum.to_le_bytes().as_slice());
 
-        bytes
+        Ok(bytes)
     }
 }
 
@@ -85,6 +100,7 @@ impl TryFrom<Vec<u8>> for RDB {
 
     fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
         validate_checksum(&bytes)?;
+        println!("validated checksum");
 
         let mut iter = bytes.into_iter().peekable();
 
@@ -92,12 +108,15 @@ impl TryFrom<Vec<u8>> for RDB {
         if MAGIC_NUMBER != magic_number.as_slice() {
             return Err(Error::WrongMagicNumber(magic_number));
         }
+        println!("validated magic number");
 
         let version_raw: Vec<u8> = iter.by_ref().take(4).collect();
         let version_string = String::from_utf8(version_raw)?;
         let version = version_string.parse()?;
+        println!("rdb version is {}", version_string);
 
         let auxiliary_fields = parse_auxiliary_fields(&mut iter)?;
+        println!("auxiliary fields are {:?}", auxiliary_fields);
 
         let mut db_hash_maps = HashMap::new();
         while &SELECTDB == iter.peek().ok_or(Error::Truncated)? {
@@ -105,6 +124,7 @@ impl TryFrom<Vec<u8>> for RDB {
                 .expect("when peek() returns Some(..) next() should also return Some(..)");
 
             let db_number = iter.next().ok_or(Error::Truncated)?;
+            println!("parsed database number {}", db_number);
 
             let hash_map = match iter.peek() {
                 Some(&RESIZEDB) => {
@@ -112,7 +132,11 @@ impl TryFrom<Vec<u8>> for RDB {
                         .expect("when peek() returns Some(..) next() should also return Some(..)");
 
                     let hash_table_size = decode_length(&mut iter)?;
-                    let _expire_hash_table_size = decode_length(&mut iter)?;
+                    let expire_hash_table_size = decode_length(&mut iter)?;
+                    println!(
+                        "database {} has in total keys {} of which {} have an expire timestamp",
+                        db_number, hash_table_size, expire_hash_table_size
+                    );
                     HashMap::with_capacity(hash_table_size)
                 }
                 _ => HashMap::new(),
@@ -128,12 +152,12 @@ impl TryFrom<Vec<u8>> for RDB {
                 next != SELECTDB && next != EOF
             } {
                 let expires_at = try_timestamp(&mut iter)?;
-                let value_type = parse_value_type(&mut iter)?;
+                let value_type = decode_value_type_identifier(&mut iter)?;
                 let key = decode_string(&mut iter)?;
                 let value = match value_type {
                     ValueTypeIdentifier::String => ValueType::String(decode_string(&mut iter)?),
-                    ValueTypeIdentifier::List => ValueType::List(parse_list(&mut iter)?),
-                    ValueTypeIdentifier::Set => ValueType::Set(parse_set(&mut iter)?),
+                    ValueTypeIdentifier::List => ValueType::List(decode_list(&mut iter)?),
+                    ValueTypeIdentifier::Set => ValueType::Set(decode_set(&mut iter)?),
                 };
 
                 hash_map.insert(
@@ -147,6 +171,7 @@ impl TryFrom<Vec<u8>> for RDB {
         }
 
         expect_op_code(EOF, &mut iter)?;
+        println!("reached EOF op_code");
 
         Ok(RDB {
             version,
@@ -197,12 +222,6 @@ fn parse_auxiliary_fields<I: Iterator<Item = u8>>(
     Ok(auxiliary_fields)
 }
 
-#[derive(Debug, PartialEq)]
-enum Timestamp {
-    Seconds(u32),
-    Milliseconds(u64),
-}
-
 fn try_timestamp<I: Iterator<Item = u8>>(
     iter: &mut Peekable<I>,
 ) -> Result<Option<Timestamp>, Error> {
@@ -216,7 +235,7 @@ fn try_timestamp<I: Iterator<Item = u8>>(
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            let seconds = u32::from_le_bytes(bytes);
+            let seconds = u32::from_be_bytes(bytes);
             Ok(Some(Timestamp::Seconds(seconds)))
         }
         &EXPIRETIMEMS => {
@@ -232,7 +251,7 @@ fn try_timestamp<I: Iterator<Item = u8>>(
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            let milliseconds = u64::from_le_bytes(bytes);
+            let milliseconds = u64::from_be_bytes(bytes);
             Ok(Some(Timestamp::Milliseconds(milliseconds)))
         }
         _ => Ok(None),
@@ -249,20 +268,29 @@ fn expect_op_code(expected_op_code: u8, iter: &mut impl Iterator<Item = u8>) -> 
 }
 
 #[derive(Debug, PartialEq)]
-struct Value {
+pub struct Value {
     expires_at: Option<Timestamp>,
     value_type: ValueType,
 }
 
+impl Value {
+    pub fn new(expires_at: Option<Timestamp>, value_type: ValueType) -> Value {
+        Value {
+            expires_at,
+            value_type,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
-enum ValueType {
+pub enum ValueType {
     String(String),
     List(Vec<String>),
     Set(HashSet<String>),
 }
 
 #[derive(Debug, PartialEq)]
-enum ValueTypeIdentifier {
+pub enum ValueTypeIdentifier {
     String,
     List,
     Set,
@@ -300,42 +328,78 @@ impl TryFrom<u8> for ValueTypeIdentifier {
     }
 }
 
-fn parse_value_type(iter: &mut impl Iterator<Item = u8>) -> Result<ValueTypeIdentifier, Error> {
+fn decode_value_type_identifier(
+    iter: &mut impl Iterator<Item = u8>,
+) -> Result<ValueTypeIdentifier, Error> {
     ValueTypeIdentifier::try_from(iter.next().ok_or(Error::Truncated)?)
 }
 
-fn encode_value(value: &Value) -> Vec<u8> {
-    match &value.value_type {
-        ValueType::String(string) => encode_string(string),
-        ValueType::List(list) => encode_list(list),
-        ValueType::Set(set) => encode_set(set),
+fn encode_value(value: &Value) -> Result<Vec<u8>, LzfError> {
+    let result = match &value.value_type {
+        ValueType::String(string) => encode_string(string)?,
+        ValueType::List(list) => encode_list(list)?,
+        ValueType::Set(set) => encode_set(set)?,
+    };
+
+    Ok(result)
+}
+
+fn encode_string(string: &str) -> Result<Vec<u8>, LzfError> {
+    if string.len() > 20 {
+        let mut bytes = Size::Compressed.encode();
+        let compressed_string = lzf::compress(string.as_bytes())?;
+        bytes.extend_from_slice(Size::Length(compressed_string.len()).encode().as_slice());
+        bytes.extend_from_slice(Size::Length(string.len()).encode().as_slice());
+        bytes.extend_from_slice(compressed_string.as_slice());
+
+        Ok(bytes)
+    } else if let Ok(i) = string.parse::<i32>() {
+        return Ok(encode_integer(i));
+    } else {
+        let mut bytes = Size::Length(string.len()).encode();
+        bytes.extend_from_slice(string.as_bytes());
+        Ok(bytes)
     }
 }
 
-fn encode_string(string: &str) -> Vec<u8> {
-    let mut bytes = Size::Length(string.len()).encode();
-    bytes.extend_from_slice(string.as_bytes());
-    bytes
+fn encode_integer(value: i32) -> Vec<u8> {
+    match value {
+        -128..=127 => {
+            let mut bytes = Size::EightBits.encode();
+            bytes.push(value as u8);
+            bytes
+        }
+        -32768..=32767 => {
+            let mut bytes = Size::SixteenBits.encode();
+            bytes.extend_from_slice((value as i16) .to_be_bytes().as_slice());
+            bytes
+        }
+        _ => {
+            let mut bytes = Size::ThirtyTwoBits.encode();
+            bytes.extend_from_slice(value.to_be_bytes().as_slice());
+            bytes
+        }
+    }
 }
 
-fn encode_list(list: &Vec<String>) -> Vec<u8> {
+fn encode_list(list: &Vec<String>) -> Result<Vec<u8>, LzfError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(Size::Length(list.len()).encode().as_slice());
     for item in list {
-        bytes.extend_from_slice(encode_string(item).as_slice());
+        bytes.extend_from_slice(encode_string(item)?.as_slice());
     }
 
-    bytes
+    Ok(bytes)
 }
 
-fn encode_set(set: &HashSet<String>) -> Vec<u8> {
+fn encode_set(set: &HashSet<String>) -> Result<Vec<u8>, LzfError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(Size::Length(set.len()).encode().as_slice());
     for item in set {
-        bytes.extend_from_slice(encode_string(item).as_slice());
+        bytes.extend_from_slice(encode_string(item)?.as_slice());
     }
 
-    bytes
+    Ok(bytes)
 }
 
 fn decode_string(iter: &mut impl Iterator<Item = u8>) -> Result<String, Error> {
@@ -353,7 +417,7 @@ fn decode_string(iter: &mut impl Iterator<Item = u8>) -> Result<String, Error> {
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            Ok(i16::from_le_bytes(bytes).to_string())
+            Ok(i16::from_be_bytes(bytes).to_string())
         }
         Size::ThirtyTwoBits => {
             let bytes = [
@@ -362,7 +426,7 @@ fn decode_string(iter: &mut impl Iterator<Item = u8>) -> Result<String, Error> {
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            Ok(i32::from_le_bytes(bytes).to_string())
+            Ok(i32::from_be_bytes(bytes).to_string())
         }
         Size::Compressed => {
             let compressed_length = decode_length(iter)?;
@@ -375,7 +439,7 @@ fn decode_string(iter: &mut impl Iterator<Item = u8>) -> Result<String, Error> {
     }
 }
 
-fn parse_list(iter: &mut impl Iterator<Item = u8>) -> Result<Vec<String>, Error> {
+fn decode_list(iter: &mut impl Iterator<Item = u8>) -> Result<Vec<String>, Error> {
     let len = decode_length(iter)?;
     let mut list = Vec::with_capacity(len);
     for _ in 0..len {
@@ -386,7 +450,7 @@ fn parse_list(iter: &mut impl Iterator<Item = u8>) -> Result<Vec<String>, Error>
     Ok(list)
 }
 
-fn parse_set(iter: &mut impl Iterator<Item = u8>) -> Result<HashSet<String>, Error> {
+fn decode_set(iter: &mut impl Iterator<Item = u8>) -> Result<HashSet<String>, Error> {
     let len = decode_length(iter)?;
     let mut set = HashSet::with_capacity(len);
     for _ in 0..len {
@@ -415,7 +479,7 @@ impl Size {
                     vec![((*len >> 8) | 0b0100_0000) as u8, *len as u8]
                 } else {
                     let mut bytes = vec![0b0100_0000];
-                    bytes.extend_from_slice(&len.to_le_bytes());
+                    bytes.extend_from_slice(&len.to_be_bytes());
 
                     bytes
                 }
@@ -450,7 +514,7 @@ fn decode_size(iter: &mut impl Iterator<Item = u8>) -> Result<Size, Error> {
         0b0000_0001 => {
             let second = iter.next().ok_or(Error::Truncated)?;
             let length_parts = [0, 0, 0, 0, 0, 0, first & 0b0011_1111, second];
-            Ok(Size::Length(usize::from_le_bytes(length_parts)))
+            Ok(Size::Length(usize::from_be_bytes(length_parts)))
         }
         0b0000_0010 => {
             let length_parts = [
@@ -463,7 +527,7 @@ fn decode_size(iter: &mut impl Iterator<Item = u8>) -> Result<Size, Error> {
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            Ok(Size::Length(usize::from_le_bytes(length_parts)))
+            Ok(Size::Length(usize::from_be_bytes(length_parts)))
         }
         0b0000_0011 => match first & 0b0011_1111 {
             0 => Ok(Size::EightBits),
@@ -585,7 +649,7 @@ mod test {
                 String::from("string3"),
                 Value {
                     expires_at: Some(Timestamp::Seconds(2)),
-                    value_type: ValueType::String(String::from("short value")),
+                    value_type: ValueType::String(String::from("123456")),
                 },
             ),
             (
@@ -600,9 +664,9 @@ mod test {
                 Value {
                     expires_at: None,
                     value_type: ValueType::List(vec![
-                        String::from("1"),
-                        String::from("2"),
-                        String::from("3"),
+                        String::from("127"),
+                        String::from("32767"),
+                        String::from("2147483647"),
                     ]),
                 },
             ),
@@ -611,9 +675,9 @@ mod test {
                 Value {
                     expires_at: None,
                     value_type: ValueType::Set(HashSet::from([
-                        String::from("1"),
-                        String::from("2"),
-                        String::from("3"),
+                        String::from("-128"),
+                        String::from("-32768"),
+                        String::from("-2147483648"),
                     ])),
                 },
             ),
@@ -630,7 +694,7 @@ mod test {
             )]),
         );
 
-        let bytes = Vec::<u8>::from(&want);
+        let bytes = Vec::<u8>::try_from(&want)?;
 
         let got = RDB::try_from(bytes)?;
 

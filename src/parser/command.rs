@@ -1,4 +1,5 @@
 use super::resp;
+use crate::dictionary::Timestamp;
 use crate::parser::resp::{parse, ParsedValue, Reference, ValOrRef, Value};
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -391,19 +392,33 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub enum ExpireRule {
-    ExpiresInSecs(Duration),
-    ExpiresInMillis(Duration),
-    ExpiresAtSecs(Duration),
-    ExpiresAtMillis(Duration),
+    ExpiresInSecs(u64),
+    ExpiresInMillis(u64),
+    ExpiresAtSecs(u64),
+    ExpiresAtMillis(u64),
     KeepTTL,
 }
 impl ExpireRule {
-    pub fn calculate_expire_time(&self, old_expires_at: Option<SystemTime>) -> Option<SystemTime> {
+    pub fn calculate_expire_time(&self, old_expires_at: Option<Timestamp>) -> Option<Timestamp> {
         match self {
-            ExpireRule::ExpiresInSecs(s) => SystemTime::now().checked_add(*s),
-            ExpireRule::ExpiresInMillis(ms) => SystemTime::now().checked_add(*ms),
-            ExpireRule::ExpiresAtSecs(s) => Some(SystemTime::UNIX_EPOCH.checked_add(*s)?),
-            ExpireRule::ExpiresAtMillis(ms) => Some(SystemTime::UNIX_EPOCH.checked_add(*ms)?),
+            ExpireRule::ExpiresInSecs(s) => {
+                let expires_at = SystemTime::now() + Duration::from_secs(*s);
+                let expires_at_secs = expires_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                Some(Timestamp::Seconds(expires_at_secs as u32))
+            }
+            ExpireRule::ExpiresInMillis(ms) => {
+                let expires_at = SystemTime::now() + Duration::from_secs(*ms);
+                let expires_at_in_millis = expires_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                Some(Timestamp::Milliseconds(expires_at_in_millis as u64))
+            }
+            ExpireRule::ExpiresAtSecs(s) => Some(Timestamp::Seconds(*s as u32)),
+            ExpireRule::ExpiresAtMillis(ms) => Some(Timestamp::Milliseconds(*ms)),
             ExpireRule::KeepTTL => old_expires_at,
         }
     }
@@ -415,27 +430,25 @@ impl TryFrom<&[u8]> for ExpireRule {
             let trimmed = &value[2..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let secs = ascii_number.parse()?;
-            let dur = Duration::from_secs(secs);
-            return Ok(ExpireRule::ExpiresInSecs(dur));
+            return Ok(ExpireRule::ExpiresInSecs(secs));
         }
         if value.starts_with(b"PX") {
             let trimmed = &value[2..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let millis = ascii_number.parse()?;
-            let dur = Duration::from_millis(millis);
-            return Ok(ExpireRule::ExpiresInMillis(dur));
+            return Ok(ExpireRule::ExpiresInMillis(millis));
         }
         if value.starts_with(b"EXAT") {
             let trimmed = &value[4..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let secs = ascii_number.parse()?;
-            return Ok(ExpireRule::ExpiresAtSecs(Duration::from_secs(secs)));
+            return Ok(ExpireRule::ExpiresAtSecs(secs));
         }
         if value.starts_with(b"PXAT") {
             let trimmed = &value[4..].trim_ascii_start();
             let ascii_number = std::str::from_utf8(trimmed)?;
             let millis = ascii_number.parse()?;
-            return Ok(ExpireRule::ExpiresAtMillis(Duration::from_millis(millis)));
+            return Ok(ExpireRule::ExpiresAtMillis(millis));
         }
         if value == b"KEEPTTL" {
             return Ok(ExpireRule::KeepTTL);
@@ -458,17 +471,11 @@ impl TryFrom<&str> for ExpireRule {
 impl From<ExpireRule> for Value {
     fn from(value: ExpireRule) -> Self {
         match value {
-            ExpireRule::ExpiresInSecs(duration) => {
-                Value::BulkString(format!("EX {}", duration.as_secs()))
-            }
-            ExpireRule::ExpiresInMillis(duration) => {
-                Value::BulkString(format!("PX {}", duration.as_millis()))
-            }
-            ExpireRule::ExpiresAtSecs(duration) => {
-                Value::BulkString(format!("EXAT {}", duration.as_secs()))
-            }
+            ExpireRule::ExpiresInSecs(duration) => Value::BulkString(format!("EX {}", duration)),
+            ExpireRule::ExpiresInMillis(duration) => Value::BulkString(format!("PX {}", duration)),
+            ExpireRule::ExpiresAtSecs(duration) => Value::BulkString(format!("EXAT {}", duration)),
             ExpireRule::ExpiresAtMillis(duration) => {
-                Value::BulkString(format!("PXAT {}", duration.as_millis()))
+                Value::BulkString(format!("PXAT {}", duration))
             }
             ExpireRule::KeepTTL => Value::BulkString(String::from("KEEPTTL")),
         }
@@ -762,7 +769,7 @@ mod tests {
                 value: Cow::Owned("value".to_string()),
                 overwrite_rule: Some(OverwriteRule::Exists),
                 get: true,
-                expire_rule: Some(ExpireRule::ExpiresInSecs(Duration::from_secs(10))),
+                expire_rule: Some(ExpireRule::ExpiresInSecs(10)),
             },
             command
         );
@@ -786,7 +793,7 @@ mod tests {
                 value: Cow::Borrowed("value"),
                 overwrite_rule: Some(OverwriteRule::Exists),
                 get: true,
-                expire_rule: Some(ExpireRule::ExpiresInSecs(Duration::from_secs(10))),
+                expire_rule: Some(ExpireRule::ExpiresInSecs(10)),
             },
             command
         );
