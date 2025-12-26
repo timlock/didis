@@ -115,12 +115,19 @@ pub enum Value {
     Null,
 }
 
-
-
 impl Value {
     pub fn ok() -> Value {
         Value::SimpleString("OK".to_string())
     }
+
+    pub fn bulk_string(value: &str) -> Value {
+        Value::BulkString(value.to_string())
+    }
+
+    pub fn simple_error(value: &str) -> Value {
+        Value::SimpleError(value.to_string())
+    }
+
     pub fn to_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::new();
         const CRLF: &[u8; 2] = b"\r\n";
@@ -219,6 +226,15 @@ impl Display for Value {
             }
             Value::Null => write!(f, "_\\r\\n"),
         }
+    }
+}
+
+impl<T> From<T> for Value
+where
+    T: error::Error,
+{
+    fn from(value: T) -> Self {
+        Value::SimpleError(value.to_string())
     }
 }
 

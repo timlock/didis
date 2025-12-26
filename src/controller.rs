@@ -3,18 +3,30 @@ use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
 use crate::persistence::{ValueType, RDB};
 use crate::pubsub::{ChannelStore, Message};
+use libc::{c_int, pid_t};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::fs;
+use std::time::SystemTime;
+use std::{fs, io};
 
-#[derive(Default)]
 pub struct Controller {
     dictionary: Dictionary,
     channel_store: ChannelStore,
     messages: VecDeque<Message>,
+    background_jobs: JobQueue,
+    last_save: SystemTime,
 }
 
 impl Controller {
+    pub fn new(last_save: SystemTime) -> Controller {
+        Controller {
+            dictionary: Dictionary::default(),
+            channel_store: ChannelStore::default(),
+            messages: VecDeque::default(),
+            background_jobs: JobQueue::default(),
+            last_save,
+        }
+    }
     pub fn handle_command(&mut self, client_id: u64, command: Command) -> Option<ValOrRef> {
         let result: ValOrRef = match command {
             Command::Ping(None) => Reference::SimpleString("PONG").into(),
@@ -164,11 +176,19 @@ impl Controller {
 
                 Value::Integer(subscribers_len).into()
             }
-            Command::Save => match self.create_snapshot() {
+            Command::Save => match self.save() {
                 Ok(()) => ValOrRef::Ref(Reference::SimpleString("ok")),
                 Err(simple_error) => ValOrRef::Val(simple_error),
             },
-
+            Command::BackgroundSave(scheduled) => match self.background_save(scheduled) {
+                Ok(true) => ValOrRef::Ref(Reference::SimpleString("Background saving started")),
+                Ok(false) => ValOrRef::Ref(Reference::SimpleString("Background saving scheduled")),
+                Err(simple_error) => ValOrRef::Val(simple_error),
+            },
+            Command::LastSave => match self.last_save.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(duration) => ValOrRef::Val(Value::Integer(duration.as_secs() as i64)),
+                Err(err) => ValOrRef::Ref(Reference::SimpleError("System clock error")),
+            },
             Command::Expire {
                 key,
                 seconds,
@@ -216,16 +236,170 @@ impl Controller {
                 }
             }
         }
+
+        self.last_save = SystemTime::now();
         Ok(())
     }
 
-    pub fn create_snapshot(&self) -> Result<(), Value> {
+    pub fn save(&mut self) -> Result<(), Value> {
         let rdb = self.dictionary.snapshot();
-        let bytes = Vec::<u8>::try_from(&rdb)
-            .map_err(|err| Value::SimpleError(format!("failed to serialize database {err}")))?;
-        fs::write("dump.rdb", bytes.as_slice())
-            .map_err(|err| Value::SimpleError(format!("failed to create dump file {err}")))?;
-        fs::rename("dump.rdb", "save.rdb")
-            .map_err(|err| Value::SimpleError(format!("remove old dump file {err}")))
+        let bytes = Vec::<u8>::try_from(&rdb)?;
+
+        println!("Creating new save file");
+        fs::write("dump.rdb", bytes.as_slice())?;
+
+        println!("Replacing old save file");
+        fs::rename("dump.rdb", "save.rdb")?;
+
+        self.last_save = SystemTime::now();
+
+        Ok(())
+    }
+
+    pub fn background_save(&mut self, scheduled: bool) -> Result<bool, Value> {
+        while let Some(result) = self.background_jobs.pop_if_done() {
+            result?;
+        }
+
+        match self.background_jobs.pop_if_scheduled() {
+            Some(_) => {
+                return if scheduled {
+                    self.background_jobs.push_scheduled();
+                    Ok(false)
+                } else {
+                    Err(Value::simple_error(
+                        "There is already a save process running",
+                    ))
+                };
+            }
+            None => {}
+        }
+
+        let process_id = self.do_background_save()?;
+        self.background_jobs.push_active(process_id);
+        Ok(true)
+    }
+
+    pub fn do_jobs(&mut self) -> io::Result<()> {
+        while let Some(result) = self.background_jobs.pop_if_done() {
+            result?;
+        }
+
+        if let None = self.background_jobs.pop_if_scheduled() {
+            return Ok(());
+        }
+
+        let child_process_id = self.do_background_save()?;
+        self.background_jobs.push_active(child_process_id);
+
+        Ok(())
+    }
+
+    fn do_background_save(&mut self) -> io::Result<pid_t> {
+        println!("Begin background save");
+        unsafe {
+            let process_id = libc::fork();
+            match process_id {
+                ..0 => {
+                    return Err(io::Error::last_os_error());
+                }
+                0 => {}
+                1.. => {
+                    println!("forked child process {}", process_id);
+                    return Ok(process_id);
+                }
+            }
+        }
+
+        match self.save() {
+            Ok(()) => {
+                println!("Created save file")
+            }
+            Err(err) => {
+                println!("Failed to create save file {}", err)
+            }
+        }
+
+        println!("exit child_process");
+        unsafe { libc::_exit(0) }
+    }
+}
+
+enum JobStatus {
+    Scheduled,
+    Active,
+    Done,
+}
+
+#[derive(Default)]
+struct JobQueue {
+    inner: VecDeque<BackgroundJob>,
+}
+
+impl JobQueue {
+    pub fn push_scheduled(&mut self) {
+        self.inner.push_back(BackgroundJob::scheduled())
+    }
+
+    pub fn push_active(&mut self, process_id: pid_t) {
+        self.inner.push_front(BackgroundJob::active(process_id))
+    }
+
+    fn pop_if_done(&mut self) -> Option<io::Result<BackgroundJob>> {
+        if let Some(job) = self.inner.front() {
+            return match job.status() {
+                Ok(JobStatus::Done) => self.inner.pop_front().map(|job| Ok(job)),
+                Err(err) => Some(Err(err)),
+                _ => None,
+            };
+        }
+
+        None
+    }
+
+    fn pop_if_scheduled(&mut self) -> Option<BackgroundJob> {
+        if let Some(job) = self.inner.front() {
+            return if job.process_id.is_some() {
+                None
+            } else {
+                self.inner.pop_front()
+            };
+        }
+
+        None
+    }
+}
+struct BackgroundJob {
+    process_id: Option<pid_t>,
+}
+impl BackgroundJob {
+    fn scheduled() -> BackgroundJob {
+        BackgroundJob { process_id: None }
+    }
+    fn active(process_id: pid_t) -> BackgroundJob {
+        BackgroundJob {
+            process_id: Some(process_id),
+        }
+    }
+
+    fn status(&self) -> io::Result<JobStatus> {
+        let process_id = match self.process_id {
+            Some(process_id) => process_id,
+            None => return Ok(JobStatus::Scheduled),
+        };
+
+        let result = unsafe { libc::kill(process_id, 0 as c_int) };
+        if result < 0 {
+            let err = io::Error::last_os_error();
+            return match err.kind() {
+                io::ErrorKind::NotFound => Ok(JobStatus::Done),
+                _ => Err(err),
+            };
+        }
+        if result == 0 {
+            return Ok(JobStatus::Active);
+        }
+
+        panic!("kill(2) should return 0 or -1, but returned {}", result)
     }
 }

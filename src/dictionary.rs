@@ -1,6 +1,6 @@
 use crate::parser::command::{ExpireRule, OverwriteRule, SetValueExpireRule};
 use crate::persistence;
-use crate::persistence::{Value, ValueType, RDB};
+use crate::persistence::RDB;
 use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -392,21 +392,21 @@ impl From<Entry> for persistence::Value {
     fn from(value: Entry) -> Self {
         match value.entry_type {
             EntryType::String(string) => {
-                persistence::Value::new(value.expires_at, ValueType::String(string))
+                persistence::Value::new(value.expires_at, persistence::ValueType::String(string))
             }
             EntryType::List(list) => {
-                persistence::Value::new(value.expires_at, ValueType::List(Vec::from(list)))
+                persistence::Value::new(value.expires_at, persistence::ValueType::List(Vec::from(list)))
             }
         }
     }
 }
 
 impl From<persistence::Value> for Entry {
-    fn from(value: Value) -> Self {
+    fn from(value: persistence::Value) -> Self {
         let entry_type = match value.value_type {
-            ValueType::String(string) => EntryType::String(string),
-            ValueType::List(list) => EntryType::List(VecDeque::from(list)),
-            ValueType::Set(set) => {
+            persistence::ValueType::String(string) => EntryType::String(string),
+            persistence::ValueType::List(list) => EntryType::List(VecDeque::from(list)),
+            persistence::ValueType::Set(set) => {
                 todo!()
             }
         };

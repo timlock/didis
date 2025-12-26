@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use std::{
     collections::HashMap,
     fs,
@@ -30,7 +30,7 @@ impl Server {
         Self {
             address,
             connections: Default::default(),
-            controller: Default::default(),
+            controller: Controller::new(SystemTime::now()),
             done: Arc::new(AtomicBool::new(false)),
             id_counter: 0,
         }
@@ -80,12 +80,14 @@ impl Server {
             }
 
             if self.controller.has_messages() {
-                self.publish_messages(io)?;
+                self.publish_messages()?;
             }
 
             for (_, connection) in &mut self.connections {
                 connection.flush(io)?;
             }
+
+            self.controller.do_jobs()?;
 
             if self.done.load(Ordering::SeqCst) {
                 println!("Server stopped");
@@ -173,12 +175,14 @@ impl Server {
         for command in commands {
             let response = match command {
                 Ok(command) => {
+                    let start = Instant::now();
                     println!("Received command: {}", command);
                     if let Some(response) = self.controller.handle_command(connection.id, command) {
-                        println!("Sending response {response}");
+                        println!("Sending response {response} took {:?}", start.elapsed());
 
                         response.to_bytes()
                     } else {
+                        println!("Took {:?}", start.elapsed());
                         Default::default()
                     }
                 }
@@ -194,7 +198,7 @@ impl Server {
         Ok(())
     }
 
-    fn publish_messages(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
+    fn publish_messages(&mut self) -> io::Result<()> {
         let messages = self.controller.messages();
         for message in messages {
             let bytes = message.value.to_bytes();

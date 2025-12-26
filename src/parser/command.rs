@@ -108,6 +108,8 @@ pub enum Command<'a> {
         message: Cow<'a, str>,
     },
     Save,
+    BackgroundSave(bool),
+    LastSave,
     Expire {
         key: Cow<'a, str>,
         seconds: u64,
@@ -119,18 +121,18 @@ impl<'a> Command<'a> {
     pub fn to_resp(self) -> Value {
         match self {
             Command::Ping(message) => {
-                let mut command_parts = vec![Value::BulkString(String::from("PING"))];
+                let mut command_parts = vec![Value::bulk_string("PING")];
                 if let Some(message) = message {
                     command_parts.push(Value::BulkString(message.into_owned()));
                 }
                 Value::Array(command_parts)
             }
             Command::Echo(message) => Value::Array(vec![
-                Value::BulkString(String::from("ECHO")),
+                Value::bulk_string("ECHO"),
                 Value::BulkString(message.into_owned()),
             ]),
             Command::Get(key) => Value::Array(vec![
-                Value::BulkString(String::from("GET")),
+                Value::bulk_string("GET"),
                 Value::BulkString(key.into_owned()),
             ]),
             Command::Set {
@@ -141,7 +143,7 @@ impl<'a> Command<'a> {
                 expire_rule,
             } => {
                 let mut command_parts = vec![
-                    Value::BulkString(String::from("SET")),
+                    Value::bulk_string("SET"),
                     Value::BulkString(key.into_owned()),
                     Value::BulkString(value.into_owned()),
                 ];
@@ -149,7 +151,7 @@ impl<'a> Command<'a> {
                     command_parts.push(Value::from(overwrite_rule));
                 }
                 if get {
-                    command_parts.push(Value::BulkString(String::from("GET")))
+                    command_parts.push(Value::bulk_string("GET"))
                 }
                 if let Some(expire_rule) = expire_rule {
                     command_parts.push(Value::from(expire_rule));
@@ -158,18 +160,16 @@ impl<'a> Command<'a> {
                 Value::Array(command_parts)
             }
             Command::ConfigGet(config_params) => {
-                let mut command_parts = vec![
-                    Value::BulkString(String::from("CONFIG")),
-                    Value::BulkString(String::from("GET")),
-                ];
+                let mut command_parts =
+                    vec![Value::bulk_string("CONFIG"), Value::bulk_string("GET")];
                 for config_param in config_params {
                     command_parts.push(Value::BulkString(config_param.into_owned()));
                 }
                 Value::Array(command_parts)
             }
-            Command::Client => Value::Array(vec![Value::BulkString(String::from("CLIENT"))]),
+            Command::Client => Value::Array(vec![Value::bulk_string("CLIENT")]),
             Command::Exists(keys) => {
-                let mut command_parts = vec![Value::BulkString(String::from("EXISTS"))];
+                let mut command_parts = vec![Value::bulk_string("EXISTS")];
                 for key in keys {
                     command_parts.push(Value::BulkString(key.into_owned()));
                 }
@@ -177,7 +177,7 @@ impl<'a> Command<'a> {
                 Value::Array(command_parts)
             }
             Command::Delete(keys) => {
-                let mut command_parts = vec![Value::BulkString(String::from("DELETE"))];
+                let mut command_parts = vec![Value::bulk_string("DELETE")];
                 for key in keys {
                     command_parts.push(Value::BulkString(key.into_owned()));
                 }
@@ -185,32 +185,32 @@ impl<'a> Command<'a> {
                 Value::Array(command_parts)
             }
             Command::Increment(key) => Value::Array(vec![
-                Value::BulkString(String::from("INCR")),
+                Value::bulk_string("INCR"),
                 Value::BulkString(key.into_owned()),
             ]),
             Command::IncrementBy(key, by) => Value::Array(vec![
-                Value::BulkString(String::from("INCRBY")),
+                Value::bulk_string("INCRBY"),
                 Value::BulkString(key.into_owned()),
                 Value::BulkString(by.to_string()),
             ]),
             Command::Decrement(key) => Value::Array(vec![
-                Value::BulkString(String::from("DECR")),
+                Value::bulk_string("DECR"),
                 Value::BulkString(key.into_owned()),
             ]),
             Command::DecrementBy(key, by) => Value::Array(vec![
-                Value::BulkString(String::from("DECRBY")),
+                Value::bulk_string("DECRBY"),
                 Value::BulkString(key.into_owned()),
                 Value::BulkString(by.to_string()),
             ]),
             Command::ListRange(key, start, end) => Value::Array(vec![
-                Value::BulkString(String::from("LRANGE")),
+                Value::bulk_string("LRANGE"),
                 Value::BulkString(key.into_owned()),
                 Value::BulkString(start.to_string()),
                 Value::BulkString(end.to_string()),
             ]),
             Command::LeftPush(key, items) => {
                 let mut command_parts = vec![
-                    Value::BulkString(String::from("LPUSH")),
+                    Value::bulk_string("LPUSH"),
                     Value::BulkString(key.into_owned()),
                 ];
                 for item in items {
@@ -221,7 +221,7 @@ impl<'a> Command<'a> {
             }
             Command::RightPush(key, items) => {
                 let mut command_parts = vec![
-                    Value::BulkString(String::from("RPUSH")),
+                    Value::bulk_string("RPUSH"),
                     Value::BulkString(key.into_owned()),
                 ];
                 for item in items {
@@ -231,7 +231,7 @@ impl<'a> Command<'a> {
                 Value::Array(command_parts)
             }
             Command::Subscribe(channels) => {
-                let mut command_parts = vec![Value::BulkString(String::from("SUBSCRIBE"))];
+                let mut command_parts = vec![Value::bulk_string("SUBSCRIBE")];
                 for channel in channels {
                     command_parts.push(Value::BulkString(channel.into_owned()));
                 }
@@ -239,7 +239,7 @@ impl<'a> Command<'a> {
                 Value::Array(command_parts)
             }
             Command::Unsubscribe(channels) => {
-                let mut command_parts = vec![Value::BulkString(String::from("UNSUBSCRIBE"))];
+                let mut command_parts = vec![Value::bulk_string("UNSUBSCRIBE")];
                 for channel in channels {
                     command_parts.push(Value::BulkString(channel.into_owned()));
                 }
@@ -247,18 +247,26 @@ impl<'a> Command<'a> {
                 Value::Array(command_parts)
             }
             Command::Publish { channel, message } => Value::Array(vec![
-                Value::BulkString(String::from("PUBLISH")),
+                Value::bulk_string("PUBLISH"),
                 Value::BulkString(channel.into_owned()),
                 Value::BulkString(message.into_owned()),
             ]),
-            Command::Save => Value::Array(vec![Value::BulkString(String::from("SAVE"))]),
+            Command::Save => Value::Array(vec![Value::bulk_string("SAVE")]),
+            Command::BackgroundSave(scheduled) => {
+                let mut command_parts = vec![Value::bulk_string("SAVE")];
+                if scheduled {
+                    command_parts.push(Value::bulk_string("SCHEDULED"))
+                }
+                Value::Array(command_parts)
+            }
+            Command::LastSave => Value::Array(vec![Value::bulk_string("LASTSAVE")]),
             Command::Expire {
                 key,
                 seconds,
                 expire_rule,
             } => {
                 let mut command_parts = vec![
-                    Value::BulkString(String::from("EXPIRE")),
+                    Value::bulk_string("EXPIRE"),
                     Value::BulkString(key.into_owned()),
                     Value::BulkString(seconds.to_string()),
                 ];
@@ -353,6 +361,15 @@ impl<'a> Display for Command<'a> {
                 write!(f, "PUBLISH {} {}", channel, message)
             }
             Command::Save => write!(f, "SAVE"),
+            Command::BackgroundSave(scheduled) => {
+                write!(f, "BGSAVE")?;
+                if *scheduled {
+                    write!(f, "SCHEDULED")?;
+                }
+
+                Ok(())
+            }
+            Command::LastSave => write!(f, "LASTSAVE"),
             Command::Expire {
                 key,
                 seconds,
@@ -417,6 +434,8 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
             "UNSUBSCRIBE" => parse_unsubscribe(&mut iter)?,
             "PUBLISH" => parse_publish(&mut iter)?,
             "SAVE" => Command::Save,
+            "BGSAVE" => parse_background_save(&mut iter)?,
+            "LASTSAVE" => Command::LastSave,
             _ => return Err(Error::UnknownCommand(name)),
         };
         if !iter.is_empty() {
@@ -578,7 +597,7 @@ impl From<SetValueExpireRule> for Value {
             SetValueExpireRule::ExpiresAtMillis(duration) => {
                 Value::BulkString(format!("PXAT {}", duration))
             }
-            SetValueExpireRule::KeepTTL => Value::BulkString(String::from("KEEPTTL")),
+            SetValueExpireRule::KeepTTL => Value::bulk_string("KEEPTTL"),
         }
     }
 }
@@ -606,8 +625,8 @@ impl TryFrom<&str> for OverwriteRule {
 impl From<OverwriteRule> for Value {
     fn from(value: OverwriteRule) -> Self {
         match value {
-            OverwriteRule::NotExists => Value::BulkString(String::from("NX")),
-            OverwriteRule::Exists => Value::BulkString(String::from("XX")),
+            OverwriteRule::NotExists => Value::bulk_string("NX"),
+            OverwriteRule::Exists => Value::bulk_string("XX"),
         }
     }
 }
@@ -848,6 +867,23 @@ fn parse_publish<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, 
     let message = expect_string(queue)?;
 
     Ok(Command::Publish { channel, message })
+}
+
+fn parse_background_save<'a>(queue: &mut VecDeque<ValOrRef<'a>>) -> Result<Command<'a>, Error> {
+    let scheduled = try_string(queue)?;
+    let scheduled = if let Some(scheduled) = scheduled {
+        if scheduled.to_ascii_uppercase() != "SCHEDULED" {
+            return Err(Error::UnknownArguments(vec![Value::BulkString(
+                scheduled.into_owned(),
+            )]));
+        }
+
+        true
+    } else {
+        false
+    };
+
+    Ok(Command::BackgroundSave(scheduled))
 }
 
 mod tests {
