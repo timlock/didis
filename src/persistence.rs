@@ -3,11 +3,16 @@ use lzf::LzfError;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::io;
+use std::io::Write;
 use std::iter::Peekable;
 use std::num::ParseIntError;
+use std::str::Utf8Error;
 use std::string::FromUtf8Error;
+use std::time::{SystemTime, SystemTimeError};
 
 const MAGIC_NUMBER: &'static [u8] = b"REDIS";
+
+const RDB_VERSION: &[u8] = b"0007";
 
 const EOF: u8 = 0xFF;
 const SELECTDB: u8 = 0xFE;
@@ -16,11 +21,92 @@ const EXPIRETIMEMS: u8 = 0xFC;
 const RESIZEDB: u8 = 0xFB;
 const AUX: u8 = 0xFA;
 
+pub trait Dump {
+    fn redis_version(&self) -> &str;
+    fn memory_usage(&self) -> &str;
+    fn dump_iter(&self) -> impl Iterator<Item = (u8, impl Iterator<Item = (&str, Reference)> + Clone)>;
+}
+
+pub fn write_dump(dump: impl Dump, writer: &mut impl Write) -> Result<(), Error> {
+    writer.write_all(MAGIC_NUMBER)?;
+    writer.write_all(RDB_VERSION)?;
+
+    writer.write_all(&[AUX])?;
+    writer.write_all(b"redis-ver")?;
+    write_string(dump.redis_version(), writer)?;
+
+    writer.write_all(&[AUX])?;
+    writer.write_all(b"redis-bits")?;
+
+    write_string(str::from_utf8(&[usize::BITS as u8])?, writer)?;
+
+    writer.write_all(&[AUX])?;
+    writer.write_all(b"ctime")?;
+    write_string(
+        str::from_utf8(
+            SystemTime::UNIX_EPOCH
+                .elapsed()?
+                .as_secs()
+                .to_le_bytes()
+                .as_slice(),
+        )?,
+        writer,
+    )?;
+
+    writer.write_all(&[AUX])?;
+    writer.write_all(b"used-mem")?;
+    writer.write_all(&[0])?; // TODO calculate usage
+
+    let mut iter = dump.dump_iter();
+    for (db, db_iter) in iter {
+        writer.write_all(&[SELECTDB])?;
+        writer.write_all(&[db])?;
+        writer.write_all(&[RESIZEDB])?;
+        Size::Length(db_iter.size_hint().0).write(writer)?;
+        let mut len = 0;
+        let mut expiry_len= 0;
+        for (key, value) in db_iter.clone(){
+
+        }
+
+        let keys_with_expires = hash_map
+            .values()
+            .filter(|value| value.expires_at.is_some())
+            .count();
+        bytes.extend_from_slice(Size::Length(keys_with_expires).encode().as_slice());
+
+        for (key, value) in hash_map {
+            match value.expires_at {
+                Some(Timestamp::Milliseconds(ms)) => {
+                    bytes.push(EXPIRETIMEMS);
+                    bytes.extend_from_slice(ms.to_le_bytes().as_slice());
+                }
+                Some(Timestamp::Seconds(s)) => {
+                    bytes.push(EXPIRETIME);
+                    bytes.extend_from_slice(s.to_le_bytes().as_slice());
+                }
+                None => {}
+            }
+
+            let value_type = ValueTypeIdentifier::from(&value.value_type);
+            bytes.push(value_type.into());
+            bytes.extend_from_slice(encode_string(key)?.as_slice());
+            bytes.extend_from_slice(encode_value(value)?.as_slice());
+        }
+    }
+
+    bytes.push(EOF);
+    let checksum = crc64::crc64(0, bytes.as_slice());
+    bytes.extend_from_slice(checksum.to_le_bytes().as_slice());
+
+    Ok(bytes)
+}
+
 #[derive(Debug, PartialEq)]
 pub struct RDB {
     version: u32,
     auxiliary_fields: HashMap<String, String>,
-   pub db_hash_maps: HashMap<u8, HashMap<String, Value>>,
+    pub db_hash_maps: HashMap<u8, HashMap<String, Value>>,
 }
 
 impl RDB {
@@ -71,11 +157,11 @@ impl TryFrom<&RDB> for Vec<u8> {
                 match value.expires_at {
                     Some(Timestamp::Milliseconds(ms)) => {
                         bytes.push(EXPIRETIMEMS);
-                        bytes.extend_from_slice(ms.to_be_bytes().as_slice());
+                        bytes.extend_from_slice(ms.to_le_bytes().as_slice());
                     }
                     Some(Timestamp::Seconds(s)) => {
                         bytes.push(EXPIRETIME);
-                        bytes.extend_from_slice(s.to_be_bytes().as_slice());
+                        bytes.extend_from_slice(s.to_le_bytes().as_slice());
                     }
                     None => {}
                 }
@@ -235,7 +321,7 @@ fn try_timestamp<I: Iterator<Item = u8>>(
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            let seconds = u32::from_be_bytes(bytes);
+            let seconds = u32::from_le_bytes(bytes);
             Ok(Some(Timestamp::Seconds(seconds)))
         }
         &EXPIRETIMEMS => {
@@ -251,7 +337,7 @@ fn try_timestamp<I: Iterator<Item = u8>>(
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            let milliseconds = u64::from_be_bytes(bytes);
+            let milliseconds = u64::from_le_bytes(bytes);
             Ok(Some(Timestamp::Milliseconds(milliseconds)))
         }
         _ => Ok(None),
@@ -265,6 +351,28 @@ fn expect_op_code(expected_op_code: u8, iter: &mut impl Iterator<Item = u8>) -> 
     }
 
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Reference<'a> {
+    pub expires_at: Option<Timestamp>,
+    pub reference_type: ReferenceType<'a>,
+}
+
+impl<'a> Reference<'a> {
+    pub fn new(expires_at: Option<Timestamp>, reference_type: ReferenceType) -> Reference {
+        Reference {
+            expires_at,
+            reference_type,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ReferenceType<'a> {
+    String(&'a str),
+    List(Vec<&'a str>),
+    Set(HashSet<&'a str>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -344,6 +452,23 @@ fn encode_value(value: &Value) -> Result<Vec<u8>, LzfError> {
     Ok(result)
 }
 
+fn write_string(string: &str, writer: &mut impl Write) -> Result<(), Error> {
+    if string.len() > 20 {
+        Size::Compressed.write(writer)?;
+        let compressed_string = lzf::compress(string.as_bytes())?;
+        Size::Length(compressed_string.len()).write(writer)?;
+        Size::Length(string.len()).write(writer)?;
+        writer.write_all(compressed_string.as_slice())?;
+    } else if let Ok(i) = string.parse::<i32>() {
+        write_integer(i, writer)?;
+    } else {
+        Size::Length(string.len()).write(writer)?;
+        writer.write_all(string.as_bytes())?;
+    }
+
+    Ok(())
+}
+
 fn encode_string(string: &str) -> Result<Vec<u8>, LzfError> {
     if string.len() > 20 {
         let mut bytes = Size::Compressed.encode();
@@ -371,13 +496,30 @@ fn encode_integer(value: i32) -> Vec<u8> {
         }
         -32768..=32767 => {
             let mut bytes = Size::SixteenBits.encode();
-            bytes.extend_from_slice((value as i16) .to_be_bytes().as_slice());
+            bytes.extend_from_slice((value as i16).to_le_bytes().as_slice());
             bytes
         }
         _ => {
             let mut bytes = Size::ThirtyTwoBits.encode();
-            bytes.extend_from_slice(value.to_be_bytes().as_slice());
+            bytes.extend_from_slice(value.to_le_bytes().as_slice());
             bytes
+        }
+    }
+}
+
+fn write_integer(value: i32, writer: &mut impl Write) -> io::Result<()> {
+    match value {
+        -128..=127 => {
+            Size::EightBits.write(writer)?;
+            writer.write_all(&[value as u8])
+        }
+        -32768..=32767 => {
+            Size::SixteenBits.write(writer)?;
+            writer.write_all((value as i16).to_le_bytes().as_slice())
+        }
+        _ => {
+            Size::ThirtyTwoBits.write(writer)?;
+            writer.write_all(value.to_le_bytes().as_slice())
         }
     }
 }
@@ -417,7 +559,7 @@ fn decode_string(iter: &mut impl Iterator<Item = u8>) -> Result<String, Error> {
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            Ok(i16::from_be_bytes(bytes).to_string())
+            Ok(i16::from_le_bytes(bytes).to_string())
         }
         Size::ThirtyTwoBits => {
             let bytes = [
@@ -426,7 +568,7 @@ fn decode_string(iter: &mut impl Iterator<Item = u8>) -> Result<String, Error> {
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            Ok(i32::from_be_bytes(bytes).to_string())
+            Ok(i32::from_le_bytes(bytes).to_string())
         }
         Size::Compressed => {
             let compressed_length = decode_length(iter)?;
@@ -470,6 +612,24 @@ enum Size {
 }
 
 impl Size {
+    fn write(&self, writer: &mut impl Write) -> io::Result<()> {
+        match self {
+            Size::Length(len) => {
+                if *len < 64 {
+                    writer.write_all(&[*len as u8])
+                } else if *len < 16384 {
+                    writer.write_all(&[((*len >> 8) | 0b0100_0000) as u8, *len as u8])
+                } else {
+                    writer.write_all(&[0b0100_0000])?;
+                    writer.write_all(&len.to_le_bytes())
+                }
+            }
+            Size::EightBits => writer.write_all(&[0b1100_0000]),
+            Size::SixteenBits => writer.write_all(&[1 | 0b1100_0000]),
+            Size::ThirtyTwoBits => writer.write_all(&[2 | 0b1100_0000]),
+            Size::Compressed => writer.write_all(&[3 | 0b1100_0000]),
+        }
+    }
     fn encode(&self) -> Vec<u8> {
         match self {
             Size::Length(len) => {
@@ -479,7 +639,7 @@ impl Size {
                     vec![((*len >> 8) | 0b0100_0000) as u8, *len as u8]
                 } else {
                     let mut bytes = vec![0b0100_0000];
-                    bytes.extend_from_slice(&len.to_be_bytes());
+                    bytes.extend_from_slice(&len.to_le_bytes());
 
                     bytes
                 }
@@ -514,7 +674,7 @@ fn decode_size(iter: &mut impl Iterator<Item = u8>) -> Result<Size, Error> {
         0b0000_0001 => {
             let second = iter.next().ok_or(Error::Truncated)?;
             let length_parts = [0, 0, 0, 0, 0, 0, first & 0b0011_1111, second];
-            Ok(Size::Length(usize::from_be_bytes(length_parts)))
+            Ok(Size::Length(usize::from_le_bytes(length_parts)))
         }
         0b0000_0010 => {
             let length_parts = [
@@ -527,7 +687,7 @@ fn decode_size(iter: &mut impl Iterator<Item = u8>) -> Result<Size, Error> {
                 iter.next().ok_or(Error::Truncated)?,
                 iter.next().ok_or(Error::Truncated)?,
             ];
-            Ok(Size::Length(usize::from_be_bytes(length_parts)))
+            Ok(Size::Length(usize::from_le_bytes(length_parts)))
         }
         0b0000_0011 => match first & 0b0011_1111 {
             0 => Ok(Size::EightBits),
@@ -545,6 +705,7 @@ pub enum Error {
     Io(io::Error),
     WrongMagicNumber(Vec<u8>),
     FromUtf8(FromUtf8Error),
+    Utf8(Utf8Error),
     UnexpectedOpCode(u8),
     Truncated,
     InvalidLengthEncoding(u8),
@@ -553,6 +714,7 @@ pub enum Error {
     InvalidValueType(u8),
     ChecksumMismatch(u64, u64),
     ParseIntError(ParseIntError),
+    SystemTimeError(SystemTimeError),
 }
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
@@ -563,6 +725,12 @@ impl From<io::Error> for Error {
 impl From<FromUtf8Error> for Error {
     fn from(value: FromUtf8Error) -> Self {
         Error::FromUtf8(value)
+    }
+}
+
+impl From<Utf8Error> for Error {
+    fn from(value: Utf8Error) -> Self {
+        Error::Utf8(value)
     }
 }
 
@@ -578,6 +746,12 @@ impl From<LzfError> for Error {
     }
 }
 
+impl From<SystemTimeError> for Error {
+    fn from(value: SystemTimeError) -> Self {
+        Error::SystemTimeError(value)
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -586,6 +760,7 @@ impl Display for Error {
                 write!(f, "wrong magic number {:?}", number)
             }
             Error::FromUtf8(err) => err.fmt(f),
+            Error::Utf8(err) => err.fmt(f),
             Error::UnexpectedOpCode(opCode) => {
                 write!(f, "unexpected op code {:?}", opCode)
             }
@@ -604,6 +779,7 @@ impl Display for Error {
                 "file contains checksum {} but the computed checksum of the file is {}",
                 actual, expected
             ),
+            Error::SystemTimeError(err) => err.fmt(f),
         }
     }
 }
