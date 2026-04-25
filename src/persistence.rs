@@ -24,7 +24,9 @@ const AUX: u8 = 0xFA;
 pub trait Dump {
     fn redis_version(&self) -> &str;
     fn memory_usage(&self) -> &str;
-    fn dump_iter(&self) -> impl Iterator<Item = (u8, impl Iterator<Item = (&str, Reference)> + Clone)>;
+    fn dump_iter(
+        &self,
+    ) -> impl Iterator<Item = (u8, impl Iterator<Item = (&str, Reference)> + Clone)>;
 }
 
 pub fn write_dump(dump: impl Dump, writer: &mut impl Write) -> Result<(), Error> {
@@ -64,42 +66,38 @@ pub fn write_dump(dump: impl Dump, writer: &mut impl Write) -> Result<(), Error>
         writer.write_all(&[RESIZEDB])?;
         Size::Length(db_iter.size_hint().0).write(writer)?;
         let mut len = 0;
-        let mut expiry_len= 0;
-        for (key, value) in db_iter.clone(){
-
+        let mut expiry_len = 0;
+        for (_, value) in db_iter.clone() {
+            match value.expires_at {
+                None => len += 1,
+                Some(_) => expiry_len += 1,
+            }
         }
+        writer.write_all(Size::Length(expiry_len).encode().as_slice())?;
+        writer.write_all(Size::Length(len).encode().as_slice())?;
 
-        let keys_with_expires = hash_map
-            .values()
-            .filter(|value| value.expires_at.is_some())
-            .count();
-        bytes.extend_from_slice(Size::Length(keys_with_expires).encode().as_slice());
-
-        for (key, value) in hash_map {
+        for (key, value) in db_iter {
             match value.expires_at {
                 Some(Timestamp::Milliseconds(ms)) => {
-                    bytes.push(EXPIRETIMEMS);
-                    bytes.extend_from_slice(ms.to_le_bytes().as_slice());
+                    writer.write_all(&[EXPIRETIMEMS])?;
+                    writer.write_all(ms.to_le_bytes().as_slice())?;
                 }
                 Some(Timestamp::Seconds(s)) => {
-                    bytes.push(EXPIRETIME);
-                    bytes.extend_from_slice(s.to_le_bytes().as_slice());
+                    writer.write_all(&[EXPIRETIME])?;
+                    writer.write_all(s.to_le_bytes().as_slice())?;
                 }
                 None => {}
             }
 
-            let value_type = ValueTypeIdentifier::from(&value.value_type);
-            bytes.push(value_type.into());
-            bytes.extend_from_slice(encode_string(key)?.as_slice());
-            bytes.extend_from_slice(encode_value(value)?.as_slice());
+            let value_type = ValueTypeIdentifier::from(&value.reference_type);
+            writer.write_all(&[u8::from(value_type)])?;
+            write_string(key, writer)?;
+            write_value(value, writer)?;
         }
     }
 
-    bytes.push(EOF);
-    let checksum = crc64::crc64(0, bytes.as_slice());
-    bytes.extend_from_slice(checksum.to_le_bytes().as_slice());
-
-    Ok(bytes)
+    writer.write_all(&[EOF])?;
+    todo!("crc checksum needs to be calculated");
 }
 
 #[derive(Debug, PartialEq)]
@@ -413,6 +411,16 @@ impl From<&ValueType> for ValueTypeIdentifier {
     }
 }
 
+impl<'a> From<&ReferenceType<'a>> for ValueTypeIdentifier {
+    fn from(value: &ReferenceType) -> Self {
+        match value {
+            ReferenceType::String(_) => ValueTypeIdentifier::String,
+            ReferenceType::List(_) => ValueTypeIdentifier::List,
+            ReferenceType::Set(_) => ValueTypeIdentifier::Set,
+        }
+    }
+}
+
 impl From<ValueTypeIdentifier> for u8 {
     fn from(value: ValueTypeIdentifier) -> Self {
         match value {
@@ -440,6 +448,14 @@ fn decode_value_type_identifier(
     iter: &mut impl Iterator<Item = u8>,
 ) -> Result<ValueTypeIdentifier, Error> {
     ValueTypeIdentifier::try_from(iter.next().ok_or(Error::Truncated)?)
+}
+
+fn write_value(value: Reference, writer: &mut impl Write) -> Result<(), Error> {
+     match value.reference_type {
+        ReferenceType::String(string) => write_string(string, writer),
+        ReferenceType::List(list) => write_list(list, writer),
+        ReferenceType::Set(set) => write_set(set, writer),
+    }
 }
 
 fn encode_value(value: &Value) -> Result<Vec<u8>, LzfError> {
@@ -523,6 +539,14 @@ fn write_integer(value: i32, writer: &mut impl Write) -> io::Result<()> {
         }
     }
 }
+fn write_list(list: Vec<&str>, writer: &mut impl Write) -> Result<(), Error> {
+    writer.write_all(Size::Length(list.len()).encode().as_slice())?;
+    for item in list {
+        write_string(item, writer)?;
+    }
+
+    Ok(())
+}
 
 fn encode_list(list: &Vec<String>) -> Result<Vec<u8>, LzfError> {
     let mut bytes = Vec::new();
@@ -542,6 +566,15 @@ fn encode_set(set: &HashSet<String>) -> Result<Vec<u8>, LzfError> {
     }
 
     Ok(bytes)
+}
+
+fn write_set(set: HashSet<&str>, writer: &mut impl Write) -> Result<(), Error> {
+    writer.write_all(Size::Length(set.len()).encode().as_slice())?;
+    for item in set {
+        write_string(item, writer)?;
+    }
+
+    Ok(())
 }
 
 fn decode_string(iter: &mut impl Iterator<Item = u8>) -> Result<String, Error> {
