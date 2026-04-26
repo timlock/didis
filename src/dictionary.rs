@@ -1,6 +1,6 @@
 use crate::parser::command::{ExpireRule, OverwriteRule, SetValueExpireRule};
-use crate::persistence;
-use crate::persistence::RDB;
+use crate::rdb;
+use crate::rdb::RDB;
 use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -186,7 +186,7 @@ impl Dictionary {
     pub fn snapshot(&self) -> RDB {
         let mut hash_map = HashMap::new();
         for (key, entry) in &self.inner {
-            hash_map.insert(key.clone(), persistence::Value::from(entry.clone()));
+            hash_map.insert(key.clone(), rdb::Value::from(entry.clone()));
         }
 
         RDB::new(HashMap::new(), HashMap::from([(0, hash_map)]))
@@ -272,7 +272,7 @@ pub enum Error {
     NoInteger,
     WrongType,
     Io(io::Error),
-    Persistence(persistence::Error),
+    Persistence(rdb::Error),
 }
 
 impl Display for Error {
@@ -302,8 +302,8 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<persistence::Error> for Error {
-    fn from(value: persistence::Error) -> Self {
+impl From<rdb::Error> for Error {
+    fn from(value: rdb::Error) -> Self {
         Error::Persistence(value)
     }
 }
@@ -388,25 +388,25 @@ impl Entry {
     }
 }
 
-impl From<Entry> for persistence::Value {
+impl From<Entry> for rdb::Value {
     fn from(value: Entry) -> Self {
         match value.entry_type {
             EntryType::String(string) => {
-                persistence::Value::new(value.expires_at, persistence::ValueType::String(string))
+                rdb::Value::new(value.expires_at, rdb::ValueType::String(string))
             }
             EntryType::List(list) => {
-                persistence::Value::new(value.expires_at, persistence::ValueType::List(Vec::from(list)))
+                rdb::Value::new(value.expires_at, rdb::ValueType::List(Vec::from(list)))
             }
         }
     }
 }
 
-impl From<persistence::Value> for Entry {
-    fn from(value: persistence::Value) -> Self {
+impl From<rdb::Value> for Entry {
+    fn from(value: rdb::Value) -> Self {
         let entry_type = match value.value_type {
-            persistence::ValueType::String(string) => EntryType::String(string),
-            persistence::ValueType::List(list) => EntryType::List(VecDeque::from(list)),
-            persistence::ValueType::Set(set) => {
+            rdb::ValueType::String(string) => EntryType::String(string),
+            rdb::ValueType::List(list) => EntryType::List(VecDeque::from(list)),
+            rdb::ValueType::Set(set) => {
                 todo!()
             }
         };

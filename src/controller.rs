@@ -1,8 +1,8 @@
 use crate::dictionary::{Dictionary, Error};
 use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
-use crate::persistence::{ValueType, RDB};
 use crate::pubsub::{ChannelStore, Message};
+use crate::rdb::{ValueType, RDB};
 use libc::{c_int, pid_t};
 use std::borrow::Cow;
 use std::collections::VecDeque;
