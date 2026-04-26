@@ -246,7 +246,7 @@ struct Manifest {
 
 impl Manifest {
     fn insert(&mut self, mut table: SSTable) -> Result<(), Error> {
-        write!(table.file.get_mut(), "table_{},", table.id);
+        write!(self.file.get_mut(), "table_{},", table.id)?;
         self.tables.push(table);
 
         Ok(())
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn create_and_populate() -> Result<(), Box<dyn error::Error>> {
-        let temp_dir = TempDir::create_with_name(PathBuf::from("temp"))?;
+        let temp_dir = TempDir::create(PathBuf::from("temp"))?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
         for i in 0..100 {
@@ -291,26 +291,19 @@ mod tests {
     }
 
     #[test]
-    fn update_and_populate() -> Result<(), Box<dyn error::Error>> {
-        let temp_dir = TempDir::create_with_name(PathBuf::from("temp"))?;
+    fn load_existing_storage() -> Result<(), Box<dyn error::Error>> {
+        let temp_dir = TempDir::create(PathBuf::from("temp"))?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
         for i in 0..100 {
             storage.insert(i.to_string(), i.to_string())?;
         }
 
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
+
         for i in 0..100 {
             let value = storage.get(i.to_string().as_str())?;
             assert_eq!(Some(i.to_string()), value);
-        }
-
-        for i in 0..100 {
-            storage.insert(i.to_string(), (i * 2).to_string())?;
-        }
-
-        for i in 0..100 {
-            let value = storage.get(i.to_string().as_str())?;
-            assert_eq!(Some((i*2).to_string()), value);
         }
 
         Ok(())
