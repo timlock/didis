@@ -7,7 +7,7 @@ use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
-use std::{error, fmt, fs, io, mem};
+use std::{error, fmt, io, mem};
 
 #[derive(Debug)]
 pub enum Error {
@@ -260,29 +260,40 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::temp_dir::TempDir;
     use std::path::PathBuf;
-    use std::{error, fs};
+    use std::error;
 
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new(path: PathBuf) -> io::Result<TempDir> {
-            fs::create_dir_all(&path)?;
-            Ok(TempDir { path })
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.path).unwrap();
-        }
-    }
     #[test]
-    fn populate() -> Result<(), Box<dyn error::Error>> {
-        let temp_dir = TempDir::new(Path::new("testdata").join("populate"))?;
-        let mut storage = Storage::new(temp_dir.path.clone(), 10)?;
+    fn create_and_populate() -> Result<(), Box<dyn error::Error>> {
+        let temp_dir = TempDir::create_with_name(PathBuf::from("temp"))?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
+
+        for i in 0..100 {
+            storage.insert(i.to_string(), i.to_string())?;
+        }
+
+        for i in 0..100 {
+            let value = storage.get(i.to_string().as_str())?;
+            assert_eq!(Some(i.to_string()), value);
+        }
+
+        for i in 0..100 {
+            storage.insert(i.to_string(), (i * 2).to_string())?;
+        }
+
+        for i in 0..100 {
+            let value = storage.get(i.to_string().as_str())?;
+            assert_eq!(Some((i*2).to_string()), value);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_and_populate() -> Result<(), Box<dyn error::Error>> {
+        let temp_dir = TempDir::create_with_name(PathBuf::from("temp"))?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
         for i in 0..100 {
             storage.insert(i.to_string(), i.to_string())?;
