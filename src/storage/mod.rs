@@ -1,13 +1,13 @@
 use std::array::TryFromSliceError;
 use std::collections::BTreeMap;
-use std::fmt::{Display, Pointer};
+use std::fmt::{Debug, Display};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, IntoInnerError, Read, Seek, Write};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
-use std::{error, fmt, io, mem};
+use std::{error, fmt, fs, io, mem};
 
 #[derive(Debug)]
 pub enum Error {
@@ -16,6 +16,10 @@ pub enum Error {
     Utf8(Utf8Error),
     TryFromSliceError(TryFromSliceError),
     ParseIntError(ParseIntError),
+    UnknownOperation(u8),
+    Truncated,
+    InvalidTableName(String),
+    IntoInner(IntoInnerError<BufWriter<File>>),
 }
 
 impl error::Error for Error {}
@@ -23,11 +27,17 @@ impl error::Error for Error {}
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::FromUtf8(e) => e.fmt(f),
-            Error::Utf8(e) => e.fmt(f),
+            Error::FromUtf8(e) => write!(f, "{}", e),
+            Error::Utf8(e) => write!(f, "{}", e),
             Error::Io(error) => write!(f, "IO error: {error}"),
-            Error::TryFromSliceError(e) => e.fmt(f),
-            Error::ParseIntError(e) => e.fmt(f),
+            Error::TryFromSliceError(e) => write!(f, "{}", e),
+            Error::ParseIntError(e) => write!(f, "{}", e),
+            Error::UnknownOperation(op_code) => write!(f, "Unknown op code {}", op_code),
+            Error::Truncated => write!(f, "Truncated"),
+            Error::InvalidTableName(name) => {
+                write!(f, "Manifest contains file with invalid name {}", name)
+            }
+            Error::IntoInner(e) => write!(f, "{}", e),
         }
     }
 }
@@ -61,56 +71,40 @@ impl From<ParseIntError> for Error {
     }
 }
 
+impl From<IntoInnerError<BufWriter<File>>> for Error {
+    fn from(value: IntoInnerError<BufWriter<File>>) -> Self {
+        Error::IntoInner(value)
+    }
+}
+
 pub struct Storage {
     mem_table: MemTable,
     manifest: Manifest,
+    write_ahead_log: WriteAheadLogWriter,
     flush_threshold: usize,
-    directory_path: PathBuf,
 }
 
 impl Storage {
     pub fn new(directory_path: PathBuf, flush_threshold: usize) -> Result<Storage, Error> {
-        let mut manifest_file = BufReader::new(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .open(directory_path.join("manifest"))?,
-        );
+        let manifest = Manifest::open(directory_path.clone())?;
 
-        let mut buf = Vec::new();
-        manifest_file.read_to_end(&mut buf)?;
-        manifest_file.rewind()?;
+        let wal_path = directory_path.join("write_ahead_log");
+        let wal_reader = WriteAheadLogReader::open(&wal_path)?;
+        let wal_writer = WriteAheadLogWriter::open(&wal_path)?;
 
-        let table_names = str::from_utf8(buf.as_slice())?
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-
-        let mut tables = Vec::with_capacity(table_names.len());
-        for table in table_names {
-            let table_path = directory_path.join(table);
-            let file = File::open(table_path)?;
-            let table_id = table
-                .strip_prefix("table_")
-                .expect("all entries in manifest file should start with 'table_'")
-                .parse::<u64>()?;
-            tables.push(SSTable {
-                id: table_id,
-                file: BufReader::new(file),
-            })
-        }
-
-        Ok(Storage {
-            directory_path,
+        let mut storage = Storage {
             flush_threshold,
             mem_table: MemTable::default(),
-            manifest: Manifest {
-                id: tables.len() as u64,
-                tables,
-                file: manifest_file,
-            },
-        })
+            manifest,
+            write_ahead_log: wal_writer,
+        };
+
+        for operation in wal_reader {
+            let operation = operation?;
+            storage.execute_no_wal(operation)?;
+        }
+
+        Ok(storage)
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<String>, Error> {
@@ -128,26 +122,43 @@ impl Storage {
     }
 
     pub fn insert(&mut self, key: String, value: String) -> Result<(), Error> {
-        self.mem_table.insert(key, value);
-        if self.mem_table.inner.len() >= self.flush_threshold {
-            self.flush()?;
+        let operation = Operation::Insert(key, value);
+        self.write_ahead_log.append(&operation)?;
+        self.write_ahead_log.sync_all()?;
+
+        self.execute_no_wal(operation)
+    }
+
+    fn execute_no_wal(&mut self, operation: Operation) -> Result<(), Error> {
+        match operation {
+            Operation::Insert(key, value) => {
+                self.mem_table.insert(key, value);
+                if self.mem_table.inner.len() >= self.flush_threshold {
+                    self.flush()?;
+                }
+            }
+            Operation::Delete(key) => {
+                todo!()
+            }
         }
+
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), Error> {
         let table_id = self.manifest.next_id();
-        let table_path = self.directory_path.join(format!("table_{}", table_id));
-        let mut file = File::create(&table_path)?;
-
+        let table_path = self
+            .manifest
+            .directory_path
+            .join(format!("table_{}", table_id));
+        let mut table_writer = SSTableWriter::open(&table_path)?;
         let mem_table = mem::take(&mut self.mem_table);
-        let bytes = Vec::<u8>::from(mem_table);
-        file.write_all(bytes.as_slice())?;
-        let table = SSTable {
-            id: table_id,
-            file: BufReader::new(File::open(table_path)?),
-        };
+        table_writer.write(mem_table)?;
+
+        let table = SSTableReader::open(table_id, &table_path)?;
         self.manifest.insert(table)?;
+
+        self.write_ahead_log.truncate()?;
 
         Ok(())
     }
@@ -164,30 +175,42 @@ impl MemTable {
     }
 }
 
-impl From<MemTable> for Vec<u8> {
-    fn from(value: MemTable) -> Self {
-        let mut bytes = Vec::new();
-        for (key, value) in value.inner.iter() {
-            let key_bytes = key.as_bytes();
-            bytes.extend_from_slice(key_bytes.len().to_le_bytes().as_slice());
-            bytes.push(b':');
-            bytes.extend_from_slice(key_bytes);
+struct SSTableWriter {
+    file: BufWriter<File>,
+}
+impl SSTableWriter {
+    fn open(table_path: &Path) -> io::Result<SSTableWriter> {
+        let file = File::create(&table_path)?;
+        Ok(SSTableWriter {
+            file: BufWriter::new(file),
+        })
+    }
 
-            let value_bytes = value.as_bytes();
-            bytes.extend_from_slice(value_bytes.len().to_le_bytes().as_slice());
-            bytes.push(b':');
-            bytes.extend_from_slice(value_bytes)
+    fn write(&mut self, mem_table: MemTable) -> io::Result<()> {
+        for (key, value) in mem_table.inner {
+            write_string(&mut self.file, &key)?;
+            write_string(&mut self.file, &value)?;
         }
-        bytes
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+        Ok(())
     }
 }
 
-struct SSTable {
+struct SSTableReader {
     id: u64,
     file: BufReader<File>,
 }
 
-impl SSTable {
+impl SSTableReader {
+    fn open(id: u64, table_path: &Path) -> Result<SSTableReader, Error> {
+        let file = File::open(table_path)?;
+        Ok(SSTableReader {
+            id,
+            file: BufReader::new(file),
+        })
+    }
+
     fn find(&mut self, key: &str) -> Result<Option<String>, Error> {
         while let Some(entry) = self.next_entry()? {
             if key == entry.as_str() {
@@ -239,15 +262,68 @@ impl SSTable {
 }
 
 struct Manifest {
+    directory_path: PathBuf,
     file: BufReader<File>,
-    tables: Vec<SSTable>,
+    tables: Vec<SSTableReader>,
     id: u64,
 }
 
 impl Manifest {
-    fn insert(&mut self, mut table: SSTable) -> Result<(), Error> {
-        write!(self.file.get_mut(), "table_{},", table.id)?;
+    fn open(directory_path: PathBuf) -> Result<Manifest, Error> {
+        let mut manifest_file = BufReader::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .open(directory_path.join("manifest"))?,
+        );
+
+        let mut buf = Vec::new();
+        manifest_file.read_to_end(&mut buf)?;
+        manifest_file.rewind()?;
+
+        let table_names = str::from_utf8(buf.as_slice())?
+            .lines()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        let mut tables = Vec::with_capacity(table_names.len());
+        for table_name in table_names {
+            let table_id = table_name
+                .strip_prefix("table_")
+                .ok_or_else(|| Error::InvalidTableName(String::from(table_name)))?
+                .parse::<u64>()?;
+            let table_path = directory_path.join(table_name);
+
+            tables.push(SSTableReader::open(table_id, &table_path)?)
+        }
+
+        Ok(Manifest {
+            id: tables.len() as u64,
+            tables,
+            file: manifest_file,
+            directory_path,
+        })
+    }
+    fn insert(&mut self, table: SSTableReader) -> Result<(), Error> {
+        let temp_path = self.directory_path.join("manifest.TEMP");
+        let mut temp_manifest_file = BufWriter::new(
+            OpenOptions::new()
+                .append(true)
+                .truncate(true)
+                .open(&temp_path)?,
+        );
         self.tables.push(table);
+        for table in &self.tables {
+            writeln!(temp_manifest_file, "table_{}", table.id)?;
+        }
+
+        let temp_manifest_file = temp_manifest_file.into_inner()?;
+        temp_manifest_file.sync_all()?;
+
+        fs::rename(temp_path, self.directory_path.join("manifest"))?;
+
+        self.file = BufReader::new(temp_manifest_file);
 
         Ok(())
     }
@@ -257,12 +333,143 @@ impl Manifest {
     }
 }
 
+enum Operation {
+    Insert(String, String),
+    Delete(String),
+}
+
+impl Operation {
+    fn op_code(&self) -> u8 {
+        match self {
+            Operation::Insert(_, _) => 1,
+            Operation::Delete(_) => 2,
+        }
+    }
+}
+
+struct WriteAheadLogReader {
+    file: BufReader<File>,
+}
+
+impl WriteAheadLogReader {
+    fn open(wal_path: &Path) -> io::Result<WriteAheadLogReader> {
+        let wal_file = File::open(wal_path)?;
+        Ok(WriteAheadLogReader {
+            file: BufReader::new(wal_file),
+        })
+    }
+}
+
+impl<'a> Iterator for WriteAheadLogReader {
+    type Item = Result<Operation, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match read_operation(&mut self.file) {
+            Ok(None) => None,
+            Ok(Some(operation)) => Some(Ok(operation)),
+            Err(err) => Some(Err(err)),
+        }
+    }
+}
+
+struct WriteAheadLogWriter {
+    file: BufWriter<File>,
+}
+
+impl WriteAheadLogWriter {
+    fn open(wal_path: &Path) -> io::Result<WriteAheadLogWriter> {
+        let wal_file = OpenOptions::new()
+            .truncate(true)
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(wal_path)?;
+
+        Ok(WriteAheadLogWriter {
+            file: BufWriter::new(wal_file),
+        })
+    }
+}
+
+impl WriteAheadLogWriter {
+    fn append(&mut self, operation: &Operation) -> io::Result<()> {
+        write_operation(&mut self.file, operation)
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().sync_all()
+    }
+
+    fn truncate(&mut self) -> io::Result<()> {
+        self.file.get_mut().set_len(0)?;
+        self.sync_all()?;
+
+        Ok(())
+    }
+}
+
+fn read_string(source: &mut impl BufRead) -> Result<Option<String>, Error> {
+    let mut buf = Vec::new();
+    source.read_until(b':', &mut buf)?;
+    match buf.pop() {
+        Some(b':') => {}
+        Some(_) | None => return Err(Error::Truncated),
+    }
+    let len_str = String::from_utf8_lossy(&buf);
+    let len = len_str.parse::<usize>()?;
+    buf.resize(len, 0);
+    source.read_exact(&mut buf)?;
+    let string = String::from_utf8(buf)?;
+
+    Ok(Some(string))
+}
+
+fn write_string(destination: &mut impl Write, value: &str) -> io::Result<()> {
+    write!(destination, "{}:{}", value.len(), value)?;
+    Ok(())
+}
+
+fn read_operation(source: &mut impl BufRead) -> Result<Option<Operation>, Error> {
+    let mut op_code_bytes = [0u8; 1];
+    source.read_exact(&mut op_code_bytes)?;
+
+    match op_code_bytes[0] {
+        0 => {
+            let key = read_string(source)?.ok_or_else(|| Error::Truncated)?;
+            let value = read_string(source)?.ok_or_else(|| Error::Truncated)?;
+
+            Ok(Some(Operation::Insert(key, value)))
+        }
+        1 => {
+            let key = read_string(source)?.ok_or_else(|| Error::Truncated)?;
+
+            Ok(Some(Operation::Delete(key)))
+        }
+        other => Err(Error::UnknownOperation(other)),
+    }
+}
+
+fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::Result<()> {
+    write!(destination, "{}", operation.op_code())?;
+    match operation {
+        Operation::Insert(key, value) => {
+            write_string(destination, key)?;
+            write_string(destination, value)?;
+        }
+        Operation::Delete(key) => {
+            write_string(destination, key)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::temp_dir::TempDir;
-    use std::path::PathBuf;
     use std::error;
+    use std::path::PathBuf;
 
     #[test]
     fn create_and_populate() -> Result<(), Box<dyn error::Error>> {
@@ -284,7 +491,7 @@ mod tests {
 
         for i in 0..100 {
             let value = storage.get(i.to_string().as_str())?;
-            assert_eq!(Some((i*2).to_string()), value);
+            assert_eq!(Some((i * 2).to_string()), value);
         }
 
         Ok(())
