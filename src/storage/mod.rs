@@ -89,8 +89,8 @@ impl Storage {
         let manifest = Manifest::open(directory_path.clone())?;
 
         let wal_path = directory_path.join("write_ahead_log");
-        let wal_reader = WriteAheadLogReader::open(&wal_path)?;
-        let wal_writer = WriteAheadLogWriter::open(&wal_path)?;
+
+        let mut wal_writer = WriteAheadLogWriter::open(&wal_path)?;
 
         let mut storage = Storage {
             flush_threshold,
@@ -99,10 +99,20 @@ impl Storage {
             write_ahead_log: wal_writer,
         };
 
-        for operation in wal_reader {
-            let operation = operation?;
-            storage.execute_no_wal(operation)?;
+        let wal_reader = match WriteAheadLogReader::open(&wal_path) {
+            Ok(wal_reader) => Some(wal_reader),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(Error::from(err)),
+        };
+
+        if let Some(wal_reader) = wal_reader {
+            for operation in wal_reader {
+                let operation = operation?;
+                storage.execute_no_wal(operation)?;
+            }
         }
+
+        storage.write_ahead_log.truncate()?;
 
         Ok(storage)
     }
@@ -248,8 +258,8 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        let len_slice = buf[..n - 1].try_into()?;
-        let key_len = usize::from_le_bytes(len_slice);
+        let len_slice = &buf[..n - 1];
+        let key_len = str::from_utf8(&len_slice)?.parse()?;
         Ok(Some(key_len))
     }
 
@@ -309,7 +319,8 @@ impl Manifest {
         let temp_path = self.directory_path.join("manifest.TEMP");
         let mut temp_manifest_file = BufWriter::new(
             OpenOptions::new()
-                .append(true)
+                .write(true)
+                .create(true)
                 .truncate(true)
                 .open(&temp_path)?,
         );
@@ -338,11 +349,37 @@ enum Operation {
     Delete(String),
 }
 
-impl Operation {
-    fn op_code(&self) -> u8 {
-        match self {
-            Operation::Insert(_, _) => 1,
-            Operation::Delete(_) => 2,
+impl From<&Operation> for OperationCode {
+    fn from(value: &Operation) -> Self {
+        match value {
+            Operation::Insert(_, _) => OperationCode::Insert,
+            Operation::Delete(_) => OperationCode::Delete,
+        }
+    }
+}
+
+enum OperationCode {
+    Insert,
+    Delete,
+}
+
+impl From<&OperationCode> for u8 {
+    fn from(value: &OperationCode) -> Self {
+        match value {
+            OperationCode::Insert => 1,
+            OperationCode::Delete => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for OperationCode {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(OperationCode::Insert),
+            2 => Ok(OperationCode::Delete),
+            _ => Err(Error::UnknownOperation(value)),
         }
     }
 }
@@ -379,19 +416,17 @@ struct WriteAheadLogWriter {
 impl WriteAheadLogWriter {
     fn open(wal_path: &Path) -> io::Result<WriteAheadLogWriter> {
         let wal_file = OpenOptions::new()
-            .truncate(true)
-            .create(true)
             .write(true)
             .append(true)
+            .create(true)
+            // .truncate(true)
             .open(wal_path)?;
 
         Ok(WriteAheadLogWriter {
             file: BufWriter::new(wal_file),
         })
     }
-}
 
-impl WriteAheadLogWriter {
     fn append(&mut self, operation: &Operation) -> io::Result<()> {
         write_operation(&mut self.file, operation)
     }
@@ -430,28 +465,45 @@ fn write_string(destination: &mut impl Write, value: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn read_operation(source: &mut impl BufRead) -> Result<Option<Operation>, Error> {
+fn read_operation_code(source: &mut impl Read) -> Result<Option<OperationCode>, Error> {
     let mut op_code_bytes = [0u8; 1];
-    source.read_exact(&mut op_code_bytes)?;
+    let n = source.read(&mut op_code_bytes)?;
+    if n == 0 {
+        return Ok(None);
+    }
 
-    match op_code_bytes[0] {
-        0 => {
+    Ok(Some(OperationCode::try_from(op_code_bytes[0])?))
+}
+
+fn read_operation(source: &mut impl BufRead) -> Result<Option<Operation>, Error> {
+    let op_code = match read_operation_code(source)? {
+        Some(op_code) => op_code,
+        None => return Ok(None),
+    };
+
+    match op_code {
+        OperationCode::Insert => {
             let key = read_string(source)?.ok_or_else(|| Error::Truncated)?;
             let value = read_string(source)?.ok_or_else(|| Error::Truncated)?;
 
             Ok(Some(Operation::Insert(key, value)))
         }
-        1 => {
+        OperationCode::Delete => {
             let key = read_string(source)?.ok_or_else(|| Error::Truncated)?;
 
             Ok(Some(Operation::Delete(key)))
         }
-        other => Err(Error::UnknownOperation(other)),
     }
 }
 
+fn write_operation_code(destination: &mut impl Write, operation: OperationCode) -> io::Result<()> {
+    let op_code = u8::from(&operation);
+    write!(destination, "{}", op_code)
+}
+
 fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::Result<()> {
-    write!(destination, "{}", operation.op_code())?;
+    write_operation_code(destination, OperationCode::from(operation))?;
+
     match operation {
         Operation::Insert(key, value) => {
             write_string(destination, key)?;
@@ -469,11 +521,10 @@ mod tests {
     use super::*;
     use crate::temp_dir::TempDir;
     use std::error;
-    use std::path::PathBuf;
 
     #[test]
     fn create_and_populate() -> Result<(), Box<dyn error::Error>> {
-        let temp_dir = TempDir::create(PathBuf::from("temp"))?;
+        let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
         for i in 0..100 {
@@ -499,7 +550,7 @@ mod tests {
 
     #[test]
     fn load_existing_storage() -> Result<(), Box<dyn error::Error>> {
-        let temp_dir = TempDir::create(PathBuf::from("temp"))?;
+        let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
         for i in 0..100 {

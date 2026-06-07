@@ -1,4 +1,5 @@
-use std::ops::{AddAssign, Deref};
+use std::env::temp_dir;
+use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::{fs, io};
@@ -29,10 +30,10 @@ impl TempDir {
         })
     }
 
-    pub fn create(path: PathBuf) -> io::Result<TempDir> {
+    pub fn new() -> io::Result<TempDir> {
         let id = next_id();
-        let path = path.join(id.to_string());
-        TempDir::create_at(path)
+        let temp_dir = temp_dir();
+        TempDir::create_at(temp_dir.join(id.to_string()))
     }
 
     pub fn path(&self) -> &Path {
@@ -44,5 +45,31 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         // TODO check if unwrap makes sense
         fs::remove_dir_all(&self.path).unwrap();
+    }
+}
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::assert_matches;
+    use std::fs::File;
+    use std::io::Write;
+
+    #[test]
+    fn create_file() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        let file_path = temp_dir.path.join("temp_file");
+
+        let mut file = File::create(&file_path)?;
+        write!(&mut file, "Hello temp_dir")?;
+        drop(file);
+
+        let content = fs::read_to_string(&file_path)?;
+        assert_eq!("Hello temp_dir", content);
+
+        drop(temp_dir);
+
+        assert_matches!(fs::read_to_string(&file_path), Err(err) if err.kind() == io::ErrorKind::NotFound);
+
+        Ok(())
     }
 }
