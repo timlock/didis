@@ -2,7 +2,7 @@ use std::array::TryFromSliceError;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, IntoInnerError, Read, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, IntoInnerError, Read, Seek, SeekFrom, Write};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
@@ -119,12 +119,18 @@ impl Storage {
 
     pub fn get(&mut self, key: &str) -> Result<Option<String>, Error> {
         if let Some(value) = self.mem_table.inner.get(key) {
-            return Ok(Some(value.clone()));
+            return match value {
+                MemTableValue::Value(value) => Ok(Some(value.clone())),
+                MemTableValue::Deleted => Ok(None),
+            };
         }
         for table in self.manifest.tables.iter_mut() {
             let value = table.find(key)?;
             if let Some(value) = value {
-                return Ok(Some(value));
+                return match value {
+                    MemTableValue::Value(value) => Ok(Some(value.clone())),
+                    MemTableValue::Deleted => Ok(None),
+                };
             }
         }
 
@@ -134,7 +140,15 @@ impl Storage {
     pub fn insert(&mut self, key: String, value: String) -> Result<(), Error> {
         let operation = Operation::Insert(key, value);
         self.write_ahead_log.append(&operation)?;
-        self.write_ahead_log.sync_all()?;
+        self.write_ahead_log.sync_data()?;
+
+        self.execute_no_wal(operation)
+    }
+
+    pub fn delete(&mut self, key: String) -> Result<(), Error> {
+        let operation = Operation::Delete(key);
+        self.write_ahead_log.append(&operation)?;
+        self.write_ahead_log.sync_data()?;
 
         self.execute_no_wal(operation)
     }
@@ -143,13 +157,14 @@ impl Storage {
         match operation {
             Operation::Insert(key, value) => {
                 self.mem_table.insert(key, value);
-                if self.mem_table.inner.len() >= self.flush_threshold {
-                    self.flush()?;
-                }
             }
-            Operation::Delete(_) => {
-                todo!()
+            Operation::Delete(key) => {
+                self.mem_table.delete(key.as_str())?;
             }
+        }
+
+        if self.mem_table.inner.len() >= self.flush_threshold {
+            self.flush()?;
         }
 
         Ok(())
@@ -164,6 +179,7 @@ impl Storage {
         let mut table_writer = SSTableWriter::open(&table_path)?;
         let mem_table = mem::take(&mut self.mem_table);
         table_writer.write(mem_table)?;
+        sync_all_dir(self.manifest.directory_path.as_path())?;
 
         let table = SSTableReader::open(table_id, &table_path)?;
         self.manifest.insert(table)?;
@@ -176,12 +192,35 @@ impl Storage {
 
 #[derive(Default)]
 struct MemTable {
-    inner: BTreeMap<String, String>,
+    inner: BTreeMap<String, MemTableValue>,
 }
 
 impl MemTable {
-    fn insert(&mut self, key: String, value: String) -> Option<String> {
-        self.inner.insert(key, value)
+    fn insert(&mut self, key: String, value: String) -> Option<MemTableValue> {
+        self.inner.insert(key, MemTableValue::new(value))
+    }
+
+    fn delete(&mut self, key: &str) -> Result<(), Error> {
+        if let Some(value) = self.inner.get_mut(key) {
+            *value = MemTableValue::Deleted;
+            return Ok(());
+        }
+
+        self.inner.insert(key.to_string(), MemTableValue::Deleted);
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialOrd, PartialEq, Debug)]
+enum MemTableValue {
+    Value(String),
+    Deleted,
+}
+
+impl MemTableValue {
+    fn new(value: String) -> MemTableValue {
+        MemTableValue::Value(value)
     }
 }
 
@@ -199,7 +238,15 @@ impl SSTableWriter {
     fn write(&mut self, mem_table: MemTable) -> io::Result<()> {
         for (key, value) in mem_table.inner {
             write_string(&mut self.file, &key)?;
-            write_string(&mut self.file, &value)?;
+            match value {
+                MemTableValue::Value(value) => {
+                    write_string(&mut self.file, &value)?;
+                }
+                MemTableValue::Deleted => {
+                    write_string(&mut self.file, "")?;
+                    write_deleted(&mut self.file)?;
+                }
+            }
         }
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
@@ -221,20 +268,33 @@ impl SSTableReader {
         })
     }
 
-    fn find(&mut self, key: &str) -> Result<Option<String>, Error> {
-        while let Some(entry) = self.next_entry()? {
+    fn find(&mut self, key: &str) -> Result<Option<MemTableValue>, Error> {
+        self.file.seek(SeekFrom::Start(0))?;
+
+        while let Some(entry) = self.next_string()? {
             if key == entry.as_str() {
-                break;
+                let value = match self.next_string()? {
+                    Some(value) => value,
+                    None => {
+                        todo!("handle key without value in sstable file")
+                    }
+                };
+
+                if self.read_deleted()? {
+                    return Ok(None);
+                }
+
+                return Ok(Some(MemTableValue::Value(value)));
             } else {
-                self.skip_entry()?;
+                self.skip_string()?;
+                self.read_deleted()?;
             }
         }
 
-        let entry = self.next_entry()?;
-        Ok(entry)
+        Ok(None)
     }
 
-    fn skip_entry(&mut self) -> Result<(), Error> {
+    fn skip_string(&mut self) -> Result<(), Error> {
         let entry_len = match self.read_len()? {
             Some(key_len) => key_len,
             None => return Ok(()),
@@ -243,14 +303,32 @@ impl SSTableReader {
         self.file.seek_relative(entry_len as i64)?;
         Ok(())
     }
-    fn next_entry(&mut self) -> Result<Option<String>, Error> {
+
+    fn read_deleted(&mut self) -> io::Result<bool> {
+        let mut buf = [0u8; 1];
+        let n = self.file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(false);
+        }
+
+        let is_deleted = buf[0] as char == 'd';
+
+        if !is_deleted {
+            self.file.seek_relative(-1)?;
+        }
+
+        Ok(is_deleted)
+    }
+
+    fn next_string(&mut self) -> Result<Option<String>, Error> {
         let entry_len = match self.read_len()? {
             Some(key_len) => key_len,
             None => return Ok(None),
         };
 
-        self.read_entry(entry_len)
+        self.read_string(entry_len)
     }
+
     fn read_len(&mut self) -> Result<Option<usize>, Error> {
         let mut buf = Vec::new();
         let n = self.file.read_until(b':', &mut buf)?;
@@ -259,11 +337,12 @@ impl SSTableReader {
         }
 
         let len_slice = &buf[..n - 1];
-        let key_len = str::from_utf8(&len_slice)?.parse()?;
+        let len_str = str::from_utf8(&len_slice)?;
+        let key_len = len_str.parse()?;
         Ok(Some(key_len))
     }
 
-    fn read_entry(&mut self, len: usize) -> Result<Option<String>, Error> {
+    fn read_string(&mut self, len: usize) -> Result<Option<String>, Error> {
         let mut buf = vec![0u8; len];
         self.file.read_exact(&mut buf)?;
         let value = String::from_utf8(buf)?;
@@ -333,6 +412,8 @@ impl Manifest {
         temp_manifest_file.sync_all()?;
 
         fs::rename(temp_path, self.directory_path.join("manifest"))?;
+        temp_manifest_file.sync_all()?;
+        sync_all_dir(self.directory_path.as_path())?;
 
         self.file = BufReader::new(temp_manifest_file);
 
@@ -376,9 +457,9 @@ impl TryFrom<u8> for OperationCode {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(OperationCode::Insert),
-            2 => Ok(OperationCode::Delete),
+        match value.into() {
+            '1' => Ok(OperationCode::Insert),
+            '2' => Ok(OperationCode::Delete),
             _ => Err(Error::UnknownOperation(value)),
         }
     }
@@ -419,7 +500,6 @@ impl WriteAheadLogWriter {
             .write(true)
             .append(true)
             .create(true)
-            // .truncate(true)
             .open(wal_path)?;
 
         Ok(WriteAheadLogWriter {
@@ -431,14 +511,14 @@ impl WriteAheadLogWriter {
         write_operation(&mut self.file, operation)
     }
 
-    fn sync_all(&mut self) -> io::Result<()> {
+    fn sync_data(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        self.file.get_ref().sync_all()
+        self.file.get_ref().sync_data()
     }
 
     fn truncate(&mut self) -> io::Result<()> {
         self.file.get_mut().set_len(0)?;
-        self.sync_all()?;
+        self.sync_data()?;
 
         Ok(())
     }
@@ -462,6 +542,11 @@ fn read_string(source: &mut impl BufRead) -> Result<Option<String>, Error> {
 
 fn write_string(destination: &mut impl Write, value: &str) -> io::Result<()> {
     write!(destination, "{}:{}", value.len(), value)?;
+    Ok(())
+}
+
+fn write_deleted(destination: &mut impl Write) -> io::Result<()> {
+    write!(destination, "{}", 'd')?;
     Ok(())
 }
 
@@ -516,6 +601,10 @@ fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::R
     Ok(())
 }
 
+fn sync_all_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,9 +620,18 @@ mod tests {
             storage.insert(i.to_string(), i.to_string())?;
         }
 
-        for i in 0..100 {
+        for i in 95..100 {
+            storage.delete(i.to_string())?;
+        }
+
+        for i in 0..95 {
             let value = storage.get(i.to_string().as_str())?;
             assert_eq!(Some(i.to_string()), value);
+        }
+
+        for i in 95..100 {
+            let value = storage.get(i.to_string().as_str())?;
+            assert_eq!(None, value);
         }
 
         for i in 0..100 {
@@ -549,20 +647,18 @@ mod tests {
     }
 
     #[test]
-    fn load_existing_storage() -> Result<(), Box<dyn error::Error>> {
+    fn data_survives_crash_before_flush() -> Result<(), Box<dyn error::Error>> {
         let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
-        for i in 0..100 {
-            storage.insert(i.to_string(), i.to_string())?;
-        }
+        storage.insert("one".to_string(), "value one".to_string())?;
+        storage.insert("two".to_string(), "value two".to_string())?;
+        storage.delete("two".to_string())?;
 
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
-        for i in 0..100 {
-            let value = storage.get(i.to_string().as_str())?;
-            assert_eq!(Some(i.to_string()), value);
-        }
+        assert_eq!(Some("value one".to_string()), storage.get("one")?);
+        assert_eq!(None, storage.get("two")?);
 
         Ok(())
     }
