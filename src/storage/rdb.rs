@@ -60,7 +60,7 @@ pub fn write_dump(dump: impl Dump, writer: &mut impl Write) -> Result<(), Error>
     writer.write_all(b"used-mem")?;
     writer.write_all(&[0])?; // TODO calculate usage
 
-    let mut iter = dump.dump_iter();
+    let iter = dump.dump_iter();
     for (db, db_iter) in iter {
         writer.write_all(&[SELECTDB])?;
         writer.write_all(&[db])?;
@@ -795,8 +795,8 @@ impl Display for Error {
             }
             Error::FromUtf8(err) => err.fmt(f),
             Error::Utf8(err) => err.fmt(f),
-            Error::UnexpectedOpCode(opCode) => {
-                write!(f, "unexpected op code {:?}", opCode)
+            Error::UnexpectedOpCode(op_code) => {
+                write!(f, "unexpected op code {:?}", op_code)
             }
             Error::Truncated => write!(f, "rdb file is truncated"),
             Error::InvalidLengthEncoding(length_byte) => {

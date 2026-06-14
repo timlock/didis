@@ -26,7 +26,7 @@ pub enum Error {
 
 impl error::Error for Error {}
 impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnknownCommand(name) => write!(f, "Command {name} is unknown"),
             Error::Resp(err) => write!(f, "{}", err),
@@ -661,8 +661,8 @@ impl<'a> Parser {
             };
 
             match parse_result {
-                Ok(Some((valOrRef, remaining))) => {
-                    let command = Command::try_from(valOrRef);
+                Ok(Some((val_or_ref, remaining))) => {
+                    let command = Command::try_from(val_or_ref);
                     commands.push(command);
                     buffer = remaining;
                 }

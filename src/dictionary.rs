@@ -216,11 +216,6 @@ impl Dictionary {
             .expect("map entry should be populated after an insert")
     }
 
-    fn get_string(&self, key: &str) -> Option<Result<&String, Error>> {
-        let entry = self.inner.get(key)?;
-        Some(entry.get_string())
-    }
-
     fn get_string_mut(&mut self, key: &str) -> Option<Result<&mut String, Error>> {
         let entry = self.inner.get_mut(key)?;
         Some(entry.get_string_mut())
@@ -406,7 +401,7 @@ impl From<rdb::Value> for Entry {
         let entry_type = match value.value_type {
             rdb::ValueType::String(string) => EntryType::String(string),
             rdb::ValueType::List(list) => EntryType::List(VecDeque::from(list)),
-            rdb::ValueType::Set(set) => {
+            rdb::ValueType::Set(_) => {
                 todo!()
             }
         };
@@ -416,7 +411,7 @@ impl From<rdb::Value> for Entry {
 }
 
 fn increment(string: &mut String, by: i64) -> Result<i64, Error> {
-    let mut integer_value: i64 = string.parse().map_err(|err| Error::NoInteger)?;
+    let mut integer_value: i64 = string.parse().map_err(|_| Error::NoInteger)?;
     integer_value = integer_value
         .checked_add(by)
         .ok_or_else(|| Error::NoInteger)?;
@@ -426,7 +421,7 @@ fn increment(string: &mut String, by: i64) -> Result<i64, Error> {
 }
 
 fn decrement(string: &mut String, by: i64) -> Result<i64, Error> {
-    let mut integer_value: i64 = string.parse().map_err(|err| Error::NoInteger)?;
+    let mut integer_value: i64 = string.parse().map_err(|_| Error::NoInteger)?;
     integer_value = integer_value
         .checked_sub(by)
         .ok_or_else(|| Error::NoInteger)?;

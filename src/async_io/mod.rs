@@ -40,7 +40,7 @@ mod tests {
         listener.set_nonblocking(true)?;
 
         let mut io = IO::new(1)?;
-        io.accept(listener.try_clone().unwrap());
+        io.accept(listener.try_clone()?);
 
         let address = SocketAddr::from_str("127.0.0.1:8000")?;
         let handler = thread::spawn(move || {
@@ -66,7 +66,7 @@ mod tests {
         listener.set_nonblocking(true)?;
 
         let mut io = IO::new(8)?;
-        io.accept(listener.try_clone().unwrap());
+        io.accept(listener.try_clone()?);
 
         let address = SocketAddr::from_str("127.0.0.1:8001")?;
         let handler = thread::spawn(move || {
@@ -94,7 +94,7 @@ mod tests {
         eprintln!("Client connected");
 
         let buf = Box::new([0u8; 1024]);
-        io.receive(socket.try_clone().unwrap(), buf, 1);
+        io.receive(socket.try_clone()?, buf, 1);
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len, id) = match results.remove(0) {
             Completion::Receive(_, buf, len, id) => (buf, len?, id),
@@ -106,7 +106,7 @@ mod tests {
 
         let mut buf = Box::new([0u8; 1024]);
         buf[..5].copy_from_slice(b"hello");
-        io.send(socket.try_clone().unwrap(), buf, 5, id);
+        io.send(socket.try_clone()?, buf, 5, id);
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (_, len, id) = match results.remove(0) {
             Completion::Send(_, buf, len, id) => (buf, len?, id),

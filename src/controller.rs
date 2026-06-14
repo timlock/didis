@@ -188,7 +188,7 @@ impl Controller {
             },
             Command::LastSave => match self.last_save.duration_since(SystemTime::UNIX_EPOCH) {
                 Ok(duration) => ValOrRef::Val(Value::Integer(duration.as_secs() as i64)),
-                Err(err) => ValOrRef::Ref(Reference::SimpleError("System clock error")),
+                Err(_) => ValOrRef::Ref(Reference::SimpleError("System clock error")),
             },
             Command::Expire {
                 key,
@@ -227,7 +227,7 @@ impl Controller {
                         self.dictionary
                             .left_push(key.as_str(), list.into_iter().map(Cow::Owned).collect())?;
                     }
-                    ValueType::Set(set) => {
+                    ValueType::Set(_) => {
                         todo!()
                     }
                 };

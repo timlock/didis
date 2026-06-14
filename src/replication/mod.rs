@@ -679,7 +679,7 @@ mod tests {
             last_timeout,
         );
 
-        let replica1_state_machine = Box::new(MockStateMachine::new(|op| "success".to_owned()));
+        let replica1_state_machine = Box::new(MockStateMachine::new(|_| "success".to_owned()));
         let mut replica1 = Replica::new(
             replica1_state_machine,
             2,
@@ -703,7 +703,7 @@ mod tests {
         let client_id = SocketAddr::from_str("0.0.0.2:1")?;
         let first_request = Request {
             operation: "operation".to_owned(),
-            client_id: client_id,
+            client_id,
             request_number: 1,
         };
 
@@ -782,7 +782,7 @@ mod tests {
         // client sends new request
         let second_request = Request {
             operation: "operation".to_owned(),
-            client_id: client_id,
+            client_id,
             request_number: 2,
         };
 
@@ -870,7 +870,7 @@ mod tests {
             last_timeout,
         );
 
-        let replica1_state_machine = Box::new(MockStateMachine::new(|op| "success".to_owned()));
+        let replica1_state_machine = Box::new(MockStateMachine::new(|_| "success".to_owned()));
         let mut replica1 = Replica::new(
             replica1_state_machine,
             2,
@@ -975,6 +975,7 @@ mod tests {
             config.peers(1),
             vec![],
         );
+        assert_eq!(Some(want), response);
 
         let response = replica1.handle_message(MessageIn::try_from(do_view_change_3.unwrap()).unwrap());
         assert_eq!(None, response);

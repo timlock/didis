@@ -1,4 +1,4 @@
-use crate::async_io::{AsyncIO, Completion, IO};
+use crate::async_io::{AsyncIO, Completion};
 use crate::controller::Controller;
 use crate::parser::command::Parser;
 use crate::parser::resp::Value;
@@ -109,7 +109,7 @@ impl Server {
         io: &mut impl AsyncIO,
         result: io::Result<(TcpStream, SocketAddr)>,
     ) -> io::Result<()> {
-        let (stream, address) = result?;
+        let (stream, _) = result?;
 
         let client_id = self.id_counter;
         self.id_counter += 1;
@@ -306,6 +306,7 @@ mod test {
     use std::str::FromStr;
     use std::thread;
     use std::thread::JoinHandle;
+    use crate::async_io::IO;
 
     fn launch_server(address: SocketAddr) -> (Arc<AtomicBool>, JoinHandle<()>) {
         let mut server = Server::new(address);
@@ -416,7 +417,7 @@ mod test {
             },
             Command::Get(Cow::Borrowed("Key2")),
         ];
-        let mut response = client.send_batch(cmd_batch)?;
+        let response = client.send_batch(cmd_batch)?;
         assert_eq!(7, response.len());
         assert_eq!(Value::ok(), response[0]);
         assert_eq!(Value::ok(), response[1]);

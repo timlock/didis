@@ -90,7 +90,7 @@ impl Storage {
 
         let wal_path = directory_path.join("write_ahead_log");
 
-        let mut wal_writer = WriteAheadLogWriter::open(&wal_path)?;
+        let wal_writer = WriteAheadLogWriter::open(&wal_path)?;
 
         let mut storage = Storage {
             flush_threshold,
@@ -147,7 +147,7 @@ impl Storage {
                     self.flush()?;
                 }
             }
-            Operation::Delete(key) => {
+            Operation::Delete(_) => {
                 todo!()
             }
         }

@@ -135,8 +135,8 @@ where
             MessageOut::Prepare(prepare, _) => MessageIn::Prepare(prepare),
             MessageOut::PrepareOk(prepare_ok, _) => MessageIn::PrepareOk(prepare_ok),
             MessageOut::Commit(commit, _) => MessageIn::Commit(commit),
-            MessageOut::Reply(reply, _) => return Err(()),
-            MessageOut::ClientResponse(client_response, _) => return Err(()),
+            MessageOut::Reply(_, _) => return Err(()),
+            MessageOut::ClientResponse(_, _) => return Err(()),
             MessageOut::StartViewChange(start_view_change, _) => {
                 MessageIn::StartViewChange(start_view_change)
             }
