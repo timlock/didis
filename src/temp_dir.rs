@@ -50,7 +50,6 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::assert_matches;
     use std::fs::File;
     use std::io::Write;
 
@@ -68,7 +67,9 @@ mod test {
 
         drop(temp_dir);
 
-        assert_matches!(fs::read_to_string(&file_path), Err(err) if err.kind() == io::ErrorKind::NotFound);
+        assert!(
+            matches!(fs::read_to_string(&file_path), Err(err) if err.kind() == io::ErrorKind::NotFound)
+        );
 
         Ok(())
     }
