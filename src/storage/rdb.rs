@@ -9,6 +9,7 @@ use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::time::{SystemTime, SystemTimeError};
+use log::info;
 
 const MAGIC_NUMBER: &'static [u8] = b"REDIS";
 
@@ -184,7 +185,7 @@ impl TryFrom<Vec<u8>> for RDB {
 
     fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
         validate_checksum(&bytes)?;
-        println!("validated checksum");
+        info!("validated checksum");
 
         let mut iter = bytes.into_iter().peekable();
 
@@ -192,15 +193,15 @@ impl TryFrom<Vec<u8>> for RDB {
         if MAGIC_NUMBER != magic_number.as_slice() {
             return Err(Error::WrongMagicNumber(magic_number));
         }
-        println!("validated magic number");
+        info!("validated magic number");
 
         let version_raw: Vec<u8> = iter.by_ref().take(4).collect();
         let version_string = String::from_utf8(version_raw)?;
         let version = version_string.parse()?;
-        println!("rdb version is {}", version_string);
+        info!("rdb version is {}", version_string);
 
         let auxiliary_fields = parse_auxiliary_fields(&mut iter)?;
-        println!("auxiliary fields are {:?}", auxiliary_fields);
+        info!("auxiliary fields are {:?}", auxiliary_fields);
 
         let mut db_hash_maps = HashMap::new();
         while &SELECTDB == iter.peek().ok_or(Error::Truncated)? {
@@ -208,7 +209,7 @@ impl TryFrom<Vec<u8>> for RDB {
                 .expect("when peek() returns Some(..) next() should also return Some(..)");
 
             let db_number = iter.next().ok_or(Error::Truncated)?;
-            println!("parsed database number {}", db_number);
+            info!("parsed database number {}", db_number);
 
             let hash_map = match iter.peek() {
                 Some(&RESIZEDB) => {
@@ -217,7 +218,7 @@ impl TryFrom<Vec<u8>> for RDB {
 
                     let hash_table_size = decode_length(&mut iter)?;
                     let expire_hash_table_size = decode_length(&mut iter)?;
-                    println!(
+                    info!(
                         "database {} has in total keys {} of which {} have an expire timestamp",
                         db_number, hash_table_size, expire_hash_table_size
                     );
@@ -255,7 +256,7 @@ impl TryFrom<Vec<u8>> for RDB {
         }
 
         expect_op_code(EOF, &mut iter)?;
-        println!("reached EOF op_code");
+        info!("reached EOF op_code");
 
         Ok(RDB {
             version,

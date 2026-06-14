@@ -14,6 +14,7 @@ use std::{
     io::{self},
     net::SocketAddr,
 };
+use log::{error, info, warn};
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -38,16 +39,16 @@ impl Server {
 
     pub fn run(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
         if fs::exists("save.rdb")? {
-            println!("Loading save.rdb file");
+            info!("Loading save.rdb file");
             if let Err(err) = self.controller.restore_from_snapshot("save.rdb") {
-                println!("Failed to restore database from save.rdb {err}");
+                error!("Failed to restore database from save.rdb {err}");
                 return Ok(());
             }
 
-            println!("Restored database from save.rdb");
+            info!("Restored database from save.rdb");
         }
 
-        println!("Server starts listening on {}", self.address);
+        info!("Server starts listening on {}", self.address);
 
         let listener = TcpListener::bind(self.address)?;
         listener.set_nonblocking(true)?;
@@ -65,7 +66,7 @@ impl Server {
                         Err(err) => {
                             self.connections.remove(&client_id);
                             self.controller.remove_client(&client_id);
-                            println!("Closed connection {stream:?}: {err}");
+                            info!("Closed connection {stream:?}: {err}");
                         }
                     },
                     Completion::Receive(stream, buf, result, client_id) => match result {
@@ -73,7 +74,7 @@ impl Server {
                         Err(err) => {
                             self.connections.remove(&client_id);
                             self.controller.remove_client(&client_id);
-                            println!("Closed connection {stream:?} IO error: {err}");
+                            warn!("Closed connection {stream:?} IO error: {err}");
                         }
                     },
                 }
@@ -90,7 +91,7 @@ impl Server {
             self.controller.do_jobs()?;
 
             if self.done.load(Ordering::SeqCst) {
-                println!("Server stopped");
+                info!("Server stopped");
                 return Ok(());
             }
         }
@@ -112,7 +113,7 @@ impl Server {
 
         let client_id = self.id_counter;
         self.id_counter += 1;
-        println!["New client connected with id {}", client_id];
+        info!("New client connected with id {}", client_id);
 
         let buffer_in = Box::new([0u8; BUFFER_SIZE]);
         let buffer_out = Box::new([0u8; BUFFER_SIZE]);
@@ -139,7 +140,7 @@ impl Server {
             .as_str(),
         );
 
-        println!(
+        info!(
             "Sent {} bytes to client, remaining bytes {}",
             sent, connection.buffer_out_len
         );
@@ -165,29 +166,29 @@ impl Server {
         if received == 0 {
             self.connections.remove(&client_id);
             self.controller.remove_client(&client_id);
-            println!("Closed connection {stream:?}");
+            info!("Closed connection {stream:?}");
             return Ok(());
         }
 
-        println!("Received {} bytes from client", received);
+        info!("Received {} bytes from client", received);
 
         let commands = connection.command_parser.parse_all(&buffer_in[..received]);
         for command in commands {
             let response = match command {
                 Ok(command) => {
                     let start = Instant::now();
-                    println!("Received command: {}", command);
+                    info!("Received command: {}", command);
                     if let Some(response) = self.controller.handle_command(connection.id, command) {
-                        println!("Sending response {response} took {:?}", start.elapsed());
+                        info!("Sending response {response} took {:?}", start.elapsed());
 
                         response.to_bytes()
                     } else {
-                        println!("Took {:?}", start.elapsed());
+                        info!("Took {:?}", start.elapsed());
                         Default::default()
                     }
                 }
                 Err(err) => {
-                    println!("Received faulty command: {:?}", err);
+                    warn!("Received faulty command: {:?}", err);
                     Value::SimpleError(err.to_string()).to_bytes()
                 }
             };

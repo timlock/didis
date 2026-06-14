@@ -2,12 +2,13 @@ use crate::dictionary::{Dictionary, Error};
 use crate::parser::command::Command;
 use crate::parser::resp::{Reference, ValOrRef, Value};
 use crate::pubsub::{ChannelStore, Message};
-use crate::storage::rdb::{ValueType, RDB};
+use crate::storage::rdb::{RDB, ValueType};
 use libc::{c_int, pid_t};
+use log::{error, info};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::time::SystemTime;
-use std::{fs, io};
+use std::{fs, io, process};
 
 pub struct Controller {
     dictionary: Dictionary,
@@ -245,10 +246,8 @@ impl Controller {
         let rdb = self.dictionary.snapshot();
         let bytes = Vec::<u8>::try_from(&rdb)?;
 
-        println!("Creating new save file");
         fs::write("dump.rdb", bytes.as_slice())?;
 
-        println!("Replacing old save file");
         fs::rename("dump.rdb", "save.rdb")?;
 
         self.last_save = SystemTime::now();
@@ -296,7 +295,7 @@ impl Controller {
     }
 
     fn do_background_save(&mut self) -> io::Result<pid_t> {
-        println!("Begin background save");
+        info!("Begin background save");
         unsafe {
             let process_id = libc::fork();
             match process_id {
@@ -305,7 +304,7 @@ impl Controller {
                 }
                 0 => {}
                 1.. => {
-                    println!("forked child process {}", process_id);
+                    info!("forked child process {}", process_id);
                     return Ok(process_id);
                 }
             }
@@ -313,15 +312,14 @@ impl Controller {
 
         match self.save() {
             Ok(()) => {
-                println!("Created save file")
+                process::exit(0);
             }
             Err(err) => {
-                println!("Failed to create save file {}", err)
+                // TODO check if log from child process is safe
+                error!("Failed to save RDB file {err}");
+                process::exit(1);
             }
         }
-
-        println!("exit child_process");
-        unsafe { libc::_exit(0) }
     }
 }
 

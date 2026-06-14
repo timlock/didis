@@ -9,3 +9,5 @@ pub mod client;
 pub mod pubsub;
 pub mod storage;
 pub mod temp_dir;
+
+pub mod logger;

@@ -7,5 +7,6 @@ edition = "2024"
 libc ="0.2"
 lzf = "1.0.0"
 crc64 = "2.0.0"
+log = { version = "0.4.32", features = ["std"] }
 
 [build-dependencies]
