@@ -1,4 +1,6 @@
+use crate::storage::heap::MinHeap;
 use std::array::TryFromSliceError;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
 use std::fs::{File, OpenOptions};
@@ -20,6 +22,7 @@ pub enum Error {
     Truncated,
     InvalidTableName(String),
     IntoInner(IntoInnerError<BufWriter<File>>),
+    UnexpectedCharacter { want: char, got: char },
 }
 
 impl error::Error for Error {}
@@ -38,6 +41,9 @@ impl Display for Error {
                 write!(f, "Manifest contains file with invalid name {}", name)
             }
             Error::IntoInner(e) => write!(f, "{}", e),
+            Error::UnexpectedCharacter { want, got } => {
+                write!(f, "Expected character '{want}' got '{got}'")
+            }
         }
     }
 }
@@ -79,14 +85,14 @@ impl From<IntoInnerError<BufWriter<File>>> for Error {
 
 pub struct Storage {
     mem_table: MemTable,
-    manifest: Manifest,
+    manifest: ManifestReader,
     write_ahead_log: WriteAheadLogWriter,
     flush_threshold: usize,
 }
 
 impl Storage {
     pub fn new(directory_path: PathBuf, flush_threshold: usize) -> Result<Storage, Error> {
-        let manifest = Manifest::open(directory_path.clone())?;
+        let manifest = ManifestReader::open(directory_path.join("manifest"))?;
 
         let wal_path = directory_path.join("write_ahead_log");
 
@@ -174,19 +180,101 @@ impl Storage {
         let table_id = self.manifest.next_id();
         let table_path = self
             .manifest
-            .directory_path
+            .manifest_path
             .join(format!("table_{}", table_id));
         let mut table_writer = SSTableWriter::open(&table_path)?;
         let mem_table = mem::take(&mut self.mem_table);
         table_writer.write(mem_table)?;
-        sync_all_dir(self.manifest.directory_path.as_path())?;
+        sync_all_dir(self.manifest.manifest_path.as_path())?;
 
         let table = SSTableReader::open(table_id, &table_path)?;
-        self.manifest.insert(table)?;
+        self.manifest.insert_atomic(table)?;
 
         self.write_ahead_log.truncate()?;
 
         Ok(())
+    }
+
+    fn compact(&mut self) -> Result<(), Error> {
+        let mut table_id = self.manifest.next_id();
+        let table_path = self
+            .manifest
+            .manifest_path
+            .join(format!("table_{}", table_id));
+        let mut table_writer = SSTableWriter::open(&table_path)?;
+        let mut table_entries = 0u64;
+        let mut new_tables = Vec::<SSTableReader>::new();
+
+        let mut min_heap = MinHeap::default();
+        loop {
+            for table in self.manifest.tables.iter_mut() {
+                if let Some((key, value)) = table.next_entry()? {
+                    min_heap.insert(
+                        SSTableMinHeapKey {
+                            key,
+                            table_id: table.id,
+                        },
+                        value,
+                    );
+                }
+            }
+
+            match min_heap.extract() {
+                Some((key, value)) => {
+                    if let MemTableValue::Value(value) = value {
+                        table_writer.insert(&key.key, &value)?;
+                        table_entries += 1;
+                        if table_entries > 2000 {
+                            table_writer.sync()?;
+
+                            let table = SSTableReader::open(table_id, &table_path)?;
+                            new_tables.push(table);
+
+                            table_id = self.manifest.next_id();
+                            let table_path = self
+                                .manifest
+                                .manifest_path
+                                .join(format!("table_{}", table_id));
+                            table_writer = SSTableWriter::open(&table_path)?;
+                        }
+                    }
+                }
+                None => break,
+            };
+        }
+
+        table_writer.sync()?;
+
+        let table = SSTableReader::open(table_id, &table_path)?;
+        new_tables.push(table);
+
+        table_id = self.manifest.next_id();
+        let table_path = self
+            .manifest
+            .manifest_path
+            .join(format!("table_{}", table_id));
+        table_writer = SSTableWriter::open(&table_path)?;
+
+        sync_all_dir(self.manifest.manifest_path.as_path())?;
+
+        self.manifest.insert_atomic()
+
+
+        Ok(())
+    }
+}
+
+#[derive(PartialEq)]
+struct SSTableMinHeapKey {
+    key: String,
+    table_id: u64,
+}
+
+impl PartialOrd for SSTableMinHeapKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let ordering = self.key.partial_cmp(&other.key)?;
+        // when a min-heap has multiple entries for the same key, the entry of the newest table should be extracted
+        Some(ordering.reverse())
     }
 }
 
@@ -243,11 +331,22 @@ impl SSTableWriter {
                     write_string(&mut self.file, &value)?;
                 }
                 MemTableValue::Deleted => {
-                    write_string(&mut self.file, "")?;
-                    write_deleted(&mut self.file)?;
+                    write!(&mut self.file, "d")?;
                 }
             }
         }
+
+        self.sync()
+    }
+
+    fn insert(&mut self, key: &str, value: &str) -> io::Result<()> {
+        write_string(&mut self.file, &key)?;
+        write_string(&mut self.file, &value)?;
+
+        Ok(())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
         Ok(())
@@ -273,25 +372,39 @@ impl SSTableReader {
 
         while let Some(entry) = self.next_string()? {
             if key == entry.as_str() {
-                let value = match self.next_string()? {
-                    Some(value) => value,
-                    None => {
-                        todo!("handle key without value in sstable file")
-                    }
-                };
+                let value = self.next_string()?;
 
-                if self.read_deleted()? {
-                    return Ok(None);
+                if try_character(&mut self.file, 'd')? {
+                    return Ok(Some(MemTableValue::Deleted));
                 }
+
+                let value = value.ok_or(Error::Truncated)?;
 
                 return Ok(Some(MemTableValue::Value(value)));
             } else {
                 self.skip_string()?;
-                self.read_deleted()?;
+                try_character(&mut self.file, 'd')?;
             }
         }
 
         Ok(None)
+    }
+
+    fn next_entry(&mut self) -> Result<Option<(String, MemTableValue)>, Error> {
+        let key = match self.next_string()? {
+            Some(key) => key,
+            None => return Ok(None),
+        };
+
+        let value = self.next_string()?;
+
+        if try_character(&mut self.file, 'd')? {
+            return Ok(Some((key, MemTableValue::Deleted)));
+        }
+
+        let value = value.ok_or(Error::Truncated)?;
+
+        Ok(Some((key, MemTableValue::Value(value))))
     }
 
     fn skip_string(&mut self) -> Result<(), Error> {
@@ -302,22 +415,6 @@ impl SSTableReader {
 
         self.file.seek_relative(entry_len as i64)?;
         Ok(())
-    }
-
-    fn read_deleted(&mut self) -> io::Result<bool> {
-        let mut buf = [0u8; 1];
-        let n = self.file.read(&mut buf)?;
-        if n == 0 {
-            return Ok(false);
-        }
-
-        let is_deleted = buf[0] as char == 'd';
-
-        if !is_deleted {
-            self.file.seek_relative(-1)?;
-        }
-
-        Ok(is_deleted)
     }
 
     fn next_string(&mut self) -> Result<Option<String>, Error> {
@@ -350,21 +447,20 @@ impl SSTableReader {
     }
 }
 
-struct Manifest {
-    directory_path: PathBuf,
+struct ManifestReader {
+    manifest_path: PathBuf,
     file: BufReader<File>,
     tables: Vec<SSTableReader>,
     id: u64,
 }
 
-impl Manifest {
-    fn open(directory_path: PathBuf) -> Result<Manifest, Error> {
+impl ManifestReader {
+    fn open(manifest_path: PathBuf) -> Result<ManifestReader, Error> {
         let mut manifest_file = BufReader::new(
             OpenOptions::new()
                 .create(true)
-                .write(true)
                 .read(true)
-                .open(directory_path.join("manifest"))?,
+                .open(&manifest_path)?,
         );
 
         let mut buf = Vec::new();
@@ -382,20 +478,20 @@ impl Manifest {
                 .strip_prefix("table_")
                 .ok_or_else(|| Error::InvalidTableName(String::from(table_name)))?
                 .parse::<u64>()?;
-            let table_path = directory_path.join(table_name);
+            let table_path = manifest_path.parent().join(table_name);
 
             tables.push(SSTableReader::open(table_id, &table_path)?)
         }
 
-        Ok(Manifest {
+        Ok(ManifestReader {
             id: tables.len() as u64,
             tables,
             file: manifest_file,
-            directory_path,
+            manifest_path: manifest_path,
         })
     }
-    fn insert(&mut self, table: SSTableReader) -> Result<(), Error> {
-        let temp_path = self.directory_path.join("manifest.TEMP");
+    fn insert_atomic(&mut self, table: SSTableReader) -> io::Result<()> {
+        let temp_path = self.manifest_path.join("manifest.TEMP");
         let mut temp_manifest_file = BufWriter::new(
             OpenOptions::new()
                 .write(true)
@@ -411,19 +507,72 @@ impl Manifest {
         let temp_manifest_file = temp_manifest_file.into_inner()?;
         temp_manifest_file.sync_all()?;
 
-        fs::rename(temp_path, self.directory_path.join("manifest"))?;
+        fs::rename(temp_path, self.manifest_path.join("manifest"))?;
         temp_manifest_file.sync_all()?;
-        sync_all_dir(self.directory_path.as_path())?;
+        sync_all_dir(self.manifest_path.as_path())?;
 
         self.file = BufReader::new(temp_manifest_file);
 
         Ok(())
     }
+
+    fn insert(&mut self, table: SSTableReader) -> io::Result<()> {
+        writeln!(self.file.get_mut(), "table_{}", table.id)?;
+        self.tables.push(table);
+
+        Ok(())
+    }
+
+
     fn next_id(&mut self) -> u64 {
         self.id += 1;
         self.id
     }
 }
+
+struct ManifestWriter {
+    manifest_path: PathBuf,
+    file: BufWriter<File>,
+    next_id: u64,
+}
+
+impl ManifestWriter {
+    fn open(manifest_path: PathBuf, next_id: u64) -> Result<ManifestWriter, Error> {
+        let mut manifest_file = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&manifest_path)?,
+        );
+
+
+        Ok(ManifestWriter {
+            next_id,
+            file: manifest_file,
+            manifest_path,
+        })
+    }
+
+    fn insert(&mut self, table: SSTableReader) -> io::Result<()> {
+        writeln!(self.file.get_mut(), "table_{}", table.id)?;
+
+        Ok(())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.get_mut().sync_all()?;
+
+        Ok(())
+    }
+
+
+    fn next_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+}
+
 
 enum Operation {
     Insert(String, String),
@@ -545,11 +694,6 @@ fn write_string(destination: &mut impl Write, value: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn write_deleted(destination: &mut impl Write) -> io::Result<()> {
-    write!(destination, "{}", 'd')?;
-    Ok(())
-}
-
 fn read_operation_code(source: &mut impl Read) -> Result<Option<OperationCode>, Error> {
     let mut op_code_bytes = [0u8; 1];
     let n = source.read(&mut op_code_bytes)?;
@@ -578,6 +722,34 @@ fn read_operation(source: &mut impl BufRead) -> Result<Option<Operation>, Error>
 
             Ok(Some(Operation::Delete(key)))
         }
+    }
+}
+
+fn peek<T>(source: &mut T) -> io::Result<Option<u8>>
+where
+    T: Read + Seek,
+{
+    let mut buf = [0u8; 1];
+    let n = source.read(&mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+
+    source.seek_relative(-1)?;
+
+    Ok(Some(buf[0]))
+}
+
+fn try_character<T>(source: &mut T, want: char) -> io::Result<bool>
+where
+    T: Read + Seek,
+{
+    match peek(source)? {
+        Some(got) if got as char == want => {
+            source.seek_relative(-1)?;
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 
