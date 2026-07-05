@@ -25,8 +25,17 @@ where
         Some(extracted)
     }
 
-    pub fn peek(&self) -> Option<&(K,V)> {
-       self.inner.front()
+    pub fn extract_until(&mut self, condition: impl Fn(&K, &V) -> bool) -> Vec<(K, V)> {
+        let mut extracted = Vec::new();
+        while let Some((key, value)) = self.inner.front() {
+            if condition(key, value) {
+                let entry = self.extract().expect("extract() should return an entry when the inner array is not empty");
+                extracted.push(entry);
+            } else {
+                break;
+            }
+        }
+        extracted
     }
 
     fn heapify_up(&mut self, mut index: usize) {
@@ -70,12 +79,12 @@ where
 
 impl<K, V> Default for MinHeap<K, V>
 where
-    K: PartialOrd{
+    K: PartialOrd,
+{
     fn default() -> Self {
         MinHeap {
             inner: VecDeque::new(),
         }
-
     }
 }
 

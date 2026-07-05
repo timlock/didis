@@ -1,7 +1,7 @@
 use crate::storage::heap::MinHeap;
 use std::array::TryFromSliceError;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, IntoInnerError, Read, Seek, SeekFrom, Write};
@@ -88,11 +88,13 @@ pub struct Storage {
     manifest: ManifestReader,
     write_ahead_log: WriteAheadLogWriter,
     flush_threshold: usize,
+    directory: PathBuf,
 }
 
 impl Storage {
     pub fn new(directory_path: PathBuf, flush_threshold: usize) -> Result<Storage, Error> {
-        let manifest = ManifestReader::open(directory_path.join("manifest"))?;
+        let manifest_path = directory_path.join("manifest");
+        let manifest = ManifestReader::open(manifest_path.as_path())?;
 
         let wal_path = directory_path.join("write_ahead_log");
 
@@ -103,6 +105,7 @@ impl Storage {
             mem_table: MemTable::default(),
             manifest,
             write_ahead_log: wal_writer,
+            directory: directory_path,
         };
 
         let wal_reader = match WriteAheadLogReader::open(&wal_path) {
@@ -176,19 +179,35 @@ impl Storage {
         Ok(())
     }
 
+    fn sync_dir(&self) -> io::Result<()> {
+        File::open(self.directory.as_path())?.sync_all()
+    }
+
     fn flush(&mut self) -> Result<(), Error> {
-        let table_id = self.manifest.next_id();
-        let table_path = self
+        let table_id = self
             .manifest
-            .manifest_path
-            .join(format!("table_{}", table_id));
+            .last_id()
+            .expect("Should not call flush when manifest is empty")
+            + 1;
+        let table_name = format!("TABLE_{}", table_id);
+        let table_path = self.directory.join(&table_name);
         let mut table_writer = SSTableWriter::open(&table_path)?;
         let mem_table = mem::take(&mut self.mem_table);
         table_writer.write(mem_table)?;
-        sync_all_dir(self.manifest.manifest_path.as_path())?;
+        self.sync_dir()?;
 
-        let table = SSTableReader::open(table_id, &table_path)?;
-        self.manifest.insert_atomic(table)?;
+        let manifest_tmp_path = self.directory.join("MANIFEST.tmp");
+        let mut manifest_writer = ManifestWriter::open(manifest_tmp_path.as_path())?;
+        for table in &self.manifest.tables {
+            manifest_writer.insert(format!("TABLE_{}", table.id).as_str())?;
+        }
+        manifest_writer.insert(&table_name)?;
+        manifest_writer.sync()?;
+        let manifest_path = self.directory.join("MANIFEST");
+        fs::rename(manifest_tmp_path, manifest_path.as_path())?;
+        File::open(manifest_path.as_path())?.sync_all()?;
+        self.manifest = ManifestReader::open(manifest_path.as_path())?;
+        self.sync_dir()?;
 
         self.write_ahead_log.truncate()?;
 
@@ -196,46 +215,67 @@ impl Storage {
     }
 
     fn compact(&mut self) -> Result<(), Error> {
-        let mut table_id = self.manifest.next_id();
-        let table_path = self
+        let mut table_id = self
             .manifest
-            .manifest_path
-            .join(format!("table_{}", table_id));
+            .last_id()
+            .expect("Should not call compact when manifest is empty")
+            + 1;
+        let table_name = format!("TABLE_{}", table_id);
+        let table_path = self.directory.join(&table_name);
         let mut table_writer = SSTableWriter::open(&table_path)?;
         let mut table_entries = 0u64;
-        let mut new_tables = Vec::<SSTableReader>::new();
+        let mut new_tables = vec![table_name];
 
         let mut min_heap = MinHeap::default();
-        loop {
-            for table in self.manifest.tables.iter_mut() {
-                if let Some((key, value)) = table.next_entry()? {
-                    min_heap.insert(
-                        SSTableMinHeapKey {
-                            key,
-                            table_id: table.id,
-                        },
-                        value,
-                    );
-                }
+        let mut old_tables = self
+            .manifest
+            .tables
+            .iter_mut()
+            .map(|t| (t.id, t))
+            .collect::<HashMap<_, _>>();
+        for (_, table) in old_tables.iter_mut() {
+            if let Some((key, value)) = table.next_entry()? {
+                min_heap.insert(
+                    SSTableMinHeapKey {
+                        key,
+                        table_id: table.id,
+                    },
+                    value,
+                );
             }
+        }
 
+        loop {
             match min_heap.extract() {
                 Some((key, value)) => {
                     if let MemTableValue::Value(value) = value {
                         table_writer.insert(&key.key, &value)?;
                         table_entries += 1;
+
                         if table_entries > 2000 {
                             table_writer.sync()?;
 
-                            let table = SSTableReader::open(table_id, &table_path)?;
-                            new_tables.push(table);
-
-                            table_id = self.manifest.next_id();
-                            let table_path = self
-                                .manifest
-                                .manifest_path
-                                .join(format!("table_{}", table_id));
+                            table_id += 1;
+                            let table_name = format!("TABLE_{}", table_id);
+                            let table_path = self.directory.join(&table_name);
                             table_writer = SSTableWriter::open(&table_path)?;
+                            new_tables.push(table_name);
+                        }
+                    }
+
+                    let extracted = min_heap.extract_until(|k, _| k.key == key.key);
+                    for (key, _) in extracted {
+                        let table = old_tables.get_mut(&key.table_id).expect(
+                            "Each entry of the min-heap should come from an existing SSTable",
+                        );
+                        if let Some((key, value)) = table.next_entry()? {
+                            min_heap.insert(
+                                SSTableMinHeapKey {
+                                    key,
+                                    table_id: table.id,
+                                },
+                                value,
+                            );
                         }
                     }
                 }
@@ -244,21 +284,27 @@ impl Storage {
         }
 
         table_writer.sync()?;
+        self.sync_dir()?;
 
-        let table = SSTableReader::open(table_id, &table_path)?;
-        new_tables.push(table);
+        let manifest_tmp_path = self.directory.join("MANIFEST.tmp");
+        let mut manifest_writer = ManifestWriter::open(manifest_tmp_path.as_path())?;
+        for table_name in new_tables {
+            manifest_writer.insert(&table_name)?;
+        }
+        manifest_writer.sync()?;
+        let manifest_path = self.directory.join("MANIFEST");
+        fs::rename(manifest_tmp_path, manifest_path.as_path())?;
+        File::open(manifest_path.as_path())?.sync_all()?;
+        let old_manifest = mem::replace(
+            &mut self.manifest,
+            ManifestReader::open(manifest_path.as_path())?,
+        );
+        self.sync_dir()?;
 
-        table_id = self.manifest.next_id();
-        let table_path = self
-            .manifest
-            .manifest_path
-            .join(format!("table_{}", table_id));
-        table_writer = SSTableWriter::open(&table_path)?;
-
-        sync_all_dir(self.manifest.manifest_path.as_path())?;
-
-        self.manifest.insert_atomic()
-
+        for table in old_manifest.tables {
+            let table_name = format!("TABLE_{}", table.id);
+            fs::remove_file(table_name)?;
+        }
 
         Ok(())
     }
@@ -359,7 +405,7 @@ struct SSTableReader {
 }
 
 impl SSTableReader {
-    fn open(id: u64, table_path: &Path) -> Result<SSTableReader, Error> {
+    fn open(id: u64, table_path: &Path) -> io::Result<SSTableReader> {
         let file = File::open(table_path)?;
         Ok(SSTableReader {
             id,
@@ -448,20 +494,13 @@ impl SSTableReader {
 }
 
 struct ManifestReader {
-    manifest_path: PathBuf,
     file: BufReader<File>,
     tables: Vec<SSTableReader>,
-    id: u64,
 }
 
 impl ManifestReader {
-    fn open(manifest_path: PathBuf) -> Result<ManifestReader, Error> {
-        let mut manifest_file = BufReader::new(
-            OpenOptions::new()
-                .create(true)
-                .read(true)
-                .open(&manifest_path)?,
-        );
+    fn open(manifest_path: &Path) -> Result<ManifestReader, Error> {
+        let mut manifest_file = BufReader::new(File::open(&manifest_path)?);
 
         let mut buf = Vec::new();
         manifest_file.read_to_end(&mut buf)?;
@@ -469,110 +508,55 @@ impl ManifestReader {
 
         let table_names = str::from_utf8(buf.as_slice())?
             .lines()
+            .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>();
 
         let mut tables = Vec::with_capacity(table_names.len());
         for table_name in table_names {
             let table_id = table_name
-                .strip_prefix("table_")
+                .strip_prefix("TABLE_")
                 .ok_or_else(|| Error::InvalidTableName(String::from(table_name)))?
                 .parse::<u64>()?;
-            let table_path = manifest_path.parent().join(table_name);
+            let table_path = match manifest_path.parent() {
+                Some(path) => path.join(table_name),
+                None => PathBuf::from(table_name),
+            };
 
             tables.push(SSTableReader::open(table_id, &table_path)?)
         }
 
         Ok(ManifestReader {
-            id: tables.len() as u64,
             tables,
             file: manifest_file,
-            manifest_path: manifest_path,
         })
     }
-    fn insert_atomic(&mut self, table: SSTableReader) -> io::Result<()> {
-        let temp_path = self.manifest_path.join("manifest.TEMP");
-        let mut temp_manifest_file = BufWriter::new(
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)?,
-        );
-        self.tables.push(table);
-        for table in &self.tables {
-            writeln!(temp_manifest_file, "table_{}", table.id)?;
-        }
 
-        let temp_manifest_file = temp_manifest_file.into_inner()?;
-        temp_manifest_file.sync_all()?;
-
-        fs::rename(temp_path, self.manifest_path.join("manifest"))?;
-        temp_manifest_file.sync_all()?;
-        sync_all_dir(self.manifest_path.as_path())?;
-
-        self.file = BufReader::new(temp_manifest_file);
-
-        Ok(())
-    }
-
-    fn insert(&mut self, table: SSTableReader) -> io::Result<()> {
-        writeln!(self.file.get_mut(), "table_{}", table.id)?;
-        self.tables.push(table);
-
-        Ok(())
-    }
-
-
-    fn next_id(&mut self) -> u64 {
-        self.id += 1;
-        self.id
+    fn last_id(&self) -> Option<u64> {
+        self.tables.iter().map(|t| t.id).max()
     }
 }
 
 struct ManifestWriter {
-    manifest_path: PathBuf,
     file: BufWriter<File>,
-    next_id: u64,
 }
 
 impl ManifestWriter {
-    fn open(manifest_path: PathBuf, next_id: u64) -> Result<ManifestWriter, Error> {
-        let mut manifest_file = BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&manifest_path)?,
-        );
-
-
+    fn open(manifest_path: &Path) -> io::Result<ManifestWriter> {
         Ok(ManifestWriter {
-            next_id,
-            file: manifest_file,
-            manifest_path,
+            file: BufWriter::new(File::create(&manifest_path)?),
         })
     }
 
-    fn insert(&mut self, table: SSTableReader) -> io::Result<()> {
-        writeln!(self.file.get_mut(), "table_{}", table.id)?;
-
-        Ok(())
+    fn insert(&mut self, name: &str) -> io::Result<()> {
+        writeln!(self.file.get_mut(), "{}", name)
     }
 
     fn sync(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        self.file.get_mut().sync_all()?;
-
-        Ok(())
-    }
-
-
-    fn next_id(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id
+        self.file.get_mut().sync_all()
     }
 }
-
 
 enum Operation {
     Insert(String, String),
@@ -773,9 +757,6 @@ fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::R
     Ok(())
 }
 
-fn sync_all_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
 
 #[cfg(test)]
 mod tests {
