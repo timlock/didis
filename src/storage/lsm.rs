@@ -101,7 +101,7 @@ impl Storage {
         compaction_threshold: usize,
         max_table_size: usize,
     ) -> Result<Storage, Error> {
-        let manifest_path = directory_path.join("manifest");
+        let manifest_path = directory_path.join("MANIFEST");
         let tables = read_manifest(&manifest_path)?;
 
         let wal_path = directory_path.join("write_ahead_log");
@@ -132,8 +132,6 @@ impl Storage {
             }
         }
 
-        storage.write_ahead_log.truncate()?;
-
         Ok(storage)
     }
 
@@ -144,7 +142,7 @@ impl Storage {
                 MemTableValue::Deleted => Ok(None),
             };
         }
-        for table in self.tables.iter_mut() {
+        for table in self.tables.iter_mut().rev() {
             let value = table.find(key)?;
             if let Some(value) = value {
                 return match value {
@@ -210,7 +208,7 @@ impl Storage {
         self.sync_dir()?;
 
         let mut new_table_names = Vec::with_capacity(self.tables.len());
-        for table in &self.tables {
+        for table in self.tables.iter() {
             new_table_names.push(format!("TABLE_{}", table.id));
         }
         new_table_names.push(table_name);
@@ -717,36 +715,113 @@ mod tests {
     use crate::temp_dir::TempDir;
     use std::error;
 
+    #[derive(Debug)]
+    enum Cmd<'a> {
+        Get { key: &'a str, want: Option<&'a str> },
+        Put { key: &'a str, value: &'a str },
+        Del { key: &'a str },
+    }
+    impl<'a> TryFrom<&'a str> for Cmd<'a> {
+        type Error = Box<dyn error::Error>;
+
+        fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+            let mut iter = value.split_ascii_whitespace();
+            match iter.next().ok_or_else(|| "empty line")? {
+                "GET" => {
+                    let key = iter.next().ok_or_else(|| format!("truncated '{value}'"))?;
+                    let want = iter.next().ok_or_else(|| format!("truncated '{value}'"))?;
+                    let want = match want {
+                        "NOT_FOUND" => None,
+                        other => Some(other),
+                    };
+
+                    Ok(Cmd::Get { key, want })
+                }
+                "PUT" => {
+                    let key = iter.next().ok_or_else(|| format!("truncated '{value}'"))?;
+                    let value = iter.next().ok_or_else(|| format!("truncated '{value}'"))?;
+                    Ok(Cmd::Put { key, value })
+                }
+                "DELETE" => {
+                    let key = iter.next().ok_or_else(|| format!("truncated '{value}'"))?;
+                    Ok(Cmd::Del { key })
+                }
+                other => Err(format!("unknown cmd {other}").into()),
+            }
+        }
+    }
+
     #[test]
-    fn create_and_populate() -> Result<(), Box<dyn error::Error>> {
+    fn put() -> Result<(), Box<dyn error::Error>> {
         let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 1000, 10000)?;
-
-        for i in 0..100 {
-            storage.insert(i.to_string(), i.to_string())?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+        let lines = include_str!("testdata/put.txt").lines();
+        for (i, line) in lines.enumerate() {
+            let cmd = Cmd::try_from(line)?;
+            match cmd {
+                Cmd::Get { key, want } => {
+                    let got = storage.get(key)?;
+                    assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
+                }
+                Cmd::Put { key, value } => {
+                    storage.insert(key.to_owned(), value.to_owned())?;
+                }
+                Cmd::Del { key } => {
+                    storage.delete(key.to_owned())?;
+                }
+            }
         }
 
-        for i in 95..100 {
-            storage.delete(i.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn put_delete() -> Result<(), Box<dyn error::Error>> {
+        let temp_dir = TempDir::new()?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+        let lines = include_str!("testdata/put-delete.txt").lines();
+        for (i, line) in lines.enumerate() {
+            let cmd = Cmd::try_from(line)?;
+            match cmd {
+                Cmd::Get { key, want } => {
+                    let got = storage.get(key)?;
+                    assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
+                }
+                Cmd::Put { key, value } => {
+                    storage.insert(key.to_owned(), value.to_owned())?;
+                }
+                Cmd::Del { key } => {
+                    storage.delete(key.to_owned())?;
+                }
+            }
         }
 
-        for i in 0..95 {
-            let value = storage.get(i.to_string().as_str())?;
-            assert_eq!(Some(i.to_string()), value);
-        }
+        Ok(())
+    }
 
-        for i in 95..100 {
-            let value = storage.get(i.to_string().as_str())?;
-            assert_eq!(None, value);
-        }
+    #[test]
+    fn put_delete_with_storage_resets() -> Result<(), Box<dyn error::Error>> {
+        let temp_dir = TempDir::new()?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+        let lines = include_str!("testdata/put-delete.txt").lines();
+        for (i, line) in lines.enumerate() {
+            if i % 2500 == 0 {
+                storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+            }
 
-        for i in 0..100 {
-            storage.insert(i.to_string(), (i * 2).to_string())?;
-        }
-
-        for i in 0..100 {
-            let value = storage.get(i.to_string().as_str())?;
-            assert_eq!(Some((i * 2).to_string()), value);
+            let cmd = Cmd::try_from(line)?;
+            match cmd {
+                Cmd::Get { key, want } => {
+                    let got = storage.get(key)?;
+                    assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
+                }
+                Cmd::Put { key, value } => {
+                    storage.insert(key.to_owned(), value.to_owned())?;
+                }
+                Cmd::Del { key } => {
+                    storage.delete(key.to_owned())?;
+                }
+            }
         }
 
         Ok(())
@@ -789,7 +864,6 @@ mod tests {
         assert_eq!(Some("updated three".to_string()), storage.get("3")?);
         assert_eq!(Some("four".to_string()), storage.get("4")?);
         assert_eq!(Some("five".to_string()), storage.get("5")?);
-
 
         Ok(())
     }
