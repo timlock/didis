@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
-use std::{error, fmt, fs, io, iter, mem};
+use std::{error, fmt, fs, io, mem};
 
 #[derive(Debug)]
 pub enum Error {
@@ -23,7 +23,9 @@ pub enum Error {
     ParseIntError(ParseIntError),
     UnknownOperation(u8),
     Truncated,
+    InvalidTableName(String),
     InvalidManifestEntry(String),
+    NoManifestEntryForLevel(usize),
     IntoInner(IntoInnerError<BufWriter<File>>),
     UnexpectedCharacter { want: char, got: char },
 }
@@ -47,6 +49,10 @@ impl Display for Error {
             Error::UnexpectedCharacter { want, got } => {
                 write!(f, "Expected character '{want}' got '{got}'")
             }
+            Error::NoManifestEntryForLevel(level) => {
+                write!(f, "No manifest exists for level {level}")
+            }
+            Error::InvalidTableName(value) => write!(f, "Invalid table name {value}"),
         }
     }
 }
@@ -86,6 +92,18 @@ impl From<IntoInnerError<BufWriter<File>>> for Error {
     }
 }
 
+struct Locations {
+    directory: PathBuf,
+    manifest: PathBuf,
+    manifest_temp: PathBuf,
+}
+
+impl Locations {
+    fn table_path(&self, table_name: impl AsRef<Path>) -> PathBuf {
+        self.directory.join(table_name)
+    }
+}
+
 pub struct Storage {
     mem_table: MemTable,
     level_zero: Vec<SSTableReader>,
@@ -94,7 +112,7 @@ pub struct Storage {
     write_ahead_log: WriteAheadLogWriter,
     flush_threshold: usize,
     compaction_threshold: usize,
-    directory: PathBuf,
+    locations: Locations,
     processed_operations: usize,
     max_table_size: usize,
 }
@@ -107,7 +125,7 @@ impl Storage {
         max_table_size: usize,
     ) -> Result<Storage, Error> {
         let manifest_path = directory_path.join("MANIFEST");
-        let (level_zero, levels) = read_manifest(&manifest_path)?;
+        let (level_zero, levels) = read_manifest2(&manifest_path)?;
 
         let wal_path = directory_path.join("write_ahead_log");
 
@@ -119,7 +137,11 @@ impl Storage {
             level_zero,
             levels,
             write_ahead_log: wal_writer,
-            directory: directory_path,
+            locations: Locations {
+                directory: directory_path,
+                manifest_temp: manifest_path.join(".tmp"),
+                manifest: manifest_path,
+            },
             compaction_threshold,
             processed_operations: 0,
             max_table_size,
@@ -215,13 +237,13 @@ impl Storage {
     }
 
     fn sync_dir(&self) -> io::Result<()> {
-        File::open(self.directory.as_path())?.sync_all()
+        File::open(self.locations.directory.as_path())?.sync_all()
     }
 
     fn flush(&mut self) -> Result<(), Error> {
         let table_id = self.next_id();
         let table_name = format!("TABLE_{}", table_id);
-        let table_path = self.directory.join(&table_name);
+        let table_path = self.locations.table_path(&table_name);
         let mut table_writer = SSTableWriter::open(&table_path)?;
         let mem_table = mem::take(&mut self.mem_table);
         table_writer.write(mem_table)?;
@@ -233,18 +255,7 @@ impl Storage {
         }
         new_level_zero.push(table_name);
 
-        let levels = self
-            .levels
-            .iter()
-            .map(|level| {
-                level
-                    .iter()
-                    .map(|(key_range, table)| (key_range.clone(), table.file_name.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        self.replace_manifest(new_level_zero, levels)?;
+        self.replace_manifest_level_zero(new_level_zero)?;
 
         self.write_ahead_log.truncate()?;
 
@@ -278,7 +289,7 @@ impl Storage {
         }
 
         let mut table_name = format!("TABLE_{}", table_id);
-        let mut table_path = self.directory.join(&table_name);
+        let mut table_path = self.locations.table_path(&table_name);
         let mut table_writer = SSTableWriter::open(&table_path)?;
         let mut table_entries = 0;
         let mut new_level_one = vec![];
@@ -317,7 +328,7 @@ impl Storage {
 
                             table_id += 1;
                             table_name = format!("TABLE_{}", table_id);
-                            table_path = self.directory.join(&table_name);
+                            table_path = self.locations.table_path(&table_name);
                             table_writer = SSTableWriter::open(&table_path)?;
                             table_entries = 0;
                         }
@@ -347,11 +358,11 @@ impl Storage {
         table_writer.sync()?;
         self.sync_dir()?;
 
-        let old_tables = self.replace_manifest(iter::empty(), vec![new_level_one])?;
+        let old_tables = self.replace_manifest_levels(vec![new_level_one])?;
 
         for table in old_tables {
             let table_name = format!("TABLE_{}", table.id);
-            fs::remove_file(self.directory.join(table_name))?;
+            fs::remove_file(self.locations.table_path(&table_name))?;
         }
 
         Ok(())
@@ -373,19 +384,43 @@ impl Storage {
             .map_or(1, |id| id + 1)
     }
 
-    fn replace_manifest<'a>(
+    fn replace_manifest_level_zero<'a>(
         &mut self,
-        level_zero: impl IntoIterator<Item = String>,
-        levels: impl IntoIterator<Item = impl IntoIterator<Item = (Range<String>, String)>>,
+        level_zero: impl IntoIterator<Item=String>,
     ) -> Result<Vec<SSTableReader>, Error> {
-        let manifest_tmp_path = self.directory.join("MANIFEST.tmp");
-        write_manifest(&manifest_tmp_path, level_zero, levels)?;
+        let mut manifest_reader = ManifestReader::open(&self.locations.manifest)?;
+        let levels_raw = manifest_reader.read_levels_raw()?;
+        let mut manifest_writer = ManifestWriter::open(&self.locations.manifest_temp)?;
+        manifest_writer.write_level_zero(level_zero)?;
+        manifest_writer.append_raw(&levels_raw)?;
+        manifest_writer.sync()?;
 
-        let manifest_path = self.directory.join("MANIFEST");
-        fs::rename(manifest_tmp_path, manifest_path.as_path())?;
-        File::open(manifest_path.as_path())?.sync_all()?;
+        fs::rename(&self.locations.manifest_temp, &self.locations.manifest)?;
+        File::open(&self.locations.manifest)?.sync_all()?;
 
-        let (level_zero, levels) = read_manifest(manifest_path.as_path())?;
+
+        let mut manifest_reader = ManifestReader::open(&self.locations.manifest)?;
+        let level_zero_table_names = manifest_reader.read_level_zero()?;
+
+        let old_zero = mem::replace(&mut self.level_zero, level_zero_table_names);
+        self.sync_dir()?;
+
+        Ok(old_zero)
+    }
+
+    fn replace_manifest_levels<'a>(
+        &mut self,
+        levels: impl IntoIterator<Item=impl IntoIterator<Item=(Range<String>, String)>>,
+    ) -> Result<Vec<SSTableReader>, Error> {
+        let mut manifest_writer = ManifestWriter::open(&self.locations.manifest_temp)?;
+
+        //TODO copy level zero
+        manifest_writer.write_levels(levels)?;
+
+        fs::rename(&self.locations.manifest_temp, &self.locations.manifest)?;
+        File::open(&self.locations.manifest)?.sync_all()?;
+
+        let (level_zero, levels) = read_manifest(&self.locations.manifest)?;
         let old_zero = mem::replace(&mut self.level_zero, level_zero);
         let old_levels = mem::replace(&mut self.levels, levels); //TODO levels might not be changed in which case the removal of tables is wrong
         self.sync_dir()?;
@@ -505,13 +540,14 @@ struct SSTableReader {
 }
 
 impl SSTableReader {
-    fn open(id: u64, table_path: &Path) -> io::Result<SSTableReader> {
+    fn open(id: u64, table_path: impl AsRef<Path>) -> io::Result<SSTableReader> {
         let file_name = table_path
+            .as_ref()
             .file_name()
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::IsADirectory,
-                    format!("{:?} is a directory", table_path),
+                    format!("{:?} is a directory", table_path.as_ref()),
                 )
             })?
             .to_os_string()
@@ -558,10 +594,56 @@ impl<'a> Iterator for SSTableReader {
     }
 }
 
-fn read_manifest(
-    manifest_path: &Path,
+fn read_manifest2(
+    manifest_path: impl AsRef<Path>,
 ) -> Result<(Vec<SSTableReader>, Vec<Vec<(Range<String>, SSTableReader)>>), Error> {
-    let content = match fs::read_to_string(manifest_path) {
+    let mut manifest_reader = ManifestReader::open(&manifest_path)?;
+    let level_zero_table_names = manifest_reader.read_level_zero()?;
+
+    let mut level_zero = Vec::new();
+
+    for (table_id, table_name) in level_zero_table_names {
+        let table_path = match manifest_path.as_ref().parent() {
+            Some(path) => path.join(table_name),
+            None => PathBuf::from(table_name),
+        };
+
+        level_zero.push(SSTableReader::open(table_id, &table_path)?)
+    }
+
+
+    let levels_table_names = manifest_reader.read_levels()?;
+    let mut levels = Vec::new();
+    for (_, table_names) in levels_table_names  {
+
+        let mut tables = Vec::new();
+        for (range, table_id, table_name) in table_names {
+            let table_path = match manifest_path.as_ref().parent() {
+                Some(path) => path.join(table_name),
+                None => PathBuf::from(table_name),
+            };
+
+            tables.push((range, SSTableReader::open(table_id, &table_path)?))
+        }
+
+        levels.push(tables);
+    }
+
+    Ok((level_zero, levels))
+}
+
+fn parse_table_id(value: &str) -> Result<u64, Error> {
+    value
+        .strip_prefix("TABLE_")
+        .ok_or_else(|| Error::InvalidTableName(value.to_string()))?
+        .parse::<u64>()
+        .map_err(|err| err.into())
+}
+
+fn read_manifest(
+    manifest_path: impl AsRef<Path>,
+) -> Result<(Vec<SSTableReader>, Vec<Vec<(Range<String>, SSTableReader)>>), Error> {
+    let content = match fs::read_to_string(&manifest_path) {
         Ok(content) => content,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(err) => return Err(err.into()),
@@ -580,14 +662,14 @@ fn read_manifest(
         match line {
             "[L1]" => {
                 levels.push(Vec::new());
-                break
-            },
+                break;
+            }
             table_name => {
                 let table_id = table_name
                     .strip_prefix("TABLE_")
                     .ok_or_else(|| Error::InvalidManifestEntry(String::from(table_name)))?
                     .parse::<u64>()?;
-                let table_path = match manifest_path.parent() {
+                let table_path = match manifest_path.as_ref().parent() {
                     Some(path) => path.join(table_name),
                     None => PathBuf::from(table_name),
                 };
@@ -599,8 +681,7 @@ fn read_manifest(
 
     for line in lines {
         if line.starts_with("[L") {
-
-            if line != format!("[L{}]", levels.len()){
+            if line != format!("[L{}]", levels.len()) {
                 return Err(Error::InvalidManifestEntry(line.to_owned()));
             }
 
@@ -618,7 +699,7 @@ fn read_manifest(
             .strip_prefix("TABLE_")
             .ok_or_else(|| Error::InvalidManifestEntry(String::from(table_name)))?
             .parse::<u64>()?;
-        let table_path = match manifest_path.parent() {
+        let table_path = match manifest_path.as_ref().parent() {
             Some(path) => path.join(table_name),
             None => PathBuf::from(table_name),
         };
@@ -635,10 +716,227 @@ fn read_manifest(
     Ok((level_zero, levels))
 }
 
+struct ManifestReader {
+    file: BufReader<File>,
+}
+
+impl ManifestReader {
+    fn open(path: impl AsRef<Path>) -> io::Result<ManifestReader> {
+        let file = File::create(path)?;
+        Ok(ManifestReader {
+            file: BufReader::new(file),
+        })
+    }
+
+    fn read_level_zero(&mut self) -> Result<Vec<(u64, String)>, Error> {
+        self.file.seek(SeekFrom::Start(0))?;
+
+        if !self.skip_until_level(0)? {
+            return Ok(Vec::new());
+        }
+
+        match self.read_level_header() {
+            Some(level) => level?,
+            None => { return Ok(Vec::new()) }
+        };
+
+        let lines = self
+            .read_lines_until_next_level()?;
+
+        let mut table_names = Vec::new();
+        for line in lines {
+            let table_id = parse_table_id(&line)?;
+            table_names.push((table_id, line));
+        }
+
+        Ok(table_names)
+    }
+
+    fn read_levels(&mut self) -> Result<Vec<(usize, Vec<(Range<String>, u64, String)>)>, Error> {
+        self.file.seek(SeekFrom::Start(0))?;
+
+        if !self.skip_until_level(1)? {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::new();
+        while let Some(level) = self.read_next_level() {
+            result.push(level?);
+        }
+
+        Ok(result)
+    }
+
+    fn read_levels_raw(&mut self) -> Result<String, Error> {
+        self.file.seek(SeekFrom::Start(0))?;
+
+        if !self.skip_until_level(1)? {
+            return Ok(String::new());
+        }
+
+        let mut buf = Vec::new();
+        self.file.read_to_end(&mut buf)?;
+
+        String::from_utf8(buf).map_err(Error::from)
+    }
+
+    fn read_level(&mut self, level: usize) -> Result<Vec<(Range<String>, u64, String)>, Error> {
+        self.file.seek(SeekFrom::Start(0))?;
+
+        if !self.skip_until_level(level)? {
+            return Ok(Vec::new());
+        }
+
+        self.read_next_level()
+            .map(|r|r.map(|(_, t)|t))
+            .ok_or_else(|| Error::NoManifestEntryForLevel(level))?
+    }
+
+    fn read_next_level(&mut self) -> Option<Result<(usize, Vec<(Range<String>, u64, String)>), Error>> {
+        let level = match self.read_level_header()? {
+            Ok(level) => { level }
+            Err(err) => { return Some(Err(err)) }
+        };
+
+        let lines = match self.read_lines_until_next_level() {
+            Ok(lines) => { lines }
+            Err(err) => { return Some(Err(err)) }
+        };
+
+        let mut result = Vec::new();
+        for line in lines {
+            let table = match Self::parse_table(&line) {
+                Ok(table) => table,
+                Err(err) => return Some(Err(err)),
+            };
+            result.push(table);
+        }
+
+        Some(Ok((level, result)))
+    }
+
+
+    fn skip_until_level(&mut self, level: usize) -> Result<bool, Error> {
+        while self.file.skip_until(b'[')? != 0 {
+            self.file.seek_relative(-1)?;
+
+            let current_level = match self.read_level_header() {
+                Some(level) => {level?}
+                None => {return Ok(false)}
+            };
+            if current_level == level {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn read_lines_until_next_level(&mut self) -> Result<Vec<String>, Error> {
+        let mut buf = Vec::new();
+        if self.file.read_until(b'[', &mut buf)? == 0 {
+            return Ok(Vec::new());
+        }
+        self.file.seek_relative(-1)?;
+
+        let lines = str::from_utf8(&buf)?
+            .lines()
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.to_owned())
+            .collect();
+
+        Ok(lines)
+    }
+
+    fn read_level_header(&mut self) -> Option<Result<usize, Error>> {
+        let mut line = String::new();
+        match self.file.read_line(&mut line) {
+            Ok(0) => {return None}
+            Ok(_) => {}
+            Err(err) => {return Some(Err(err.into()))}
+        }
+
+        if !line.starts_with('[') && !line.ends_with(']') {
+            return Some(Err(Error::InvalidManifestEntry(line.to_owned())));
+        }
+
+        let level_str = &line[1..line.len()];
+        Some(level_str.parse::<usize>().map_err(Error::from))
+    }
+
+    fn parse_table(line: &str) -> Result<(Range<String>, u64, String), Error> {
+        let (keys, table_name) = line
+            .split_once(":")
+            .ok_or_else(|| Error::InvalidManifestEntry(line.to_owned()))?;
+
+        let (start_inclusive, end_exclusive) = keys
+            .split_once("-")
+            .ok_or_else(|| Error::InvalidManifestEntry(line.to_owned()))?;
+
+        let table_id = parse_table_id(&table_name)?;
+
+        Ok((
+            start_inclusive.to_owned()..end_exclusive.to_owned(),
+            table_id,
+            table_name.to_owned(),
+        ))
+    }
+}
+
+struct ManifestWriter {
+    file: BufWriter<File>,
+}
+impl ManifestWriter {
+    fn open(path: impl AsRef<Path>) -> io::Result<ManifestWriter> {
+        let file = File::create(path)?;
+        Ok(ManifestWriter {
+            file: BufWriter::new(file),
+        })
+    }
+
+    fn write_level_zero(&mut self, level_zero: impl IntoIterator<Item=String>) -> io::Result<()> {
+        writeln!(self.file, "[L0]")?;
+        for table_name in level_zero {
+            writeln!(self.file, "{table_name}")?;
+        }
+
+        Ok(())
+    }
+
+    fn append_raw(&mut self, raw: &str) -> io::Result<()> {
+        self.file.write_all(raw.as_bytes())
+    }
+
+    fn write_levels(
+        &mut self,
+        levels: impl IntoIterator<Item=impl IntoIterator<Item=(Range<String>, String)>>,
+    ) -> io::Result<()> {
+        for (level, tables) in levels.into_iter().enumerate() {
+            writeln!(self.file, "[L{}]", level + 1)?;
+            for (key_range, table_name) in tables {
+                writeln!(
+                    self.file,
+                    "{}-{}:{table_name}",
+                    key_range.start, key_range.end
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+        Ok(())
+    }
+}
+
 fn write_manifest<'a>(
     manifest_path: &Path,
-    level_zero: impl IntoIterator<Item = String>,
-    levels: impl IntoIterator<Item = impl IntoIterator<Item = (Range<String>, String)>>,
+    level_zero: impl IntoIterator<Item=String>,
+    levels: impl IntoIterator<Item=impl IntoIterator<Item=(Range<String>, String)>>,
 ) -> io::Result<()> {
     let mut file = BufWriter::new(File::create(&manifest_path)?);
 
