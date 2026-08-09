@@ -1,4 +1,5 @@
 use crate::storage::heap::MinHeap;
+use log::info;
 use std::array::TryFromSliceError;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -12,6 +13,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
+use std::time::{Duration, Instant};
 use std::{error, fmt, fs, io, mem};
 
 #[derive(Debug)]
@@ -124,14 +126,23 @@ impl Storage {
         compaction_threshold: usize,
         max_table_size: usize,
     ) -> Result<Storage, Error> {
+        info!("Setting up storage engine");
+
         let locations = Locations {
             manifest: directory_path.join("MANIFEST"),
             manifest_temp: directory_path.join("MANIFEST.tmp"),
             wal: directory_path.join("write_ahead_log"),
             directory: directory_path,
         };
+        info!("Reading manifest file");
         let levels = match read_manifest(&locations.manifest) {
-            Ok(levels) => levels,
+            Ok(levels) => {
+                info!(
+                    "Found {} tables",
+                    levels.iter().map(Vec::len).sum::<usize>()
+                );
+                levels
+            }
             Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => {
                 File::create(&locations.manifest)?;
                 Vec::new()
@@ -158,12 +169,16 @@ impl Storage {
             Err(err) => return Err(Error::from(err)),
         };
 
+        info!("Replaying operations from write ahead log file");
+
         if let Some(wal_reader) = wal_reader {
             for operation in wal_reader {
                 let operation = operation?;
                 storage.execute_no_wal(operation)?;
             }
         }
+
+        info!("Storage engine is set up");
 
         Ok(storage)
     }
@@ -245,6 +260,9 @@ impl Storage {
     }
 
     fn flush(&mut self) -> Result<(), Error> {
+        info!("Flushing memtable");
+        let start = Instant::now();
+
         let table_id = self.next_id();
         let table_name = format!("TABLE_{}", table_id);
         let table_path = self.locations.table_path(&table_name);
@@ -273,22 +291,22 @@ impl Storage {
                 &mut self.levels[0]
             }
         };
-        // let old_level_zero = self.levels.get(0).into_iter().flatten();
-        // let mut new_level_zero = Vec::new();
-        // for (range, table) in old_level_zero {
-        //     new_level_zero.push((range.clone(), table.file_name.clone()));
-        // }
+
         new_level_zero.push((table_range, table_reader));
 
         self.save_manifest()?;
-        // self.replace_manifest_level(0, new_level_zero)?;
 
         self.write_ahead_log.truncate()?;
+
+        info!("Flush complete took {:?}", start.elapsed());
 
         Ok(())
     }
 
     fn compact_level(&mut self, level: usize) -> Result<(), Error> {
+        info!("Compacting level {level}");
+        let start = Instant::now();
+
         let mut table_id = self.next_id();
 
         let mut old_tables = Vec::new();
@@ -325,42 +343,86 @@ impl Storage {
         loop {
             match min_heap.extract() {
                 Some((heap_key, value)) => {
-                    if heap_key.key.as_str() == "qxfaz"{
-                        dbg!("");
-                    }
-                    if let Operation::Insert(_, value) = &value {
-                        table_writer.insert(heap_key.key.clone(), value.to_owned())?;
-                        table_entries += 1;
-                        key_range = Some(match key_range {
-                            Some(key_range) => {
-                                let start = if &heap_key.key < key_range.start() {
-                                    heap_key.key.clone()
-                                } else {
-                                    key_range.start().clone()
-                                };
+                    match &value {
+                        Operation::Insert(_, value) => {
+                            table_writer.insert(heap_key.key.clone(), value.to_owned())?;
+                            table_entries += 1;
+                            key_range = Some(match key_range {
+                                Some(key_range) => {
+                                    let start = if &heap_key.key < key_range.start() {
+                                        heap_key.key.clone()
+                                    } else {
+                                        key_range.start().clone()
+                                    };
 
-                                let end = if &heap_key.key > key_range.end() {
-                                    heap_key.key.clone()
-                                } else {
-                                    key_range.end().clone()
-                                };
+                                    let end = if &heap_key.key > key_range.end() {
+                                        heap_key.key.clone()
+                                    } else {
+                                        key_range.end().clone()
+                                    };
 
-                                start..=end
+                                    start..=end
+                                }
+                                None => heap_key.key.clone()..=heap_key.key.clone(),
+                            });
+
+                            if table_entries > self.max_table_size {
+                                table_writer.sync()?;
+
+                                new_next_level.push((
+                                    key_range.unwrap(),
+                                    SSTableReader::open(table_id, table_path)?,
+                                ));
+                                key_range = None;
+
+                                table_id += 1;
+                                table_name = format!("TABLE_{}", table_id);
+                                table_path = self.locations.table_path(&table_name);
+                                table_writer = SSTableWriter::open(&table_path)?;
+                                table_entries = 0;
                             }
-                            None => heap_key.key.clone()..=heap_key.key.clone(),
-                        });
+                        }
+                        Operation::Delete(_) if level < self.levels.len() - 1 => {
+                            table_writer.delete(heap_key.key.clone())?;
+                            table_entries += 1;
+                            key_range = Some(match key_range {
+                                Some(key_range) => {
+                                    let start = if &heap_key.key < key_range.start() {
+                                        heap_key.key.clone()
+                                    } else {
+                                        key_range.start().clone()
+                                    };
 
-                        if table_entries > self.max_table_size {
-                            table_writer.sync()?;
+                                    let end = if &heap_key.key > key_range.end() {
+                                        heap_key.key.clone()
+                                    } else {
+                                        key_range.end().clone()
+                                    };
 
-                            new_next_level.push((key_range.unwrap(), SSTableReader::open(table_id, table_path)?));
-                            key_range = None;
+                                    start..=end
+                                }
+                                None => heap_key.key.clone()..=heap_key.key.clone(),
+                            });
 
-                            table_id += 1;
-                            table_name = format!("TABLE_{}", table_id);
-                            table_path = self.locations.table_path(&table_name);
-                            table_writer = SSTableWriter::open(&table_path)?;
-                            table_entries = 0;
+                            if table_entries > self.max_table_size {
+                                table_writer.sync()?;
+
+                                new_next_level.push((
+                                    key_range.unwrap(),
+                                    SSTableReader::open(table_id, table_path)?,
+                                ));
+                                key_range = None;
+
+                                table_id += 1;
+                                table_name = format!("TABLE_{}", table_id);
+                                table_path = self.locations.table_path(&table_name);
+                                table_writer = SSTableWriter::open(&table_path)?;
+                                table_entries = 0;
+                            }
+                        }
+                        Operation::Delete(_) => {
+                            // Tombstones at the lowest level can be dropped, since there are no higher levels
+                            // the tombstone does not shadow other operations for that key
                         }
                     }
 
@@ -383,12 +445,13 @@ impl Storage {
             };
         }
 
-
-        new_next_level.push((key_range.unwrap(), SSTableReader::open(table_id, table_path)?));
+        new_next_level.push((
+            key_range.unwrap(),
+            SSTableReader::open(table_id, table_path)?,
+        ));
 
         table_writer.sync()?;
         self.sync_dir()?;
-
 
         let next_level = match self.levels.get_mut(level + 1) {
             Some(level_zero) => level_zero,
@@ -400,8 +463,11 @@ impl Storage {
         next_level.extend(new_next_level);
 
         for (_, (_, table)) in old_tables {
+            info!("Deleting old table {}", table.file_name);
             fs::remove_file(self.locations.table_path(&table.file_name))?;
         }
+
+        info!("Compaction complete, took {:?}", start.elapsed());
 
         Ok(())
     }
@@ -416,6 +482,8 @@ impl Storage {
     }
 
     fn save_manifest(&mut self) -> Result<(), Error> {
+        info!("Saving manifest entries");
+
         let mut manifest_writer = ManifestWriter::open(&self.locations.manifest_temp)?;
 
         for (level, tables) in self.levels.iter().enumerate() {
@@ -432,7 +500,6 @@ impl Storage {
 
         Ok(())
     }
-
 }
 
 #[derive(PartialEq)]
@@ -504,6 +571,7 @@ struct SSTableWriter {
 }
 impl SSTableWriter {
     fn open(table_path: &Path) -> io::Result<SSTableWriter> {
+        info!("Creating new table {:?}", table_path);
         let file = File::create(&table_path)?;
         Ok(SSTableWriter {
             file: BufWriter::new(file),
@@ -527,6 +595,10 @@ impl SSTableWriter {
 
     fn insert(&mut self, key: String, value: String) -> io::Result<()> {
         write_operation(&mut self.file, &Operation::Insert(key, value))
+    }
+
+    fn delete(&mut self, key: String) -> io::Result<()> {
+        write_operation(&mut self.file, &Operation::Delete(key))
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -556,6 +628,8 @@ impl SSTableReader {
             .to_os_string()
             .to_string_lossy()
             .into_owned();
+
+        info!("Opening table {:?}", table_path.as_ref());
 
         let file = File::open(table_path)?;
         Ok(SSTableReader {
@@ -743,6 +817,7 @@ struct ManifestWriter {
 }
 impl ManifestWriter {
     fn open(path: impl AsRef<Path>) -> io::Result<ManifestWriter> {
+        info!("Creating manifest {:?}", path.as_ref());
         let file = File::create(path)?;
         Ok(ManifestWriter {
             file: BufWriter::new(file),
@@ -829,6 +904,7 @@ struct WriteAheadLogReader {
 
 impl WriteAheadLogReader {
     fn open(wal_path: &Path) -> io::Result<WriteAheadLogReader> {
+        info!("Opening write ahead log");
         let wal_file = File::open(wal_path)?;
         Ok(WriteAheadLogReader {
             file: BufReader::new(wal_file),
@@ -854,6 +930,7 @@ struct WriteAheadLogWriter {
 
 impl WriteAheadLogWriter {
     fn open(wal_path: &Path) -> io::Result<WriteAheadLogWriter> {
+        info!("Opening / Creating write ahead log");
         let wal_file = OpenOptions::new()
             .write(true)
             .append(true)
@@ -957,11 +1034,23 @@ fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logger;
     use crate::temp_dir::TempDir;
+    use log::Level;
     use std::error;
 
     static PUT_FILE: &'static str = include_str!("testdata/put.txt");
     static PUT_DELETE_FILE: &'static str = include_str!("testdata/put-delete.txt");
+
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    pub fn initialize() {
+        INIT.call_once(|| {
+            logger::init(Level::Info).unwrap();
+        });
+    }
 
     #[derive(Debug)]
     enum Cmd<'a> {
@@ -1001,6 +1090,7 @@ mod tests {
 
     #[test]
     fn put() -> Result<(), Box<dyn error::Error>> {
+        initialize();
         let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
         let lines = PUT_FILE.lines();
@@ -1008,9 +1098,6 @@ mod tests {
             let cmd = Cmd::try_from(line)?;
             match cmd {
                 Cmd::Get { key, want } => {
-                    if key == "qxfaz" {
-                        dbg!("");
-                    }
                     let got = storage.get(key)?;
                     assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
                 }
@@ -1028,6 +1115,7 @@ mod tests {
 
     #[test]
     fn put_delete() -> Result<(), Box<dyn error::Error>> {
+        initialize();
         let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
         let lines = PUT_DELETE_FILE.lines();
@@ -1052,6 +1140,7 @@ mod tests {
 
     #[test]
     fn put_delete_with_storage_resets() -> Result<(), Box<dyn error::Error>> {
+        initialize();
         let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
         let lines = PUT_DELETE_FILE.lines();
@@ -1080,6 +1169,7 @@ mod tests {
 
     #[test]
     fn data_survives_crash_before_flush() -> Result<(), Box<dyn error::Error>> {
+        initialize();
         let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 1000, 10000)?;
 
@@ -1097,6 +1187,7 @@ mod tests {
 
     #[test]
     fn compaction() -> Result<(), Box<dyn error::Error>> {
+        initialize();
         let temp_dir = TempDir::new()?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2, 2, 10)?;
 
