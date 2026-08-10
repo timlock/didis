@@ -1,7 +1,8 @@
 use crate::storage::heap::MinHeap;
 use log::info;
 use std::array::TryFromSliceError;
-use std::cmp::Ordering;
+use std::borrow::Cow;
+use std::cmp::{Ordering, min};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display};
 use std::fs::{File, OpenOptions};
@@ -109,23 +110,15 @@ impl Locations {
 
 pub struct Storage {
     mem_table: MemTable,
-    levels: Vec<Vec<(RangeInclusive<String>, SSTableReader)>>,
+    levels: BTreeMap<usize, Vec<(RangeInclusive<String>, SSTableReader)>>,
 
     write_ahead_log: WriteAheadLogWriter,
-    flush_threshold: usize,
-    compaction_threshold: usize,
     locations: Locations,
-    processed_operations: usize,
     max_table_size: usize,
 }
 
 impl Storage {
-    pub fn new(
-        directory_path: PathBuf,
-        flush_threshold: usize,
-        compaction_threshold: usize,
-        max_table_size: usize,
-    ) -> Result<Storage, Error> {
+    pub fn new(directory_path: PathBuf, max_table_size: usize) -> Result<Storage, Error> {
         info!("Setting up storage engine");
 
         let locations = Locations {
@@ -139,27 +132,26 @@ impl Storage {
             Ok(levels) => {
                 info!(
                     "Found {} tables",
-                    levels.iter().map(Vec::len).sum::<usize>()
+                    levels.values().map(Vec::len).sum::<usize>()
                 );
                 levels
             }
             Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => {
                 File::create(&locations.manifest)?;
-                Vec::new()
+                BTreeMap::new()
             }
             Err(err) => return Err(err),
         };
 
+        //TODO look for dangling table files
+
         let wal_writer = WriteAheadLogWriter::open(&locations.wal)?;
 
         let mut storage = Storage {
-            flush_threshold,
             mem_table: MemTable::default(),
             levels,
             write_ahead_log: wal_writer,
             locations,
-            compaction_threshold,
-            processed_operations: 0,
             max_table_size,
         };
 
@@ -191,13 +183,13 @@ impl Storage {
             };
         }
 
-        for (level, tables) in self.levels.iter_mut().enumerate() {
+        for (level, tables) in self.levels.iter_mut() {
             for (key_range, table) in tables.iter_mut().rev() {
                 if key_range.start().as_str() <= key && key <= key_range.end().as_str() {
                     let value = table.find(key)?;
                     match value {
                         None => {
-                            if level > 0 {
+                            if *level > 0 {
                                 // only level one has tables with overlapping keys, for later levels only one table may contain a certain key
                                 break;
                             }
@@ -242,14 +234,15 @@ impl Storage {
             }
         }
 
-        if self.mem_table.inner.len() >= self.flush_threshold {
+        if self.mem_table.inner.len() >= self.max_table_size {
             self.flush()?;
-        }
 
-        self.processed_operations += 1;
-        if self.processed_operations >= self.compaction_threshold {
-            self.compact_level(0)?;
-            self.processed_operations = 0;
+            for level in 0..self.levels.len() {
+                let tables_len = self.levels.get(&level).map(Vec::len).unwrap_or(0);
+                if tables_len > (level + 1) * 5 {
+                    self.compact_level(level)?;
+                }
+            }
         }
 
         Ok(())
@@ -284,11 +277,13 @@ impl Storage {
 
         let table_reader = SSTableReader::open(table_id, table_path)?;
 
-        let new_level_zero = match self.levels.get_mut(0) {
+        let new_level_zero = match self.levels.get_mut(&0) {
             Some(level_zero) => level_zero,
             None => {
-                self.levels.push(Vec::new());
-                &mut self.levels[0]
+                self.levels.insert(0, Vec::new());
+                self.levels.get_mut(&0).expect(
+                    "get_mut(0) should return Some when insert(0, value) has been called before",
+                )
             }
         };
 
@@ -310,16 +305,16 @@ impl Storage {
         let mut table_id = self.next_id();
 
         let mut old_tables = Vec::new();
-        if let Some(old_level) = self.levels.get_mut(level) {
+        if let Some(old_level) = self.levels.get_mut(&level) {
             old_tables.extend(old_level.drain(..));
         }
-        if let Some(old_level) = self.levels.get_mut(level + 1) {
+        if let Some(old_level) = self.levels.get_mut(&(level + 1)) {
             old_tables.extend(old_level.drain(..));
         }
 
         let mut old_tables = old_tables
             .iter_mut()
-            .map(|(_, table)| (table.id, (level + 1, table)))
+            .map(|(_, table)| (table.id, (level, table)))
             .collect::<HashMap<_, _>>();
 
         let mut min_heap = MinHeap::default();
@@ -340,109 +335,64 @@ impl Storage {
         let mut table_entries = 0;
         let mut new_next_level = vec![];
         let mut key_range: Option<RangeInclusive<String>> = None;
-        loop {
-            match min_heap.extract() {
-                Some((heap_key, value)) => {
-                    match &value {
-                        Operation::Insert(_, value) => {
-                            table_writer.insert(heap_key.key.clone(), value.to_owned())?;
-                            table_entries += 1;
-                            key_range = Some(match key_range {
-                                Some(key_range) => {
-                                    let start = if &heap_key.key < key_range.start() {
-                                        heap_key.key.clone()
-                                    } else {
-                                        key_range.start().clone()
-                                    };
 
-                                    let end = if &heap_key.key > key_range.end() {
-                                        heap_key.key.clone()
-                                    } else {
-                                        key_range.end().clone()
-                                    };
-
-                                    start..=end
-                                }
-                                None => heap_key.key.clone()..=heap_key.key.clone(),
-                            });
-
-                            if table_entries > self.max_table_size {
-                                table_writer.sync()?;
-
-                                new_next_level.push((
-                                    key_range.unwrap(),
-                                    SSTableReader::open(table_id, table_path)?,
-                                ));
-                                key_range = None;
-
-                                table_id += 1;
-                                table_name = format!("TABLE_{}", table_id);
-                                table_path = self.locations.table_path(&table_name);
-                                table_writer = SSTableWriter::open(&table_path)?;
-                                table_entries = 0;
-                            }
-                        }
-                        Operation::Delete(_) if level < self.levels.len() - 1 => {
-                            table_writer.delete(heap_key.key.clone())?;
-                            table_entries += 1;
-                            key_range = Some(match key_range {
-                                Some(key_range) => {
-                                    let start = if &heap_key.key < key_range.start() {
-                                        heap_key.key.clone()
-                                    } else {
-                                        key_range.start().clone()
-                                    };
-
-                                    let end = if &heap_key.key > key_range.end() {
-                                        heap_key.key.clone()
-                                    } else {
-                                        key_range.end().clone()
-                                    };
-
-                                    start..=end
-                                }
-                                None => heap_key.key.clone()..=heap_key.key.clone(),
-                            });
-
-                            if table_entries > self.max_table_size {
-                                table_writer.sync()?;
-
-                                new_next_level.push((
-                                    key_range.unwrap(),
-                                    SSTableReader::open(table_id, table_path)?,
-                                ));
-                                key_range = None;
-
-                                table_id += 1;
-                                table_name = format!("TABLE_{}", table_id);
-                                table_path = self.locations.table_path(&table_name);
-                                table_writer = SSTableWriter::open(&table_path)?;
-                                table_entries = 0;
-                            }
-                        }
-                        Operation::Delete(_) => {
-                            // Tombstones at the lowest level can be dropped, since there are no higher levels
-                            // the tombstone does not shadow other operations for that key
-                        }
-                    }
-
-                    let mut extracted = min_heap.extract_until(|k, _| k.key == heap_key.key);
-                    extracted.insert(0, (heap_key, value));
-                    for (key, _) in extracted {
-                        let (level, table) = old_tables.get_mut(&key.table_id).expect(
-                            "Each entry of the min-heap should come from an existing SSTable",
-                        );
-                        if let Some(entry) = table.next() {
-                            let entry = entry?;
-                            min_heap.insert(
-                                MinHeapKey::new(entry.key().to_owned(), table.id, *level),
-                                entry,
-                            );
-                        }
-                    }
+        while let Some((heap_key, operation)) = min_heap.extract() {
+            if heap_key.key == "bhkja"{
+                dbg!();
+            }
+            match &operation {
+                Operation::Insert(_, value) => {
+                    table_writer.insert(heap_key.key.clone(), value.to_owned())?;
+                    table_entries += 1;
+                    key_range = Some(match key_range {
+                        Some(key_range) => grow_range(&heap_key.key, key_range),
+                        None => heap_key.key.clone()..=heap_key.key.clone(),
+                    });
                 }
-                None => break,
-            };
+                Operation::Delete(_) if level < self.levels.len() - 1 => {
+                    table_writer.delete(heap_key.key.clone())?;
+                    table_entries += 1;
+                    key_range = Some(match key_range {
+                        Some(key_range) => grow_range(&heap_key.key, key_range),
+                        None => heap_key.key.clone()..=heap_key.key.clone(),
+                    });
+                }
+                Operation::Delete(_) => {
+                    // Tombstones at the lowest level can be dropped, since there are no higher levels
+                    // the tombstone does not shadow other operations for that key
+                }
+            }
+
+            if table_entries > self.max_table_size {
+                table_writer.sync()?;
+
+                new_next_level.push((
+                    key_range.unwrap(),
+                    SSTableReader::open(table_id, table_path)?,
+                ));
+                key_range = None;
+
+                table_id += 1;
+                table_name = format!("TABLE_{}", table_id);
+                table_path = self.locations.table_path(&table_name);
+                table_writer = SSTableWriter::open(&table_path)?;
+                table_entries = 0;
+            }
+
+            let mut extracted = min_heap.extract_until(|k, _| k.key == heap_key.key);
+            extracted.insert(0, (heap_key, operation));
+            for (key, _) in extracted {
+                let (level, table) = old_tables
+                    .get_mut(&key.table_id)
+                    .expect("Each entry of the min-heap should come from an existing SSTable");
+                if let Some(entry) = table.next() {
+                    let entry = entry?;
+                    min_heap.insert(
+                        MinHeapKey::new(entry.key().to_owned(), table.id, *level),
+                        entry,
+                    );
+                }
+            }
         }
 
         new_next_level.push((
@@ -451,16 +401,19 @@ impl Storage {
         ));
 
         table_writer.sync()?;
-        self.sync_dir()?;
 
-        let next_level = match self.levels.get_mut(level + 1) {
-            Some(level_zero) => level_zero,
-            None => {
-                self.levels.push(Vec::new());
-                &mut self.levels[0]
-            }
+        let next_level = if let Some(next_level) = self.levels.get_mut(&(level + 1)) {
+            next_level
+        } else {
+            self.levels.insert(level + 1, Vec::new());
+            self.levels.get_mut(&(level + 1)).expect("get_mut(level) should return Some when insert(level, value) has been called before")
         };
+
         next_level.extend(new_next_level);
+
+
+        self.sync_dir()?;
+        self.save_manifest()?;
 
         for (_, (_, table)) in old_tables {
             info!("Deleting old table {}", table.file_name);
@@ -474,7 +427,7 @@ impl Storage {
 
     fn next_id(&self) -> u64 {
         self.levels
-            .iter()
+            .values()
             .flatten()
             .map(|(_, table)| table.id)
             .max()
@@ -486,11 +439,11 @@ impl Storage {
 
         let mut manifest_writer = ManifestWriter::open(&self.locations.manifest_temp)?;
 
-        for (level, tables) in self.levels.iter().enumerate() {
+        for (level, tables) in self.levels.iter() {
             let tables = tables
                 .iter()
                 .map(|(range, table)| (range.clone(), table.file_name.clone()));
-            manifest_writer.write_level(level, tables)?;
+            manifest_writer.write_level(*level, tables)?;
         }
 
         manifest_writer.sync()?;
@@ -673,11 +626,11 @@ impl<'a> Iterator for SSTableReader {
 
 fn read_manifest(
     manifest_path: impl AsRef<Path>,
-) -> Result<Vec<Vec<(RangeInclusive<String>, SSTableReader)>>, Error> {
+) -> Result<BTreeMap<usize, Vec<(RangeInclusive<String>, SSTableReader)>>, Error> {
     let mut manifest_reader = ManifestReader::open(&manifest_path)?;
 
     let levels_table_names = manifest_reader.read_all()?;
-    let mut levels = Vec::new();
+    let mut levels = BTreeMap::new();
     for (level, table_names) in levels_table_names {
         let mut tables = Vec::new();
         for (range, table_id, table_name) in table_names {
@@ -689,11 +642,7 @@ fn read_manifest(
             tables.push((range, SSTableReader::open(table_id, &table_path)?))
         }
 
-        while levels.len() < level {
-            levels.push(Vec::new());
-        }
-
-        levels.push(tables);
+        levels.insert(level, tables);
     }
 
     Ok(levels)
@@ -1031,6 +980,19 @@ fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::R
     Ok(())
 }
 
+fn grow_range(key: &str, range: RangeInclusive<String>) -> RangeInclusive<String> {
+    let (mut start, mut end) = range.into_inner();
+    if key < start.as_str() {
+        start = key.to_owned();
+        return start..=end;
+    }
+
+    if key > end.as_str() {
+        end = key.to_owned();
+    }
+    start..=end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,15 +1000,14 @@ mod tests {
     use crate::temp_dir::TempDir;
     use log::Level;
     use std::error;
+    use std::sync::Once;
 
     static PUT_FILE: &'static str = include_str!("testdata/put.txt");
     static PUT_DELETE_FILE: &'static str = include_str!("testdata/put-delete.txt");
 
-    use std::sync::Once;
-
     static INIT: Once = Once::new();
 
-    pub fn initialize() {
+    fn initialize() {
         INIT.call_once(|| {
             logger::init(Level::Info).unwrap();
         });
@@ -1092,7 +1053,7 @@ mod tests {
     fn put() -> Result<(), Box<dyn error::Error>> {
         initialize();
         let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
         let lines = PUT_FILE.lines();
         for (i, line) in lines.enumerate() {
             let cmd = Cmd::try_from(line)?;
@@ -1117,7 +1078,7 @@ mod tests {
     fn put_delete() -> Result<(), Box<dyn error::Error>> {
         initialize();
         let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
         let lines = PUT_DELETE_FILE.lines();
         for (i, line) in lines.enumerate() {
             let cmd = Cmd::try_from(line)?;
@@ -1142,20 +1103,29 @@ mod tests {
     fn put_delete_with_storage_resets() -> Result<(), Box<dyn error::Error>> {
         initialize();
         let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
         let lines = PUT_DELETE_FILE.lines();
         for (i, line) in lines.enumerate() {
-            if i % 2500 == 0 {
-                storage = Storage::new(temp_dir.path().to_path_buf(), 2000, 10000, 10000)?;
+            if i % 800 == 0 {
+                if i == 16000 {
+                    dbg!();
+                }
+                storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
             }
 
             let cmd = Cmd::try_from(line)?;
             match cmd {
                 Cmd::Get { key, want } => {
+                    if key == "bhkja" {
+                        dbg!();
+                    }
                     let got = storage.get(key)?;
                     assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
                 }
                 Cmd::Put { key, value } => {
+                    if key == "bhkja" {
+                        dbg!();
+                    }
                     storage.insert(key.to_owned(), value.to_owned())?;
                 }
                 Cmd::Del { key } => {
@@ -1171,13 +1141,13 @@ mod tests {
     fn data_survives_crash_before_flush() -> Result<(), Box<dyn error::Error>> {
         initialize();
         let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 1000, 10000)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
         storage.insert("one".to_string(), "value one".to_string())?;
         storage.insert("two".to_string(), "value two".to_string())?;
         storage.delete("two".to_string())?;
 
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 1000, 10000)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
 
         assert_eq!(Some("value one".to_string()), storage.get("one")?);
         assert_eq!(None, storage.get("two")?);
@@ -1189,7 +1159,7 @@ mod tests {
     fn compaction() -> Result<(), Box<dyn error::Error>> {
         initialize();
         let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2, 2, 10)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2)?;
 
         storage.insert("1".to_string(), "one".to_string())?;
         storage.insert("2".to_string(), "two".to_string())?;
