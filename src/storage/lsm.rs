@@ -95,6 +95,7 @@ impl From<IntoInnerError<BufWriter<File>>> for Error {
     }
 }
 
+#[derive(Debug)]
 struct Locations {
     directory: PathBuf,
     manifest: PathBuf,
@@ -108,6 +109,7 @@ impl Locations {
     }
 }
 
+#[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
     levels: BTreeMap<usize, Vec<(RangeInclusive<String>, SSTableReader)>>,
@@ -337,9 +339,6 @@ impl Storage {
         let mut key_range: Option<RangeInclusive<String>> = None;
 
         while let Some((heap_key, operation)) = min_heap.extract() {
-            if heap_key.key == "bhkja"{
-                dbg!();
-            }
             match &operation {
                 Operation::Insert(_, value) => {
                     table_writer.insert(heap_key.key.clone(), value.to_owned())?;
@@ -455,7 +454,7 @@ impl Storage {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 struct MinHeapKey {
     key: String,
     table_id: u64,
@@ -485,7 +484,7 @@ impl PartialOrd for MinHeapKey {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct MemTable {
     inner: BTreeMap<String, MemTableValue>,
 }
@@ -519,6 +518,7 @@ impl MemTableValue {
     }
 }
 
+#[derive(Debug)]
 struct SSTableWriter {
     file: BufWriter<File>,
 }
@@ -561,6 +561,7 @@ impl SSTableWriter {
     }
 }
 
+#[derive(Debug)]
 struct SSTableReader {
     id: u64,
     file_name: String,
@@ -656,6 +657,7 @@ fn parse_table_id(value: &str) -> Result<u64, Error> {
         .map_err(|err| err.into())
 }
 
+#[derive(Debug)]
 struct ManifestReader {
     file: BufReader<File>,
 }
@@ -761,6 +763,7 @@ impl ManifestReader {
     }
 }
 
+#[derive(Debug)]
 struct ManifestWriter {
     file: BufWriter<File>,
 }
@@ -798,6 +801,7 @@ impl ManifestWriter {
     }
 }
 
+#[derive(Debug)]
 enum Operation {
     Insert(String, String),
     Delete(String),
@@ -821,6 +825,7 @@ impl From<&Operation> for OperationCode {
     }
 }
 
+#[derive(Debug)]
 enum OperationCode {
     Insert,
     Delete,
@@ -847,6 +852,7 @@ impl TryFrom<u8> for OperationCode {
     }
 }
 
+#[derive(Debug)]
 struct WriteAheadLogReader {
     file: BufReader<File>,
 }
@@ -873,6 +879,7 @@ impl<'a> Iterator for WriteAheadLogReader {
     }
 }
 
+#[derive(Debug)]
 struct WriteAheadLogWriter {
     file: BufWriter<File>,
 }
@@ -1107,25 +1114,16 @@ mod tests {
         let lines = PUT_DELETE_FILE.lines();
         for (i, line) in lines.enumerate() {
             if i % 800 == 0 {
-                if i == 16000 {
-                    dbg!();
-                }
                 storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
             }
 
             let cmd = Cmd::try_from(line)?;
             match cmd {
                 Cmd::Get { key, want } => {
-                    if key == "bhkja" {
-                        dbg!();
-                    }
                     let got = storage.get(key)?;
                     assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
                 }
                 Cmd::Put { key, value } => {
-                    if key == "bhkja" {
-                        dbg!();
-                    }
                     storage.insert(key.to_owned(), value.to_owned())?;
                 }
                 Cmd::Del { key } => {
