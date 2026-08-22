@@ -1,20 +1,19 @@
 use crate::storage::heap::MinHeap;
 use log::info;
 use std::array::TryFromSliceError;
-use std::borrow::Cow;
-use std::cmp::{Ordering, min};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display};
 use std::fs::{File, OpenOptions};
 use std::io::{
-    BufRead, BufReader, BufWriter, ErrorKind, IntoInnerError, Read, Seek, SeekFrom, Write,
+    BufRead, BufReader, BufWriter, Cursor, ErrorKind, IntoInnerError, Read, Seek, SeekFrom, Write,
 };
 use std::num::ParseIntError;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{error, fmt, fs, io, mem};
 
 #[derive(Debug)]
@@ -31,6 +30,8 @@ pub enum Error {
     NoManifestEntryForLevel(usize),
     IntoInner(IntoInnerError<BufWriter<File>>),
     UnexpectedCharacter { want: char, got: char },
+    UnexpectedByte { want: u8, got: u8 },
+    ChecksumMismatch { want: u64, got: u64 },
 }
 
 impl error::Error for Error {}
@@ -52,10 +53,16 @@ impl Display for Error {
             Error::UnexpectedCharacter { want, got } => {
                 write!(f, "Expected character '{want}' got '{got}'")
             }
+            Error::UnexpectedByte { want, got } => {
+                write!(f, "Expected byte '{want}' got '{got}'")
+            }
             Error::NoManifestEntryForLevel(level) => {
                 write!(f, "No manifest exists for level {level}")
             }
             Error::InvalidTableName(value) => write!(f, "Invalid table name {value}"),
+            Error::ChecksumMismatch { want, got } => {
+                write!(f, "Checksum mismatch want {} got {}", want, got)
+            }
         }
     }
 }
@@ -163,9 +170,9 @@ impl Storage {
             Err(err) => return Err(Error::from(err)),
         };
 
-        info!("Replaying operations from write ahead log file");
-
         if let Some(wal_reader) = wal_reader {
+            info!("Replaying operations from write ahead log file");
+
             for operation in wal_reader {
                 let operation = operation?;
                 storage.execute_no_wal(operation)?;
@@ -261,7 +268,6 @@ impl Storage {
         let table_id = self.next_id();
         let table_name = format!("TABLE_{}", table_id);
         let table_path = self.locations.table_path(&table_name);
-        let mut table_writer = SSTableWriter::open(&table_path)?;
         let mem_table = mem::take(&mut self.mem_table);
         let min = mem_table
             .inner
@@ -274,7 +280,19 @@ impl Storage {
             .map(|(key, _)| String::from(key))
             .unwrap_or_else(String::new);
         let table_range = min..=max;
-        table_writer.write(mem_table)?;
+
+        let mut table_writer = SSTableWriter::open(&table_path)?;
+
+        let operations = mem_table
+            .inner
+            .into_iter()
+            .map(|(key, operation)| match operation {
+                MemTableValue::Value(value) => Operation::Insert(key, value),
+                MemTableValue::Deleted => Operation::Delete(key),
+            })
+            .collect();
+        table_writer.write_data_blocks(operations)?;
+        table_writer.write_indices()?;
         self.sync_dir()?;
 
         let table_reader = SSTableReader::open(table_id, table_path)?;
@@ -314,18 +332,17 @@ impl Storage {
             old_tables.extend(old_level.drain(..));
         }
 
-        let mut old_tables = old_tables
-            .iter_mut()
-            .map(|(_, table)| (table.id, (level, table)))
-            .collect::<HashMap<_, _>>();
+        let mut old_table_iters = HashMap::new();
+        for (_, old_table) in &mut old_tables {
+            old_table_iters.insert(table_id, (level, old_table.data_iter()?));
+        }
 
         let mut min_heap = MinHeap::default();
-        for (_, (level, table)) in old_tables.iter_mut() {
-            table.file.seek(SeekFrom::Start(0))?;
+        for (table_id, (level, table)) in old_table_iters.iter_mut() {
             if let Some(entry) = table.next() {
                 let entry = entry?;
                 min_heap.insert(
-                    MinHeapKey::new(entry.key().to_owned(), table.id, *level),
+                    MinHeapKey::new(entry.key().to_owned(), *table_id, *level),
                     entry,
                 );
             }
@@ -341,7 +358,7 @@ impl Storage {
         while let Some((heap_key, operation)) = min_heap.extract() {
             match &operation {
                 Operation::Insert(_, value) => {
-                    table_writer.insert(heap_key.key.clone(), value.to_owned())?;
+                    table_writer.write_data_blocks(vec![operation])?;
                     table_entries += 1;
                     key_range = Some(match key_range {
                         Some(key_range) => grow_range(&heap_key.key, key_range),
@@ -349,7 +366,7 @@ impl Storage {
                     });
                 }
                 Operation::Delete(_) if level < self.levels.len() - 1 => {
-                    table_writer.delete(heap_key.key.clone())?;
+                    table_writer.write_data_blocks(vec![operation])?;
                     table_entries += 1;
                     key_range = Some(match key_range {
                         Some(key_range) => grow_range(&heap_key.key, key_range),
@@ -363,6 +380,7 @@ impl Storage {
             }
 
             if table_entries > self.max_table_size {
+                table_writer.write_indices()?;
                 table_writer.sync()?;
 
                 new_next_level.push((
@@ -379,15 +397,15 @@ impl Storage {
             }
 
             let mut extracted = min_heap.extract_until(|k, _| k.key == heap_key.key);
-            extracted.insert(0, (heap_key, operation));
-            for (key, _) in extracted {
-                let (level, table) = old_tables
+            extracted.insert(0, heap_key);
+            for key in extracted {
+                let (level, table) = old_table_iters
                     .get_mut(&key.table_id)
                     .expect("Each entry of the min-heap should come from an existing SSTable");
                 if let Some(entry) = table.next() {
                     let entry = entry?;
                     min_heap.insert(
-                        MinHeapKey::new(entry.key().to_owned(), table.id, *level),
+                        MinHeapKey::new(entry.key().to_owned(), key.table_id, *level),
                         entry,
                     );
                 }
@@ -399,6 +417,7 @@ impl Storage {
             SSTableReader::open(table_id, table_path)?,
         ));
 
+        table_writer.write_indices()?;
         table_writer.sync()?;
 
         let next_level = if let Some(next_level) = self.levels.get_mut(&(level + 1)) {
@@ -410,11 +429,10 @@ impl Storage {
 
         next_level.extend(new_next_level);
 
-
         self.sync_dir()?;
         self.save_manifest()?;
 
-        for (_, (_, table)) in old_tables {
+        for (_, table) in old_tables {
             info!("Deleting old table {}", table.file_name);
             fs::remove_file(self.locations.table_path(&table.file_name))?;
         }
@@ -518,45 +536,136 @@ impl MemTableValue {
     }
 }
 
+const BLOCK_SIZE: usize = 4096;
+
 #[derive(Debug)]
 struct SSTableWriter {
-    file: BufWriter<File>,
+    file: File,
+    block: Vec<u8>,
+    keys: Vec<(String, usize)>,
 }
 impl SSTableWriter {
     fn open(table_path: &Path) -> io::Result<SSTableWriter> {
         info!("Creating new table {:?}", table_path);
         let file = File::create(&table_path)?;
         Ok(SSTableWriter {
-            file: BufWriter::new(file),
+            file,
+            block: Vec::with_capacity(BLOCK_SIZE),
+            keys: Vec::new(),
         })
     }
 
-    fn write(&mut self, mem_table: MemTable) -> io::Result<()> {
-        for (key, value) in mem_table.inner {
-            match value {
-                MemTableValue::Value(value) => {
-                    write_operation(&mut self.file, &Operation::Insert(key, value))?;
-                }
-                MemTableValue::Deleted => {
-                    write_operation(&mut self.file, &Operation::Delete(key))?;
-                }
-            }
+    fn write_data_blocks(&mut self, operations: Vec<Operation>) -> io::Result<()> {
+        if self.keys.is_empty() {
+            assert!(self.block.is_empty());
+
+            let first_operation = operations
+                .first()
+                .expect("write_operations should not be called with an empty slice");
+            self.keys.push((first_operation.key().to_owned(), 0));
         }
 
-        self.sync()
+        assert!(self.block.is_empty());
+        self.block.resize(16, 0);
+
+        let mut buf = Vec::new();
+        for operation in operations {
+            write_operation(&mut buf, &operation)?;
+
+            if buf.len() + self.block.len() > BLOCK_SIZE && !self.block.is_empty() {
+                self.flush_data_block()?;
+                self.block.resize(16, 0);
+
+                let data_block_offset = self.file.stream_position()? as usize;
+                assert_eq!(data_block_offset % BLOCK_SIZE, 0);
+                self.keys
+                    .push((operation.key().to_owned(), data_block_offset));
+            }
+
+            self.block.extend(&buf);
+            buf.clear();
+        }
+        self.flush_data_block()?;
+
+        Ok(())
     }
 
-    fn insert(&mut self, key: String, value: String) -> io::Result<()> {
-        write_operation(&mut self.file, &Operation::Insert(key, value))
+    fn write_indices(&mut self) -> io::Result<()> {
+        self.flush_data_block()?;
+        assert!(self.block.is_empty());
+
+        let index_block_offset = self.file.stream_position()?;
+        assert_eq!(index_block_offset as usize % BLOCK_SIZE, 0);
+
+        let mut buf = Vec::new();
+        for i in 0..self.keys.len() {
+            let (key, offset) = &self.keys[i];
+
+            write_length_prefixed_string(&mut buf, &key)?;
+            write_integer(&mut buf, *offset)?;
+
+            if buf.len() + self.block.len() > BLOCK_SIZE {
+                self.flush_index_block()?;
+            }
+
+            self.block.extend(&buf);
+            buf.clear();
+        }
+        self.flush_index_block()?;
+
+        self.file.write_all(&index_block_offset.to_le_bytes())?;
+
+        Ok(())
     }
 
-    fn delete(&mut self, key: String) -> io::Result<()> {
-        write_operation(&mut self.file, &Operation::Delete(key))
+    fn flush_data_block(&mut self) -> io::Result<()> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+
+        self.add_padding()?;
+
+        assert_eq!([0u8; 16], &self.block[..16]);
+        let block_size = self.block.len().to_le_bytes();
+        self.block[0..8].clone_from_slice(block_size.as_slice());
+        let checksum = crc64::crc64(0, &self.block[16..]);
+        self.block[8..16].clone_from_slice(checksum.to_le_bytes().as_slice());
+
+        assert_eq!(self.block.len(), BLOCK_SIZE);
+
+        self.file.write_all(&self.block)?;
+        self.block.clear();
+
+        Ok(())
+    }
+
+    fn flush_index_block(&mut self) -> io::Result<()> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+
+        self.add_padding()?;
+
+        assert_eq!(self.block.len(), BLOCK_SIZE);
+
+        self.file.write_all(&self.block)?;
+        self.block.clear();
+
+        Ok(())
+    }
+
+    fn add_padding(&mut self) -> io::Result<()> {
+        let padding = BLOCK_SIZE - (self.block.len() % BLOCK_SIZE);
+        self.block.resize(self.block.len() + padding, 0);
+
+        assert_eq!(self.block.len() % BLOCK_SIZE, 0);
+
+        Ok(())
     }
 
     fn sync(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+        self.file.sync_all()?;
         Ok(())
     }
 }
@@ -594,34 +703,157 @@ impl SSTableReader {
     }
 
     fn find(&mut self, key: &str) -> Result<Option<Operation>, Error> {
-        self.file.seek(SeekFrom::Start(0))?;
+        let offset = match self.find_offset(key)? {
+            Some(offset) => offset,
+            None => return Ok(None),
+        };
 
-        while let Some(entry) = self.next() {
-            let entry = entry?;
-            let found = match &entry {
-                Operation::Insert(got_key, _) if key == got_key => true,
-                Operation::Delete(got_key) if key == got_key => true,
-                _ => false,
-            };
+        let data_block = self.read_data_block(offset as u64)?;
+        let data_block_len = data_block.len() as u64;
+        let mut cursor = Cursor::new(data_block);
 
-            if found {
-                return Ok(Some(entry));
+        while cursor.position() < data_block_len {
+            let operation = read_operation(&mut cursor)?;
+            if operation.key() > key {
+                return Ok(None);
+            }
+
+            if operation.key() == key {
+                return Ok(Some(operation));
             }
         }
 
         Ok(None)
     }
+
+    //TODO check if its possible to reuse bufreader internal buffer
+    fn read_data_block(&mut self, offset: u64) -> Result<Vec<u8>, Error> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 8];
+        self.file.read_exact(&mut buf)?;
+        let block_size = usize::from_le_bytes(buf);
+
+        let mut buf = [0u8; 8];
+        self.file.read_exact(&mut buf)?;
+        let want_checksum = u64::from_le_bytes(buf);
+
+        let mut buf = Vec::with_capacity(block_size);
+        self.file.read_exact(&mut buf)?;
+
+        let got_checksum = crc64::crc64(0, &buf);
+        if want_checksum != got_checksum {
+            return Err(Error::ChecksumMismatch {
+                want: want_checksum,
+                got: got_checksum,
+            });
+        }
+
+        Ok(buf)
+    }
+
+    fn find_offset(&mut self, wanted_key: &str) -> Result<Option<usize>, Error> {
+        let block_offset = self.first_index_offset()?;
+        self.file.seek(SeekFrom::Start(block_offset as u64))?;
+
+        let mut index_iter = self.index_iter()?;
+
+        while let Some(next) = index_iter.next() {
+            let (key, offset) = next?;
+            if key.as_str() > wanted_key {
+                return Ok(None);
+            }
+
+            if key.as_str() == wanted_key {
+                return Ok(Some(offset));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn first_index_offset(&mut self) -> io::Result<usize> {
+        self.file.seek(SeekFrom::End(-8))?;
+
+        let mut offset_bytes = [0; 8];
+        self.file.read_exact(&mut offset_bytes)?;
+
+        Ok(usize::from_le_bytes(offset_bytes))
+    }
+
+    fn index_iter(&mut self) -> io::Result<SSTableIndexIter> {
+        let block_offset = self.first_index_offset()?;
+        self.file.seek(SeekFrom::Start(block_offset as u64))?;
+
+        Ok(SSTableIndexIter {
+            file: &mut self.file,
+        })
+    }
+
+    fn data_iter(&mut self) -> io::Result<SSTableDataIter> {
+        let block_offset = self.first_index_offset()?;
+        self.file.seek(SeekFrom::Start(0))?;
+
+        Ok(SSTableDataIter {
+            file: &mut self.file,
+            first_index_offset: block_offset as u64,
+        })
+    }
 }
 
-impl<'a> Iterator for SSTableReader {
+struct SSTableIndexIter<'a> {
+    file: &'a mut BufReader<File>,
+}
+impl<'a> Iterator for SSTableIndexIter<'a> {
+    type Item = Result<(String, usize), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = [0u8];
+        match self.file.read(&mut buf) {
+            Ok(0) | Ok(_) if buf[0] == 0 => return None,
+            Ok(_) => {}
+            Err(err) => return Some(Err(err.into())),
+        }
+
+        let key = match read_length_prefixed_string(&mut self.file) {
+            Ok(key) => key,
+            Err(err) => return Some(Err(err.into())),
+        };
+
+        let offset = match read_integer(&mut self.file) {
+            Ok(offset) => offset,
+            Err(err) => return Some(Err(err.into())),
+        };
+
+        Some(Ok((key, offset)))
+    }
+}
+
+struct SSTableDataIter<'a> {
+    file: &'a mut BufReader<File>,
+    first_index_offset: u64,
+}
+
+impl<'a> Iterator for SSTableDataIter<'a> {
     type Item = Result<Operation, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match read_operation(&mut self.file) {
-            Ok(None) => None,
-            Ok(Some(operation)) => Some(Ok(operation)),
-            Err(err) => Some(Err(err)),
+        let mut buf = [0u8];
+        match self.file.read(&mut buf) {
+            Ok(0) | Ok(_) if buf[0] == 0 => return None,
+            Ok(_) => {}
+            Err(err) => return Some(Err(err.into())),
         }
+
+        let stream_pos = match self.file.stream_position() {
+            Ok(stream_pos) => stream_pos,
+            Err(err) => return Some(Err(err.into())),
+        };
+
+        if stream_pos > self.first_index_offset {
+            return None;
+        }
+
+        Some(read_operation(&mut self.file))
     }
 }
 
@@ -871,11 +1103,14 @@ impl<'a> Iterator for WriteAheadLogReader {
     type Item = Result<Operation, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match read_operation(&mut self.file) {
-            Ok(None) => None,
-            Ok(Some(operation)) => Some(Ok(operation)),
-            Err(err) => Some(Err(err)),
+        let mut buf = [0u8];
+        match self.file.read(&mut buf) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(err) => return Some(Err(err.into())),
         }
+
+        Some(read_operation(&mut self.file))
     }
 }
 
@@ -915,54 +1150,83 @@ impl WriteAheadLogWriter {
     }
 }
 
-fn read_string(source: &mut impl BufRead) -> Result<Option<String>, Error> {
+fn read_length_prefixed_string<R: BufRead + Seek>(source: &mut R) -> Result<String, Error> {
     let mut buf = Vec::new();
-    source.read_until(b':', &mut buf)?;
+    source.read_until(b';', &mut buf)?;
     match buf.pop() {
-        Some(b':') => {}
+        Some(b';') => {}
         Some(_) | None => return Err(Error::Truncated),
     }
-    let len_str = String::from_utf8_lossy(&buf);
-    let len = len_str.parse::<usize>()?;
+
+    let bytes_array = buf.as_slice().try_into()?;
+    let len = usize::from_le_bytes(bytes_array);
     buf.resize(len, 0);
     source.read_exact(&mut buf)?;
     let string = String::from_utf8(buf)?;
 
-    Ok(Some(string))
+    Ok(string)
 }
 
-fn write_string(destination: &mut impl Write, value: &str) -> io::Result<()> {
-    write!(destination, "{}:{}", value.len(), value)?;
+fn write_length_prefixed_string(destination: &mut impl Write, value: &str) -> io::Result<()> {
+    destination.write_all(b"$")?;
+    let bytes = value.len().to_le_bytes();
+    destination.write_all(&bytes)?;
+    destination.write_all(b";")?;
+
+    write!(destination, "{};", value)?;
     Ok(())
 }
 
-fn read_operation_code(source: &mut impl Read) -> Result<Option<OperationCode>, Error> {
+fn read_operation_code<R: BufRead + Seek>(source: &mut R) -> Result<OperationCode, Error> {
     let mut op_code_bytes = [0u8; 1];
     let n = source.read(&mut op_code_bytes)?;
     if n == 0 {
-        return Ok(None);
+        return Err(Error::Truncated);
     }
 
-    Ok(Some(OperationCode::try_from(op_code_bytes[0])?))
+    OperationCode::try_from(op_code_bytes[0])
 }
 
-fn read_operation(source: &mut impl BufRead) -> Result<Option<Operation>, Error> {
-    let op_code = match read_operation_code(source)? {
-        Some(op_code) => op_code,
-        None => return Ok(None),
+fn write_integer(destination: &mut impl Write, integer: usize) -> io::Result<usize> {
+    destination.write_all(b":")?;
+    let bytes = integer.to_le_bytes();
+    destination.write_all(&bytes)?;
+    destination.write_all(b";")?;
+
+    Ok(bytes.len() + 2)
+}
+
+fn read_integer(mut source: &mut impl BufRead) -> Result<usize, Error> {
+    expect_byte(&mut source, b':')?;
+
+    let mut buf = Vec::new();
+    if source.read_until(b';', &mut buf)? == 0 {
+        return Err(Error::Truncated);
     };
+    match buf.pop() {
+        Some(b';') => {}
+        Some(_) | None => return Err(Error::Truncated),
+    }
+
+    let integer = usize::from_le_bytes(buf.as_slice().try_into()?);
+
+    Ok(integer)
+}
+
+fn read_operation<R: BufRead + Seek>(source: &mut R) -> Result<Operation, Error> {
+    let op_code = read_operation_code(source)?;
 
     match op_code {
         OperationCode::Insert => {
-            let key = read_string(source)?.ok_or_else(|| Error::Truncated)?;
-            let value = read_string(source)?.ok_or_else(|| Error::Truncated)?;
+            let key = read_length_prefixed_string(source)?;
+            let value = read_length_prefixed_string(source)?;
 
-            Ok(Some(Operation::Insert(key, value)))
+            Ok(Operation::Insert(key, value))
         }
         OperationCode::Delete => {
-            let key = read_string(source)?.ok_or_else(|| Error::Truncated)?;
+            let key = read_length_prefixed_string(source)?;
 
-            Ok(Some(Operation::Delete(key)))
+            Ok(Operation::Delete(key))
         }
     }
 }
@@ -977,11 +1241,11 @@ fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::R
 
     match operation {
         Operation::Insert(key, value) => {
-            write_string(destination, key)?;
-            write_string(destination, value)?;
+            write_length_prefixed_string(destination, key)?;
+            write_length_prefixed_string(destination, value)?;
         }
         Operation::Delete(key) => {
-            write_string(destination, key)?;
+            write_length_prefixed_string(destination, key)?;
         }
     }
     Ok(())
@@ -1000,14 +1264,24 @@ fn grow_range(key: &str, range: RangeInclusive<String>) -> RangeInclusive<String
     start..=end
 }
 
+fn expect_byte(source: &mut impl BufRead, want: u8) -> Result<(), Error> {
+    let mut buf = [0; 1];
+    source.read_exact(&mut buf)?;
+    if buf[0] != want {
+        return Err(Error::UnexpectedByte { want, got: buf[0] });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::logger;
     use crate::temp_dir::TempDir;
     use log::Level;
-    use std::error;
     use std::sync::Once;
+    use std::{env, error};
 
     static PUT_FILE: &'static str = include_str!("testdata/put.txt");
     static PUT_DELETE_FILE: &'static str = include_str!("testdata/put-delete.txt");
@@ -1156,7 +1430,7 @@ mod tests {
     #[test]
     fn compaction() -> Result<(), Box<dyn error::Error>> {
         initialize();
-        let temp_dir = TempDir::new()?;
+        let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
         let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2)?;
 
         storage.insert("1".to_string(), "one".to_string())?;

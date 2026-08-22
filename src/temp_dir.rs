@@ -18,7 +18,22 @@ pub struct TempDir {
 }
 
 impl TempDir {
-    pub fn create_at(path: PathBuf) -> io::Result<TempDir> {
+    pub fn new() -> io::Result<TempDir> {
+        let id = next_id();
+        let temp_dir = temp_dir();
+        TempDir::create_at(temp_dir.join(id.to_string()))
+    }
+
+    pub fn create(path: PathBuf) -> io::Result<TempDir> {
+        let id = next_id();
+        TempDir::create_at(path.join(id.to_string()))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn create_at(path: PathBuf) -> io::Result<TempDir> {
         match fs::remove_dir_all(&path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
@@ -30,15 +45,6 @@ impl TempDir {
         })
     }
 
-    pub fn new() -> io::Result<TempDir> {
-        let id = next_id();
-        let temp_dir = temp_dir();
-        TempDir::create_at(temp_dir.join(id.to_string()))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl Drop for TempDir {
