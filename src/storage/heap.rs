@@ -25,12 +25,12 @@ where
         Some(extracted)
     }
 
-    pub fn extract_until(&mut self, condition: impl Fn(&K, &V) -> bool) -> Vec<(K, V)> {
+    pub fn extract_until(&mut self, condition: impl Fn(&K, &V) -> bool) -> Vec<K> {
         let mut extracted = Vec::new();
         while let Some((key, value)) = self.inner.front() {
             if condition(key, value) {
                 let entry = self.extract().expect("extract() should return an entry when the inner array is not empty");
-                extracted.push(entry);
+                extracted.push(entry.0);
             } else {
                 break;
             }
