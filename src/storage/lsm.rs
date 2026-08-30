@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::time::Instant;
-use std::{error, fmt, fs, io, mem};
+use std::{error, fmt, fs, io, mem, usize};
 
 #[derive(Debug)]
 pub enum Error {
@@ -124,10 +124,11 @@ pub struct Storage {
     write_ahead_log: WriteAheadLogWriter,
     locations: Locations,
     max_table_size: usize,
+    level_ratio: usize,
 }
 
 impl Storage {
-    pub fn new(directory_path: PathBuf, max_table_size: usize) -> Result<Storage, Error> {
+    pub fn new(directory_path: PathBuf, max_table_size: usize, level_ratio: usize) -> Result<Storage, Error> {
         info!("Setting up storage engine");
 
         let locations = Locations {
@@ -162,6 +163,7 @@ impl Storage {
             write_ahead_log: wal_writer,
             locations,
             max_table_size,
+            level_ratio,
         };
 
         let wal_reader = match WriteAheadLogReader::open(&storage.locations.wal) {
@@ -195,7 +197,7 @@ impl Storage {
         for (level, tables) in self.levels.iter_mut() {
             for (key_range, table) in tables.iter_mut().rev() {
                 if key_range.start().as_str() <= key && key <= key_range.end().as_str() {
-                    let value = table.find(key)?;
+                    let value = table.find_value(key)?;
                     match value {
                         None => {
                             if *level > 0 {
@@ -248,7 +250,7 @@ impl Storage {
 
             for level in 0..self.levels.len() {
                 let tables_len = self.levels.get(&level).map(Vec::len).unwrap_or(0);
-                if tables_len > (level + 1) * 5 {
+                if tables_len > (level + 1) * self.level_ratio {
                     self.compact_level(level)?;
                 }
             }
@@ -326,20 +328,25 @@ impl Storage {
 
         let mut old_tables = Vec::new();
         if let Some(old_level) = self.levels.get_mut(&level) {
-            old_tables.extend(old_level.drain(..));
+            while let Some(table) = old_level.pop() {
+               old_tables.push((level, table));
+            }
         }
         if let Some(old_level) = self.levels.get_mut(&(level + 1)) {
-            old_tables.extend(old_level.drain(..));
+            while let Some(table) = old_level.pop() {
+                old_tables.push((level + 1, table));
+            }
         }
 
         let mut old_table_iters = HashMap::new();
-        for (_, old_table) in &mut old_tables {
-            old_table_iters.insert(table_id, (level, old_table.data_iter()?));
+        for (level, (_,old_table)) in &mut old_tables {
+            old_table_iters.insert(old_table.id, (*level, old_table.data_iter()?));
         }
 
         let mut min_heap = MinHeap::default();
         for (table_id, (level, table)) in old_table_iters.iter_mut() {
-            if let Some(entry) = table.next() {
+            let next = table.next();
+            if let Some(entry) = next {
                 let entry = entry?;
                 min_heap.insert(
                     MinHeapKey::new(entry.key().to_owned(), *table_id, *level),
@@ -420,19 +427,12 @@ impl Storage {
         table_writer.write_indices()?;
         table_writer.sync()?;
 
-        let next_level = if let Some(next_level) = self.levels.get_mut(&(level + 1)) {
-            next_level
-        } else {
-            self.levels.insert(level + 1, Vec::new());
-            self.levels.get_mut(&(level + 1)).expect("get_mut(level) should return Some when insert(level, value) has been called before")
-        };
-
-        next_level.extend(new_next_level);
+        self.levels.insert(level + 1, new_next_level);
 
         self.sync_dir()?;
         self.save_manifest()?;
 
-        for (_, table) in old_tables {
+        for (_, (_, table)) in old_tables {
             info!("Deleting old table {}", table.file_name);
             fs::remove_file(self.locations.table_path(&table.file_name))?;
         }
@@ -593,6 +593,7 @@ impl SSTableWriter {
     fn write_indices(&mut self) -> io::Result<()> {
         self.flush_data_block()?;
         assert!(self.block.is_empty());
+        self.block.resize(8, 0);
 
         let index_block_offset = self.file.stream_position()?;
         assert_eq!(index_block_offset as usize % BLOCK_SIZE, 0);
@@ -606,6 +607,11 @@ impl SSTableWriter {
 
             if buf.len() + self.block.len() > BLOCK_SIZE {
                 self.flush_index_block()?;
+
+                self.block.resize(8, 0);
+
+                let index_block_offset = self.file.stream_position()? as usize;
+                assert_eq!(index_block_offset % BLOCK_SIZE, 0);
             }
 
             self.block.extend(&buf);
@@ -623,11 +629,12 @@ impl SSTableWriter {
             return Ok(());
         }
 
+        assert_eq!([0u8; 16], &self.block[..16]);
+        let content_size = self.block.len() - 16;
+        self.block[0..8].clone_from_slice(content_size.to_le_bytes().as_slice());
+
         self.add_padding()?;
 
-        assert_eq!([0u8; 16], &self.block[..16]);
-        let block_size = self.block.len().to_le_bytes();
-        self.block[0..8].clone_from_slice(block_size.as_slice());
         let checksum = crc64::crc64(0, &self.block[16..]);
         self.block[8..16].clone_from_slice(checksum.to_le_bytes().as_slice());
 
@@ -643,6 +650,10 @@ impl SSTableWriter {
         if self.block.is_empty() {
             return Ok(());
         }
+
+        assert_eq!([0u8; 8], &self.block[..8]);
+        let content_size = self.block.len() - 8;
+        self.block[0..8].clone_from_slice(content_size.to_le_bytes().as_slice());
 
         self.add_padding()?;
 
@@ -702,18 +713,18 @@ impl SSTableReader {
         })
     }
 
-    fn find(&mut self, key: &str) -> Result<Option<Operation>, Error> {
-        let offset = match self.find_offset(key)? {
+    fn find_value(&mut self, key: &str) -> Result<Option<Operation>, Error> {
+        let offset = match self.find_block(key)? {
             Some(offset) => offset,
             None => return Ok(None),
         };
 
-        let data_block = self.read_data_block(offset as u64)?;
-        let data_block_len = data_block.len() as u64;
-        let mut cursor = Cursor::new(data_block);
+        self.file.seek(SeekFrom::Start(offset as u64))?;
+        let mut data_block_iter = DataBlockIter::new(&mut self.file)?;
 
-        while cursor.position() < data_block_len {
-            let operation = read_operation(&mut cursor)?;
+        while let Some(next) = data_block_iter.next(){
+            let operation = next?;
+
             if operation.key() > key {
                 return Ok(None);
             }
@@ -726,49 +737,25 @@ impl SSTableReader {
         Ok(None)
     }
 
-    //TODO check if its possible to reuse bufreader internal buffer
-    fn read_data_block(&mut self, offset: u64) -> Result<Vec<u8>, Error> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = [0u8; 8];
-        self.file.read_exact(&mut buf)?;
-        let block_size = usize::from_le_bytes(buf);
-
-        let mut buf = [0u8; 8];
-        self.file.read_exact(&mut buf)?;
-        let want_checksum = u64::from_le_bytes(buf);
-
-        let mut buf = Vec::with_capacity(block_size);
-        self.file.read_exact(&mut buf)?;
-
-        let got_checksum = crc64::crc64(0, &buf);
-        if want_checksum != got_checksum {
-            return Err(Error::ChecksumMismatch {
-                want: want_checksum,
-                got: got_checksum,
-            });
-        }
-
-        Ok(buf)
-    }
-
-    fn find_offset(&mut self, wanted_key: &str) -> Result<Option<usize>, Error> {
-        let block_offset = self.first_index_offset()?;
-        self.file.seek(SeekFrom::Start(block_offset as u64))?;
-
+    fn find_block(&mut self, key: &str) -> Result<Option<usize>, Error> {
         let mut index_iter = self.index_iter()?;
 
+        let mut candidate = None;
+
         while let Some(next) = index_iter.next() {
-            let (key, offset) = next?;
-            if key.as_str() > wanted_key {
-                return Ok(None);
+            let (got_key, offset) = next?;
+            if got_key.as_str() > key {
+                return Ok(candidate);
             }
 
-            if key.as_str() == wanted_key {
+            if got_key.as_str() == key {
                 return Ok(Some(offset));
             }
+
+            candidate = Some(offset);
         }
 
-        Ok(None)
+        Ok(candidate)
     }
 
     fn first_index_offset(&mut self) -> io::Result<usize> {
@@ -781,37 +768,60 @@ impl SSTableReader {
     }
 
     fn index_iter(&mut self) -> io::Result<SSTableIndexIter> {
-        let block_offset = self.first_index_offset()?;
-        self.file.seek(SeekFrom::Start(block_offset as u64))?;
+        let first_index_offset = self.first_index_offset()?;
+        let header_offset = self.file.stream_position()? - 8;
+
+        self.file.seek(SeekFrom::Start(first_index_offset as u64))?;
+
+        let index_block_iter = IndexBlockIter::new(&mut self.file)?;
 
         Ok(SSTableIndexIter {
-            file: &mut self.file,
+            index_block_iter: Some(index_block_iter),
+            header_offset,
         })
     }
 
-    fn data_iter(&mut self) -> io::Result<SSTableDataIter> {
-        let block_offset = self.first_index_offset()?;
+    fn data_iter(&mut self) -> Result<SSTableDataIter, Error> {
+        let first_index_offset = self.first_index_offset()?;
         self.file.seek(SeekFrom::Start(0))?;
 
+        let data_block_iter = DataBlockIter::new(&mut self.file)?;
+
         Ok(SSTableDataIter {
-            file: &mut self.file,
-            first_index_offset: block_offset as u64,
+            data_block_iter: Some(data_block_iter),
+            first_index_offset: first_index_offset as u64,
         })
     }
 }
 
-struct SSTableIndexIter<'a> {
+struct IndexBlockIter<'a> {
     file: &'a mut BufReader<File>,
+    end_of_content: u64,
 }
-impl<'a> Iterator for SSTableIndexIter<'a> {
+
+impl<'a> IndexBlockIter<'a> {
+    fn new(file: &'a mut BufReader<File>) -> io::Result<IndexBlockIter<'a>> {
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf)?;
+        let content_len = u64::from_le_bytes(buf);
+
+        let stream_pos = file.stream_position()?;
+
+        Ok(IndexBlockIter { file, end_of_content: stream_pos + content_len })
+    }
+}
+
+impl<'a> Iterator for IndexBlockIter<'a> {
     type Item = Result<(String, usize), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut buf = [0u8];
-        match self.file.read(&mut buf) {
-            Ok(0) | Ok(_) if buf[0] == 0 => return None,
-            Ok(_) => {}
+        let stream_pos = match self.file.stream_position() {
+            Ok(stream_pos) => stream_pos,
             Err(err) => return Some(Err(err.into())),
+        };
+
+        if stream_pos >= self.end_of_content {
+            return None;
         }
 
         let key = match read_length_prefixed_string(&mut self.file) {
@@ -828,30 +838,145 @@ impl<'a> Iterator for SSTableIndexIter<'a> {
     }
 }
 
+struct SSTableIndexIter<'a> {
+    index_block_iter: Option<IndexBlockIter<'a>>,
+    header_offset: u64,
+}
+impl<'a> Iterator for SSTableIndexIter<'a> {
+    type Item = Result<(String, usize), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index_block_iter = self.index_block_iter.as_mut()?;
+
+        let next = match index_block_iter.next() {
+            Some(next) => Some(next),
+            None => {
+                let file = self.index_block_iter.take()?.file;
+                let stream_pos = match file.stream_position() {
+                    Ok(stream_pos) => stream_pos,
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                let padding = BLOCK_SIZE - (stream_pos as usize % BLOCK_SIZE);
+                if stream_pos + padding as u64 >= self.header_offset{
+                    return None;
+                }
+
+                match file.seek_relative(padding as i64) {
+                    Ok(()) => {}
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                let mut index_block_iter = match IndexBlockIter::new(file) {
+                    Ok(index_block_iter) => index_block_iter,
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                let next = index_block_iter.next();
+                self.index_block_iter = Some(index_block_iter);
+
+                next
+            }
+        };
+
+        next
+    }
+}
+
 struct SSTableDataIter<'a> {
-    file: &'a mut BufReader<File>,
+    data_block_iter: Option<DataBlockIter<'a>>,
     first_index_offset: u64,
 }
 
 impl<'a> Iterator for SSTableDataIter<'a> {
     type Item = Result<Operation, Error>;
 
+
     fn next(&mut self) -> Option<Self::Item> {
-        let mut buf = [0u8];
-        match self.file.read(&mut buf) {
-            Ok(0) | Ok(_) if buf[0] == 0 => return None,
-            Ok(_) => {}
-            Err(err) => return Some(Err(err.into())),
+        let data_block_iter = self.data_block_iter.as_mut()?;
+
+        let next = match data_block_iter.next() {
+            Some(next) => Some(next),
+            None => {
+                let file = self.data_block_iter.take()?.file;
+                let stream_pos = match file.stream_position() {
+                    Ok(stream_pos) => stream_pos,
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                let padding = BLOCK_SIZE - (stream_pos as usize % BLOCK_SIZE);
+
+                if stream_pos + padding as u64 >= self.first_index_offset{
+                    return None;
+                }
+
+                match file.seek_relative(padding as i64) {
+                    Ok(()) => {}
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                let mut data_block_iter = match DataBlockIter::new(file) {
+                    Ok(data_block_iter) => data_block_iter,
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                let next = data_block_iter.next();
+                self.data_block_iter = Some(data_block_iter);
+
+                next
+            }
+        };
+
+        next
+    }
+}
+
+struct DataBlockIter<'a> {
+    file: &'a mut BufReader<File>,
+    content_len: u64,
+}
+
+impl<'a> DataBlockIter<'a> {
+    fn new(file: &'a mut BufReader<File>) -> Result<DataBlockIter<'a>, Error> {
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf)?;
+        let content_len = u64::from_le_bytes(buf);
+
+        file.read_exact(&mut buf)?;
+        let want_checksum = u64::from_le_bytes(buf);
+
+        let data_offset = file.stream_position()?;
+
+        let padding = BLOCK_SIZE - (content_len as usize % BLOCK_SIZE) - 16;
+
+        let mut buf = vec![0u8; content_len as usize + padding];
+        file.read_exact(&mut buf)?;
+
+        let got_checksum = crc64::crc64(0, &buf);
+        if want_checksum != got_checksum{
+           return Err(Error::ChecksumMismatch {want: want_checksum, got: got_checksum})
         }
 
+        file.seek(SeekFrom::Start(data_offset))?;
+
+        Ok(DataBlockIter { file, content_len})
+    }
+}
+
+impl<'a> Iterator for DataBlockIter<'a> {
+
+    type Item = Result<Operation, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
         let stream_pos = match self.file.stream_position() {
             Ok(stream_pos) => stream_pos,
             Err(err) => return Some(Err(err.into())),
         };
 
-        if stream_pos > self.first_index_offset {
+        if stream_pos >= self.content_len {
             return None;
         }
+
 
         Some(read_operation(&mut self.file))
     }
@@ -1103,10 +1228,9 @@ impl<'a> Iterator for WriteAheadLogReader {
     type Item = Result<Operation, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut buf = [0u8];
-        match self.file.read(&mut buf) {
-            Ok(0) => return None,
-            Ok(_) => {}
+        match peek_byte(&mut self.file) {
+            Ok(Some(_)) => {}
+            Ok(None) => return None,
             Err(err) => return Some(Err(err.into())),
         }
 
@@ -1151,6 +1275,7 @@ impl WriteAheadLogWriter {
 }
 
 fn read_length_prefixed_string<R: BufRead + Seek>(source: &mut R) -> Result<String, Error> {
+    expect_byte(source, b'$')?;
     let mut buf = Vec::new();
     source.read_until(b';', &mut buf)?;
     match buf.pop() {
@@ -1163,6 +1288,8 @@ fn read_length_prefixed_string<R: BufRead + Seek>(source: &mut R) -> Result<Stri
     buf.resize(len, 0);
     source.read_exact(&mut buf)?;
     let string = String::from_utf8(buf)?;
+
+    expect_byte(source, b';')?;
 
     Ok(string)
 }
@@ -1264,6 +1391,18 @@ fn grow_range(key: &str, range: RangeInclusive<String>) -> RangeInclusive<String
     start..=end
 }
 
+fn peek_byte<R: BufRead + Seek>(source: &mut R) -> io::Result<Option<u8>> {
+    let mut buf = [0u8];
+    match source.read(&mut buf)? {
+        0 => return Ok(None),
+        _ => {}
+    };
+
+    source.seek_relative(-1)?;
+
+    Ok(Some(buf[0]))
+}
+
 fn expect_byte(source: &mut impl BufRead, want: u8) -> Result<(), Error> {
     let mut buf = [0; 1];
     source.read_exact(&mut buf)?;
@@ -1333,8 +1472,8 @@ mod tests {
     #[test]
     fn put() -> Result<(), Box<dyn error::Error>> {
         initialize();
-        let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
+        let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
         let lines = PUT_FILE.lines();
         for (i, line) in lines.enumerate() {
             let cmd = Cmd::try_from(line)?;
@@ -1358,8 +1497,8 @@ mod tests {
     #[test]
     fn put_delete() -> Result<(), Box<dyn error::Error>> {
         initialize();
-        let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
+        let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
         let lines = PUT_DELETE_FILE.lines();
         for (i, line) in lines.enumerate() {
             let cmd = Cmd::try_from(line)?;
@@ -1383,12 +1522,12 @@ mod tests {
     #[test]
     fn put_delete_with_storage_resets() -> Result<(), Box<dyn error::Error>> {
         initialize();
-        let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
+        let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
         let lines = PUT_DELETE_FILE.lines();
         for (i, line) in lines.enumerate() {
             if i % 800 == 0 {
-                storage = Storage::new(temp_dir.path().to_path_buf(), 200)?;
+                storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
             }
 
             let cmd = Cmd::try_from(line)?;
@@ -1412,14 +1551,14 @@ mod tests {
     #[test]
     fn data_survives_crash_before_flush() -> Result<(), Box<dyn error::Error>> {
         initialize();
-        let temp_dir = TempDir::new()?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
+        let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 5)?;
 
         storage.insert("one".to_string(), "value one".to_string())?;
         storage.insert("two".to_string(), "value two".to_string())?;
         storage.delete("two".to_string())?;
 
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 5)?;
 
         assert_eq!(Some("value one".to_string()), storage.get("one")?);
         assert_eq!(None, storage.get("two")?);
@@ -1431,7 +1570,7 @@ mod tests {
     fn compaction() -> Result<(), Box<dyn error::Error>> {
         initialize();
         let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
-        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2)?;
+        let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2, 2)?;
 
         storage.insert("1".to_string(), "one".to_string())?;
         storage.insert("2".to_string(), "two".to_string())?;
