@@ -133,7 +133,7 @@ impl IdGenerator {
 #[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
-    levels: BTreeMap<usize, Vec<(RangeInclusive<String>, SSTableReader)>>,
+    levels: BTreeMap<usize, Vec<SSTable>>,
     id_generator: IdGenerator,
 
     write_ahead_log: WriteAheadLogWriter,
@@ -179,7 +179,7 @@ impl Storage {
         let next_id = levels
             .values()
             .flatten()
-            .map(|(_, table)| table.id)
+            .map(|table| table.id)
             .max()
             .map_or(1, |id| id + 1);
         let id_generator = IdGenerator { next_id };
@@ -223,9 +223,9 @@ impl Storage {
         }
 
         for (level, tables) in self.levels.iter_mut() {
-            for (key_range, table) in tables.iter_mut().rev() {
-                if key_range.start().as_str() <= key && key <= key_range.end().as_str() {
-                    let value = table.find_value(key)?;
+            for table in tables.iter_mut().rev() {
+                if table.has_key_in_range(key) {
+                    let value = table.reader.find_value(key)?;
                     match value {
                         None => {
                             if *level > 0 {
@@ -295,10 +295,10 @@ impl Storage {
         info!("Flushing memtable");
         let start = Instant::now();
 
-        let table_id = self.id_generator.next();
-        let table_name = format!("TABLE_{}", table_id);
-        let table_path = self.locations.table_path(&table_name);
         let mem_table = mem::take(&mut self.mem_table);
+
+        let (table, mut writer) = self.create_table(0)?;
+
         let min = mem_table
             .inner
             .first_key_value()
@@ -309,9 +309,7 @@ impl Storage {
             .last_key_value()
             .map(|(key, _)| String::from(key))
             .unwrap_or_else(String::new);
-        let table_range = min..=max;
-
-        let mut table_writer = SSTableWriter::create(&table_path)?;
+        table.key_range = min..=max;
 
         let operations = mem_table
             .inner
@@ -321,16 +319,9 @@ impl Storage {
                 MemTableValue::Deleted => Operation::Delete(key),
             })
             .collect();
-        table_writer.write_data_blocks(operations)?;
-        table_writer.write_indices()?;
+        writer.write_data_blocks(operations)?;
+        writer.write_indices()?;
         self.sync_dir()?;
-
-        let table_reader = SSTableReader::open(table_id, table_path)?;
-
-        self.levels
-            .entry(0)
-            .or_default()
-            .push((table_range, table_reader));
 
         self.save_manifest()?;
 
@@ -362,97 +353,53 @@ impl Storage {
         );
 
         let mut old_table_iters = HashMap::new();
-        for (level, (_, old_table)) in &mut old_tables {
-            old_table_iters.insert(old_table.id, (*level, old_table.data_iter()?));
+        for (level, old_table) in &mut old_tables {
+            old_table_iters.insert(old_table.id, (*level, old_table.reader.data_iter()?));
         }
+
+        let (max_table_size, highest_level) = (self.max_table_size, self.levels.len());
+
+        let (mut table, mut writer) = self.create_table(level + 1)?;
+        let mut entries = 0;
+        let mut key_range = String::new()..=String::new();
 
         let merger = Merger::new(old_table_iters)?;
-
-        struct Table {
-            id: u64,
-            path: PathBuf,
-            writer: SSTableWriter,
-            entries: usize,
-            key_range: Option<RangeInclusive<String>>,
-        }
-
-        let mut table = {
-            let table_id = self.id_generator.next();
-            let path = self.locations.table_path(format!("TABLE_{}", table_id));
-            Table {
-                id: table_id,
-                writer: SSTableWriter::create(&path)?,
-                path,
-                entries: 0,
-                key_range: None,
-            }
-        };
-
-        let mut new_next_level = vec![];
-
         for extracted in merger {
             let (heap_key, operation) = extracted?;
 
             if let Operation::Delete(_) = &operation
-                && level >= self.levels.len() - 1
+                && level == highest_level
             {
                 // Tombstones may only be dropped at the highest level, otherwise operations at
                 // levels higher than the current one could resurface
                 continue;
             }
 
-            table.writer.write_data_blocks(vec![operation])?;
-            table.entries += 1;
-            table.key_range = Some(match table.key_range.take() {
-                Some(key_range) => grow_range(&heap_key.key, key_range),
-                None => heap_key.key.clone()..=heap_key.key.clone(),
-            });
+            writer.write_data_blocks(vec![operation])?;
+            entries += 1;
+            key_range = grow_range(heap_key.key, key_range);
 
-            if table.entries > self.max_table_size {
-                table.writer.write_indices()?;
-                table.writer.sync()?;
+            if entries > max_table_size {
+                writer.write_indices()?;
+                writer.sync()?;
 
-                new_next_level.push((
-                    table
-                        .key_range
-                        .expect("When table.entries > 0 the table should have Some(key_range)"),
-                    SSTableReader::open(table.id, table.path)?,
-                ));
+                table.key_range = key_range;
 
-                table = {
-                    let table_id = self.id_generator.next();
-                    let path = self.locations.table_path(format!("TABLE_{}", table_id));
-                    Table {
-                        id: table_id,
-                        writer: SSTableWriter::create(&path)?,
-                        path,
-                        entries: 0,
-                        key_range: None,
-                    }
-                };
+                (table, writer) = self.create_table(level + 1)?;
+                entries = 0;
+                key_range = String::new()..=String::new();
             }
         }
 
-        if table.entries > 0 {
-            new_next_level.push((
-                table
-                    .key_range
-                    .expect("When table.entries > 0 the table should have Some(key_range)"),
-                SSTableReader::open(table.id, table.path)?,
-            ));
-        }
-
-        table.writer.write_indices()?;
-        table.writer.sync()?;
-
-        self.levels.insert(level + 1, new_next_level);
+        writer.write_indices()?;
+        writer.sync()?;
 
         self.sync_dir()?;
         self.save_manifest()?;
 
-        for (_, (_, table)) in old_tables {
-            info!("Deleting old table {}", table.file_name);
-            fs::remove_file(self.locations.table_path(&table.file_name))?;
+        for (_, table) in old_tables {
+            info!("Deleting old table {:?}", table.path);
+            fs::remove_file(table.path)?;
         }
 
         info!("Compaction complete, took {:?}", start.elapsed());
@@ -466,9 +413,6 @@ impl Storage {
         let mut manifest_writer = ManifestWriter::create(&self.locations.manifest_temp)?;
 
         for (level, tables) in self.levels.iter() {
-            let tables = tables
-                .iter()
-                .map(|(range, table)| (range.clone(), table.file_name.clone()));
             manifest_writer.write_level(*level, tables)?;
         }
 
@@ -478,6 +422,31 @@ impl Storage {
         self.sync_dir()?;
 
         Ok(())
+    }
+
+    fn create_table(&mut self, level: usize) -> Result<(&mut SSTable, SSTableWriter), Error> {
+        let table_id = self.id_generator.next();
+        let path = self.locations.table_path(format!("TABLE_{}", table_id));
+
+        let writer = SSTableWriter::create(&path)?;
+
+        let reader = SSTableReader::open(&path)?;
+
+        let table = SSTable {
+            id: table_id,
+            name: format!("TABLE_{}", table_id),
+            path,
+            key_range: String::new()..=String::new(),
+            reader,
+        };
+
+        let level_tables = self.levels.entry(level).or_default();
+        level_tables.push(table);
+
+        let table = level_tables
+            .last_mut()
+            .expect("Table should be present after it has been pushed to the level vec");
+        Ok((table, writer))
     }
 }
 
@@ -601,6 +570,21 @@ enum MemTableValue {
 impl MemTableValue {
     fn new(value: String) -> MemTableValue {
         MemTableValue::Value(value)
+    }
+}
+
+#[derive(Debug)]
+struct SSTable {
+    id: u64,
+    name: String,
+    path: PathBuf,
+    key_range: RangeInclusive<String>,
+    reader: SSTableReader,
+}
+
+impl SSTable {
+    fn has_key_in_range(&self, key: &str) -> bool {
+        self.key_range.start().as_str() <= key && key <= self.key_range.end().as_str()
     }
 }
 
@@ -751,32 +735,15 @@ impl SSTableWriter {
 
 #[derive(Debug)]
 struct SSTableReader {
-    id: u64,
-    file_name: String,
     file: BufReader<File>,
 }
 
 impl SSTableReader {
-    fn open(id: u64, table_path: impl AsRef<Path>) -> io::Result<SSTableReader> {
-        let file_name = table_path
-            .as_ref()
-            .file_name()
-            .ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::IsADirectory,
-                    format!("{:?} is a directory", table_path.as_ref()),
-                )
-            })?
-            .to_os_string()
-            .to_string_lossy()
-            .into_owned();
-
+    fn open(table_path: impl AsRef<Path>) -> io::Result<SSTableReader> {
         info!("Opening table {:?}", table_path.as_ref());
 
         let file = File::open(table_path)?;
         Ok(SSTableReader {
-            id,
-            file_name,
             file: BufReader::new(file),
         })
     }
@@ -1053,22 +1020,28 @@ impl<'a> Iterator for DataBlockIter<'a> {
     }
 }
 
-fn read_manifest(
-    manifest_path: impl AsRef<Path>,
-) -> Result<BTreeMap<usize, Vec<(RangeInclusive<String>, SSTableReader)>>, Error> {
+fn read_manifest(manifest_path: impl AsRef<Path>) -> Result<BTreeMap<usize, Vec<SSTable>>, Error> {
     let mut manifest_reader = ManifestReader::open(&manifest_path)?;
 
     let levels_table_names = manifest_reader.read_all()?;
     let mut levels = BTreeMap::new();
     for (level, table_names) in levels_table_names {
         let mut tables = Vec::new();
+
         for (range, table_id, table_name) in table_names {
             let table_path = match manifest_path.as_ref().parent() {
-                Some(path) => path.join(table_name),
-                None => PathBuf::from(table_name),
+                Some(path) => path.join(&table_name),
+                None => PathBuf::from(&table_name),
             };
 
-            tables.push((range, SSTableReader::open(table_id, &table_path)?))
+            let reader = SSTableReader::open(&table_path)?;
+            tables.push(SSTable {
+                id: table_id,
+                name: table_name,
+                path: table_path,
+                key_range: range,
+                reader,
+            });
         }
 
         levels.insert(level, tables);
@@ -1204,18 +1177,19 @@ impl ManifestWriter {
         })
     }
 
-    fn write_level(
+    fn write_level<'a>(
         &mut self,
         level: usize,
-        tables: impl IntoIterator<Item = (RangeInclusive<String>, String)>,
+        tables: impl IntoIterator<Item = &'a SSTable>,
     ) -> io::Result<()> {
         writeln!(self.file, "[L{}]", level)?;
-        for (key_range, table_name) in tables {
+        for table in tables {
             writeln!(
                 self.file,
-                "{}-{}:{table_name}",
-                key_range.start(),
-                key_range.end()
+                "{}-{}:{}",
+                table.key_range.start(),
+                table.key_range.end(),
+                table.name
             )?;
         }
 
@@ -1449,15 +1423,23 @@ fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::R
     Ok(())
 }
 
-fn grow_range(key: &str, range: RangeInclusive<String>) -> RangeInclusive<String> {
+fn grow_range(key: String, range: RangeInclusive<String>) -> RangeInclusive<String> {
     let (mut start, mut end) = range.into_inner();
-    if key < start.as_str() {
-        start = key.to_owned();
+
+    if start == "" {
+        start = key.clone();
+    }
+    if end == "" {
+        end = key.clone();
+    }
+
+    if key < start {
+        start = key;
         return start..=end;
     }
 
-    if key > end.as_str() {
-        end = key.to_owned();
+    if key > end {
+        end = key;
     }
     start..=end
 }
