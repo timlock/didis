@@ -117,9 +117,24 @@ impl Locations {
 }
 
 #[derive(Debug)]
+struct IdGenerator {
+    next_id: u64,
+}
+
+impl IdGenerator {
+    fn next(&mut self) -> u64 {
+        let next_id = self.next_id;
+        self.next_id += 1;
+
+        next_id
+    }
+}
+
+#[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
     levels: BTreeMap<usize, Vec<(RangeInclusive<String>, SSTableReader)>>,
+    id_generator: IdGenerator,
 
     write_ahead_log: WriteAheadLogWriter,
     locations: Locations,
@@ -128,7 +143,11 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(directory_path: PathBuf, max_table_size: usize, level_ratio: usize) -> Result<Storage, Error> {
+    pub fn new(
+        directory_path: PathBuf,
+        max_table_size: usize,
+        level_ratio: usize,
+    ) -> Result<Storage, Error> {
         info!("Setting up storage engine");
 
         let locations = Locations {
@@ -157,6 +176,14 @@ impl Storage {
 
         let wal_writer = WriteAheadLogWriter::open(&locations.wal)?;
 
+        let next_id = levels
+            .values()
+            .flatten()
+            .map(|(_, table)| table.id)
+            .max()
+            .map_or(1, |id| id + 1);
+        let id_generator = IdGenerator { next_id };
+
         let mut storage = Storage {
             mem_table: MemTable::default(),
             levels,
@@ -164,6 +191,7 @@ impl Storage {
             locations,
             max_table_size,
             level_ratio,
+            id_generator,
         };
 
         let wal_reader = match WriteAheadLogReader::open(&storage.locations.wal) {
@@ -267,7 +295,7 @@ impl Storage {
         info!("Flushing memtable");
         let start = Instant::now();
 
-        let table_id = self.next_id();
+        let table_id = self.id_generator.next();
         let table_name = format!("TABLE_{}", table_id);
         let table_path = self.locations.table_path(&table_name);
         let mem_table = mem::take(&mut self.mem_table);
@@ -283,7 +311,7 @@ impl Storage {
             .unwrap_or_else(String::new);
         let table_range = min..=max;
 
-        let mut table_writer = SSTableWriter::open(&table_path)?;
+        let mut table_writer = SSTableWriter::create(&table_path)?;
 
         let operations = mem_table
             .inner
@@ -299,17 +327,10 @@ impl Storage {
 
         let table_reader = SSTableReader::open(table_id, table_path)?;
 
-        let new_level_zero = match self.levels.get_mut(&0) {
-            Some(level_zero) => level_zero,
-            None => {
-                self.levels.insert(0, Vec::new());
-                self.levels.get_mut(&0).expect(
-                    "get_mut(0) should return Some when insert(0, value) has been called before",
-                )
-            }
-        };
-
-        new_level_zero.push((table_range, table_reader));
+        self.levels
+            .entry(0)
+            .or_default()
+            .push((table_range, table_reader));
 
         self.save_manifest()?;
 
@@ -324,108 +345,105 @@ impl Storage {
         info!("Compacting level {level}");
         let start = Instant::now();
 
-        let mut table_id = self.next_id();
+        let mut old_tables = self
+            .levels
+            .remove(&level)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|table| (level, table))
+            .collect::<Vec<_>>();
 
-        let mut old_tables = Vec::new();
-        if let Some(old_level) = self.levels.get_mut(&level) {
-            while let Some(table) = old_level.pop() {
-               old_tables.push((level, table));
-            }
-        }
-        if let Some(old_level) = self.levels.get_mut(&(level + 1)) {
-            while let Some(table) = old_level.pop() {
-                old_tables.push((level + 1, table));
-            }
-        }
+        old_tables.extend(
+            self.levels
+                .remove(&(level + 1))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|table| (level + 1, table)),
+        );
 
         let mut old_table_iters = HashMap::new();
-        for (level, (_,old_table)) in &mut old_tables {
+        for (level, (_, old_table)) in &mut old_tables {
             old_table_iters.insert(old_table.id, (*level, old_table.data_iter()?));
         }
 
-        let mut min_heap = MinHeap::default();
-        for (table_id, (level, table)) in old_table_iters.iter_mut() {
-            let next = table.next();
-            if let Some(entry) = next {
-                let entry = entry?;
-                min_heap.insert(
-                    MinHeapKey::new(entry.key().to_owned(), *table_id, *level),
-                    entry,
-                );
-            }
+        let merger = Merger::new(old_table_iters)?;
+
+        struct Table {
+            id: u64,
+            path: PathBuf,
+            writer: SSTableWriter,
+            entries: usize,
+            key_range: Option<RangeInclusive<String>>,
         }
 
-        let mut table_name = format!("TABLE_{}", table_id);
-        let mut table_path = self.locations.table_path(&table_name);
-        let mut table_writer = SSTableWriter::open(&table_path)?;
-        let mut table_entries = 0;
-        let mut new_next_level = vec![];
-        let mut key_range: Option<RangeInclusive<String>> = None;
+        let mut table = {
+            let table_id = self.id_generator.next();
+            let path = self.locations.table_path(format!("TABLE_{}", table_id));
+            Table {
+                id: table_id,
+                writer: SSTableWriter::create(&path)?,
+                path,
+                entries: 0,
+                key_range: None,
+            }
+        };
 
-        while let Some((heap_key, operation)) = min_heap.extract() {
-            match &operation {
-                Operation::Insert(_, value) => {
-                    table_writer.write_data_blocks(vec![operation])?;
-                    table_entries += 1;
-                    key_range = Some(match key_range {
-                        Some(key_range) => grow_range(&heap_key.key, key_range),
-                        None => heap_key.key.clone()..=heap_key.key.clone(),
-                    });
-                }
-                Operation::Delete(_) if level < self.levels.len() - 1 => {
-                    table_writer.write_data_blocks(vec![operation])?;
-                    table_entries += 1;
-                    key_range = Some(match key_range {
-                        Some(key_range) => grow_range(&heap_key.key, key_range),
-                        None => heap_key.key.clone()..=heap_key.key.clone(),
-                    });
-                }
-                Operation::Delete(_) => {
-                    // Tombstones at the lowest level can be dropped, since there are no higher levels
-                    // the tombstone does not shadow other operations for that key
-                }
+        let mut new_next_level = vec![];
+
+        for extracted in merger {
+            let (heap_key, operation) = extracted?;
+
+            if let Operation::Delete(_) = &operation
+                && level >= self.levels.len() - 1
+            {
+                // Tombstones may only be dropped at the highest level, otherwise operations at
+                // levels higher than the current one could resurface
+                continue;
             }
 
-            if table_entries > self.max_table_size {
-                table_writer.write_indices()?;
-                table_writer.sync()?;
+            table.writer.write_data_blocks(vec![operation])?;
+            table.entries += 1;
+            table.key_range = Some(match table.key_range.take() {
+                Some(key_range) => grow_range(&heap_key.key, key_range),
+                None => heap_key.key.clone()..=heap_key.key.clone(),
+            });
+
+            if table.entries > self.max_table_size {
+                table.writer.write_indices()?;
+                table.writer.sync()?;
 
                 new_next_level.push((
-                    key_range.unwrap(),
-                    SSTableReader::open(table_id, table_path)?,
+                    table
+                        .key_range
+                        .expect("When table.entries > 0 the table should have Some(key_range)"),
+                    SSTableReader::open(table.id, table.path)?,
                 ));
-                key_range = None;
 
-                table_id += 1;
-                table_name = format!("TABLE_{}", table_id);
-                table_path = self.locations.table_path(&table_name);
-                table_writer = SSTableWriter::open(&table_path)?;
-                table_entries = 0;
-            }
-
-            let mut extracted = min_heap.extract_until(|k, _| k.key == heap_key.key);
-            extracted.insert(0, heap_key);
-            for key in extracted {
-                let (level, table) = old_table_iters
-                    .get_mut(&key.table_id)
-                    .expect("Each entry of the min-heap should come from an existing SSTable");
-                if let Some(entry) = table.next() {
-                    let entry = entry?;
-                    min_heap.insert(
-                        MinHeapKey::new(entry.key().to_owned(), key.table_id, *level),
-                        entry,
-                    );
-                }
+                table = {
+                    let table_id = self.id_generator.next();
+                    let path = self.locations.table_path(format!("TABLE_{}", table_id));
+                    Table {
+                        id: table_id,
+                        writer: SSTableWriter::create(&path)?,
+                        path,
+                        entries: 0,
+                        key_range: None,
+                    }
+                };
             }
         }
 
-        new_next_level.push((
-            key_range.unwrap(),
-            SSTableReader::open(table_id, table_path)?,
-        ));
+        if table.entries > 0 {
+            new_next_level.push((
+                table
+                    .key_range
+                    .expect("When table.entries > 0 the table should have Some(key_range)"),
+                SSTableReader::open(table.id, table.path)?,
+            ));
+        }
 
-        table_writer.write_indices()?;
-        table_writer.sync()?;
+        table.writer.write_indices()?;
+        table.writer.sync()?;
 
         self.levels.insert(level + 1, new_next_level);
 
@@ -442,19 +460,10 @@ impl Storage {
         Ok(())
     }
 
-    fn next_id(&self) -> u64 {
-        self.levels
-            .values()
-            .flatten()
-            .map(|(_, table)| table.id)
-            .max()
-            .map_or(1, |id| id + 1)
-    }
-
     fn save_manifest(&mut self) -> Result<(), Error> {
         info!("Saving manifest entries");
 
-        let mut manifest_writer = ManifestWriter::open(&self.locations.manifest_temp)?;
+        let mut manifest_writer = ManifestWriter::create(&self.locations.manifest_temp)?;
 
         for (level, tables) in self.levels.iter() {
             let tables = tables
@@ -472,7 +481,66 @@ impl Storage {
     }
 }
 
-#[derive(PartialEq, Debug)]
+struct Merger<'a> {
+    sources: HashMap<u64, (usize, SSTableDataIter<'a>)>,
+    min_heap: MinHeap<MinHeapKey, Operation>,
+}
+
+impl<'a> Merger<'a> {
+    fn new(mut sources: HashMap<u64, (usize, SSTableDataIter<'a>)>) -> Result<Merger<'a>, Error> {
+        let mut min_heap = MinHeap::default();
+
+        for (table_id, (level, table)) in sources.iter_mut() {
+            let next = table.next();
+            if let Some(entry) = next {
+                let entry = entry?;
+                min_heap.insert(
+                    MinHeapKey::new(entry.key().to_owned(), *table_id, *level),
+                    entry,
+                );
+            }
+        }
+
+        Ok(Merger { sources, min_heap })
+    }
+}
+
+impl<'a> Iterator for Merger<'a> {
+    type Item = Result<(MinHeapKey, Operation), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (heap_key, operation) = match self.min_heap.extract() {
+            Some(next) => next,
+            None => return None,
+        };
+
+        let mut extracted = self.min_heap.extract_until(|k, _| k.key == heap_key.key);
+        extracted.insert(0, heap_key.clone());
+
+        for key in extracted {
+            let (level, table) = self
+                .sources
+                .get_mut(&key.table_id)
+                .expect("Each entry of the min-heap should come from an existing SSTable");
+
+            if let Some(entry) = table.next() {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => return Some(Err(err)),
+                };
+
+                self.min_heap.insert(
+                    MinHeapKey::new(entry.key().to_owned(), key.table_id, *level),
+                    entry,
+                );
+            }
+        }
+
+        Some(Ok((heap_key, operation)))
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
 struct MinHeapKey {
     key: String,
     table_id: u64,
@@ -545,7 +613,7 @@ struct SSTableWriter {
     keys: Vec<(String, usize)>,
 }
 impl SSTableWriter {
-    fn open(table_path: &Path) -> io::Result<SSTableWriter> {
+    fn create(table_path: &Path) -> io::Result<SSTableWriter> {
         info!("Creating new table {:?}", table_path);
         let file = File::create(&table_path)?;
         Ok(SSTableWriter {
@@ -722,7 +790,7 @@ impl SSTableReader {
         self.file.seek(SeekFrom::Start(offset as u64))?;
         let mut data_block_iter = DataBlockIter::new(&mut self.file)?;
 
-        while let Some(next) = data_block_iter.next(){
+        while let Some(next) = data_block_iter.next() {
             let operation = next?;
 
             if operation.key() > key {
@@ -807,7 +875,10 @@ impl<'a> IndexBlockIter<'a> {
 
         let stream_pos = file.stream_position()?;
 
-        Ok(IndexBlockIter { file, end_of_content: stream_pos + content_len })
+        Ok(IndexBlockIter {
+            file,
+            end_of_content: stream_pos + content_len,
+        })
     }
 }
 
@@ -858,7 +929,7 @@ impl<'a> Iterator for SSTableIndexIter<'a> {
                 };
 
                 let padding = BLOCK_SIZE - (stream_pos as usize % BLOCK_SIZE);
-                if stream_pos + padding as u64 >= self.header_offset{
+                if stream_pos + padding as u64 >= self.header_offset {
                     return None;
                 }
 
@@ -891,7 +962,6 @@ struct SSTableDataIter<'a> {
 impl<'a> Iterator for SSTableDataIter<'a> {
     type Item = Result<Operation, Error>;
 
-
     fn next(&mut self) -> Option<Self::Item> {
         let data_block_iter = self.data_block_iter.as_mut()?;
 
@@ -906,7 +976,7 @@ impl<'a> Iterator for SSTableDataIter<'a> {
 
                 let padding = BLOCK_SIZE - (stream_pos as usize % BLOCK_SIZE);
 
-                if stream_pos + padding as u64 >= self.first_index_offset{
+                if stream_pos + padding as u64 >= self.first_index_offset {
                     return None;
                 }
 
@@ -953,18 +1023,20 @@ impl<'a> DataBlockIter<'a> {
         file.read_exact(&mut buf)?;
 
         let got_checksum = crc64::crc64(0, &buf);
-        if want_checksum != got_checksum{
-           return Err(Error::ChecksumMismatch {want: want_checksum, got: got_checksum})
+        if want_checksum != got_checksum {
+            return Err(Error::ChecksumMismatch {
+                want: want_checksum,
+                got: got_checksum,
+            });
         }
 
         file.seek(SeekFrom::Start(data_offset))?;
 
-        Ok(DataBlockIter { file, content_len})
+        Ok(DataBlockIter { file, content_len })
     }
 }
 
 impl<'a> Iterator for DataBlockIter<'a> {
-
     type Item = Result<Operation, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -976,7 +1048,6 @@ impl<'a> Iterator for DataBlockIter<'a> {
         if stream_pos >= self.content_len {
             return None;
         }
-
 
         Some(read_operation(&mut self.file))
     }
@@ -1125,7 +1196,7 @@ struct ManifestWriter {
     file: BufWriter<File>,
 }
 impl ManifestWriter {
-    fn open(path: impl AsRef<Path>) -> io::Result<ManifestWriter> {
+    fn create(path: impl AsRef<Path>) -> io::Result<ManifestWriter> {
         info!("Creating manifest {:?}", path.as_ref());
         let file = File::create(path)?;
         Ok(ManifestWriter {
