@@ -1,11 +1,28 @@
-use crate::storage::lsm::sstable::SSTable;
-use crate::storage::lsm::{Error};
+use crate::storage::lsm::Error;
 use log::info;
 use std::fs::File;
 use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use crate::storage::lsm::sstable::SSTable;
+
+#[derive(Debug)]
+pub struct Entry {
+    pub id: u64,
+    pub name: String,
+    pub key_range: RangeInclusive<String>,
+}
+
+impl From<SSTable> for Entry{
+    fn from(value: SSTable) -> Self {
+        Entry{
+            id: value.id,
+            name: value.name,
+            key_range: value.key_range,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ManifestReader {
@@ -20,9 +37,7 @@ impl ManifestReader {
         })
     }
 
-    pub fn read_all(
-        &mut self,
-    ) -> Result<Vec<(u64, Vec<(RangeInclusive<String>, u64, String)>)>, Error> {
+    pub fn read_all(&mut self) -> Result<Vec<(u64, Vec<Entry>)>, Error> {
         self.file.seek(SeekFrom::Start(0))?;
 
         let mut result = Vec::new();
@@ -33,9 +48,7 @@ impl ManifestReader {
         Ok(result)
     }
 
-    fn read_next_level(
-        &mut self,
-    ) -> Option<Result<(u64, Vec<(RangeInclusive<String>, u64, String)>), Error>> {
+    fn read_next_level(&mut self) -> Option<Result<(u64, Vec<Entry>), Error>> {
         let level = match self.read_level_header()? {
             Ok(level) => level,
             Err(err) => return Some(Err(err)),
@@ -48,7 +61,7 @@ impl ManifestReader {
 
         let mut result = Vec::new();
         for line in lines {
-            let table = match Self::parse_table(&line) {
+            let table = match Self::parse_entry(&line) {
                 Ok(table) => table,
                 Err(err) => return Some(Err(err)),
             };
@@ -68,7 +81,6 @@ impl ManifestReader {
 
         let lines = str::from_utf8(&buf)?
             .lines()
-            .into_iter()
             .filter(|line| !line.trim().is_empty())
             .map(|line| line.to_owned())
             .collect();
@@ -94,7 +106,7 @@ impl ManifestReader {
         Some(level_str.parse::<u64>().map_err(Error::from))
     }
 
-    fn parse_table(line: &str) -> Result<(RangeInclusive<String>, u64, String), Error> {
+    fn parse_entry(line: &str) -> Result<Entry, Error> {
         let (keys, table_name) = line
             .split_once(":")
             .ok_or_else(|| Error::InvalidManifestEntry(line.to_owned()))?;
@@ -103,13 +115,13 @@ impl ManifestReader {
             .split_once("-")
             .ok_or_else(|| Error::InvalidManifestEntry(line.to_owned()))?;
 
-        let table_id = parse_table_id(&table_name)?;
+        let table_id = parse_table_id(table_name)?;
 
-        Ok((
-            start_inclusive.to_owned()..=end_exclusive.to_owned(),
-            table_id,
-            table_name.to_owned(),
-        ))
+        Ok(Entry {
+            id: table_id,
+            name: table_name.to_owned(),
+            key_range: start_inclusive.to_owned()..=end_exclusive.to_owned(),
+        })
     }
 }
 
@@ -131,7 +143,7 @@ impl ManifestWriter {
         level: u64,
         tables: impl IntoIterator<Item = &'a SSTable>,
     ) -> io::Result<()> {
-        writeln!(self.file, "[L{}]", level)?;
+        writeln!(self.file, "[L{level}]")?;
         for table in tables {
             writeln!(
                 self.file,

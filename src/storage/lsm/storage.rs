@@ -2,12 +2,12 @@ use crate::storage::lsm::heap::MinHeap;
 use crate::storage::lsm::manifest::{ManifestReader, ManifestWriter};
 use crate::storage::lsm::sstable::{SSTable, SSTableDataIter, SSTableReader, SSTableWriter};
 use crate::storage::lsm::wal::{WriteAheadLogReader, WriteAheadLogWriter};
-use crate::storage::lsm::{Error, Operation};
+use crate::storage::lsm::{Error, Operation, manifest};
 use log::info;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{ErrorKind};
+use std::io::{BufRead, ErrorKind, Seek};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -44,7 +44,7 @@ impl IdGenerator {
 #[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
-    levels: BTreeMap<u64, Vec<SSTable>>,
+    levels: BTreeMap<u64, Vec<(SSTable)>>,
     id_generator: IdGenerator,
 
     write_ahead_log: WriteAheadLogWriter,
@@ -107,7 +107,7 @@ impl Storage {
 
         let wal_reader = match WriteAheadLogReader::open(&storage.locations.wal) {
             Ok(wal_reader) => Some(wal_reader),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
             Err(err) => return Err(Error::from(err)),
         };
 
@@ -214,12 +214,12 @@ impl Storage {
             .inner
             .first_key_value()
             .map(|(key, _)| String::from(key))
-            .unwrap_or_else(String::new);
+            .unwrap_or_default();
         let max = mem_table
             .inner
             .last_key_value()
             .map(|(key, _)| String::from(key))
-            .unwrap_or_else(String::new);
+            .unwrap_or_default();
         table.key_range = min..=max;
 
         let operations = mem_table
@@ -334,7 +334,7 @@ impl Storage {
 
     fn create_table(&mut self, level: u64) -> Result<(&mut SSTable, SSTableWriter), Error> {
         let table_id = self.id_generator.next();
-        let path = self.locations.table_path(format!("TABLE_{}", table_id));
+        let path = self.locations.table_path(format!("TABLE_{table_id}"));
 
         let writer = SSTableWriter::create(&path)?;
 
@@ -342,7 +342,7 @@ impl Storage {
 
         let table = SSTable::new(
             table_id,
-            format!("TABLE_{}", table_id),
+            format!("TABLE_{table_id}"),
             path,
             String::new()..=String::new(),
             reader,
@@ -358,13 +358,16 @@ impl Storage {
     }
 }
 
-struct Merger<'a> {
-    sources: HashMap<u64, (u64, SSTableDataIter<'a>)>,
+struct Merger<I> {
+    sources: HashMap<u64, (u64, I)>,
     min_heap: MinHeap<MinHeapKey, Operation>,
 }
 
-impl<'a> Merger<'a> {
-    fn new(mut sources: HashMap<u64, (u64, SSTableDataIter<'a>)>) -> Result<Merger<'a>, Error> {
+impl<I> Merger<I>
+where
+    I: Iterator<Item = Result<Operation, Error>>,
+{
+    fn new(mut sources: HashMap<u64, (u64, I)>) -> Result<Merger<I>, Error> {
         let mut min_heap = MinHeap::default();
 
         for (table_id, (level, table)) in sources.iter_mut() {
@@ -382,14 +385,14 @@ impl<'a> Merger<'a> {
     }
 }
 
-impl<'a> Iterator for Merger<'a> {
+impl<I> Iterator for Merger<I>
+where
+    I: Iterator<Item = Result<Operation, Error>>,
+{
     type Item = Result<(MinHeapKey, Operation), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (heap_key, operation) = match self.min_heap.extract() {
-            Some(next) => next,
-            None => return None,
-        };
+        let (heap_key, operation) = self.min_heap.extract()?;
 
         let mut extracted = self.min_heap.extract_until(|k, _| k.key == heap_key.key);
         extracted.insert(0, heap_key.clone());
@@ -483,23 +486,23 @@ impl MemTableValue {
 fn read_manifest(manifest_path: impl AsRef<Path>) -> Result<BTreeMap<u64, Vec<SSTable>>, Error> {
     let mut manifest_reader = ManifestReader::open(&manifest_path)?;
 
-    let levels_table_names = manifest_reader.read_all()?;
+    let level_entries = manifest_reader.read_all()?;
     let mut levels = BTreeMap::new();
-    for (level, table_names) in levels_table_names {
+    for (level, entries) in level_entries {
         let mut tables = Vec::new();
 
-        for (range, table_id, table_name) in table_names {
+        for entry in entries {
             let table_path = match manifest_path.as_ref().parent() {
-                Some(path) => path.join(&table_name),
-                None => PathBuf::from(&table_name),
+                Some(path) => path.join(&entry.name),
+                None => PathBuf::from(&entry.name),
             };
 
             let reader = SSTableReader::open(&table_path)?;
             tables.push(SSTable {
-                id: table_id,
-                name: table_name,
+                id: entry.id,
+                name: entry.name,
                 path: table_path,
-                key_range: range,
+                key_range: entry.key_range,
                 reader,
             });
         }
@@ -513,10 +516,10 @@ fn read_manifest(manifest_path: impl AsRef<Path>) -> Result<BTreeMap<u64, Vec<SS
 fn grow_range(key: String, range: RangeInclusive<String>) -> RangeInclusive<String> {
     let (mut start, mut end) = range.into_inner();
 
-    if start == "" {
+    if start.is_empty() {
         start = key.clone();
     }
-    if end == "" {
+    if end.is_empty() {
         end = key.clone();
     }
 
@@ -540,8 +543,8 @@ mod tests {
     use std::sync::Once;
     use std::{env, error};
 
-    static PUT_FILE: &'static str = include_str!("testdata/put.txt");
-    static PUT_DELETE_FILE: &'static str = include_str!("testdata/put-delete.txt");
+    static PUT_FILE: &str = include_str!("testdata/put.txt");
+    static PUT_DELETE_FILE: &str = include_str!("testdata/put-delete.txt");
 
     static INIT: Once = Once::new();
 
@@ -562,7 +565,7 @@ mod tests {
 
         fn try_from(value: &'a str) -> Result<Self, Self::Error> {
             let mut iter = value.split_ascii_whitespace();
-            match iter.next().ok_or_else(|| "empty line")? {
+            match iter.next().ok_or("empty line")? {
                 "GET" => {
                     let key = iter.next().ok_or_else(|| format!("truncated '{value}'"))?;
                     let want = iter.next().ok_or_else(|| format!("truncated '{value}'"))?;
@@ -597,16 +600,10 @@ mod tests {
             let cmd = Cmd::try_from(line)?;
             match cmd {
                 Cmd::Get { key, want } => {
-                    if key == "yivzv" {
-                        dbg!()
-                    }
                     let got = storage.get(key)?;
-                    assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
+                    assert_eq!(want, got.as_deref(), "line {i} {cmd:?}");
                 }
                 Cmd::Put { key, value } => {
-                    if key == "yivzv" {
-                        dbg!()
-                    }
                     storage.insert(key.to_owned(), value.to_owned())?;
                 }
                 Cmd::Del { key } => {
@@ -629,7 +626,7 @@ mod tests {
             match cmd {
                 Cmd::Get { key, want } => {
                     let got = storage.get(key)?;
-                    assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
+                    assert_eq!(want, got.as_deref(), "line {i} {cmd:?}");
                 }
                 Cmd::Put { key, value } => {
                     storage.insert(key.to_owned(), value.to_owned())?;
@@ -658,7 +655,7 @@ mod tests {
             match cmd {
                 Cmd::Get { key, want } => {
                     let got = storage.get(key)?;
-                    assert_eq!(want, got.as_deref(), "line {} {:?}", i, cmd);
+                    assert_eq!(want, got.as_deref(), "line {i} {cmd:?}");
                 }
                 Cmd::Put { key, value } => {
                     storage.insert(key.to_owned(), value.to_owned())?;
@@ -711,6 +708,84 @@ mod tests {
         assert_eq!(Some("updated three".to_string()), storage.get("3")?);
         assert_eq!(Some("four".to_string()), storage.get("4")?);
         assert_eq!(Some("five".to_string()), storage.get("5")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn merger() -> Result<(), Box<dyn error::Error>> {
+        let mut operations = HashMap::new();
+        operations.insert(
+            3,
+            (
+                0,
+                vec![
+                    Ok(Operation::Delete("1".to_string())),
+                    Ok(Operation::Delete("2".to_string())),
+                ]
+                .into_iter(),
+            ),
+        );
+        operations.insert(
+            4,
+            (
+                0,
+                vec![
+                    Ok(Operation::Delete("1".to_string())),
+                    Ok(Operation::Delete("2".to_string())),
+                ]
+                .into_iter(),
+            ),
+        );
+        operations.insert(
+            1,
+            (
+                1,
+                vec![
+                    Ok(Operation::Delete("1".to_string())),
+                    Ok(Operation::Delete("2".to_string())),
+                ]
+                .into_iter(),
+            ),
+        );
+        operations.insert(
+            2,
+            (
+                1,
+                vec![
+                    Ok(Operation::Delete("1".to_string())),
+                    Ok(Operation::Delete("2".to_string())),
+                ]
+                .into_iter(),
+            ),
+        );
+
+        let mut merger = Merger::new(operations)?;
+        assert_eq!(
+            (
+                MinHeapKey {
+                    key: "1".to_string(),
+                    table_id: 4,
+                    table_level: 0
+                },
+                Operation::Delete("1".to_string())
+            ),
+            merger.next().unwrap()?,
+        );
+
+        assert_eq!(
+            (
+                MinHeapKey {
+                    key: "2".to_string(),
+                    table_id: 4,
+                    table_level: 0
+                },
+                Operation::Delete("2".to_string())
+            ),
+            merger.next().unwrap()?,
+        );
+
+        assert!(merger.next().is_none());
 
         Ok(())
     }
