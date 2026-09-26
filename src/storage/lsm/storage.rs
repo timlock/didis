@@ -189,7 +189,7 @@ impl Storage {
 
             for level in 0..self.levels.len() {
                 let tables_len = self.levels.get(&(level as u64)).map(Vec::len).unwrap_or(0);
-                if tables_len > (level + 1) * self.level_ratio {
+                if tables_len >= (level + 1) * self.level_ratio {
                     self.compact_level(level as u64)?;
                 }
             }
@@ -247,6 +247,8 @@ impl Storage {
         info!("Compacting level {level}");
         let start = Instant::now();
 
+        let (max_table_size, highest_level) = (self.max_table_size, self.levels.len());
+
         let mut old_tables = self
             .levels
             .remove(&level)
@@ -267,8 +269,6 @@ impl Storage {
         for (level, old_table) in &mut old_tables {
             old_table_iters.insert(old_table.id, (*level, old_table.reader.data_iter()?));
         }
-
-        let (max_table_size, highest_level) = (self.max_table_size, self.levels.len());
 
         let (mut table, mut writer) = self.create_table(level + 1)?;
         let mut entries = 0;

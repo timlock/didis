@@ -1,8 +1,8 @@
+mod heap;
 mod manifest;
 mod sstable;
 pub mod storage;
 mod wal;
-mod heap;
 
 use std::array::TryFromSliceError;
 use std::fmt::{Debug, Display};
@@ -142,9 +142,9 @@ impl TryFrom<u8> for OperationCode {
     type Error = Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value.into() {
-            '1' => Ok(OperationCode::Insert),
-            '2' => Ok(OperationCode::Delete),
+        match value {
+            1 => Ok(OperationCode::Insert),
+            2 => Ok(OperationCode::Delete),
             _ => Err(Error::UnknownOperation(value)),
         }
     }
@@ -180,16 +180,6 @@ fn write_length_prefixed_string(destination: &mut impl Write, value: &str) -> io
     Ok(())
 }
 
-fn read_operation_code<R: BufRead + Seek>(source: &mut R) -> Result<OperationCode, Error> {
-    let mut op_code_bytes = [0u8; 1];
-    let n = source.read(&mut op_code_bytes)?;
-    if n == 0 {
-        return Err(Error::Truncated);
-    }
-
-    OperationCode::try_from(op_code_bytes[0])
-}
-
 fn write_integer(destination: &mut impl Write, integer: u64) -> io::Result<usize> {
     destination.write_all(b":")?;
     let bytes = integer.to_le_bytes();
@@ -217,7 +207,13 @@ fn read_integer(mut source: &mut impl BufRead) -> Result<u64, Error> {
 }
 
 fn read_operation<R: BufRead + Seek>(source: &mut R) -> Result<Operation, Error> {
-    let op_code = read_operation_code(source)?;
+    let mut op_code_bytes = [0u8; 1];
+    let n = source.read(&mut op_code_bytes)?;
+    if n == 0 {
+        return Err(Error::Truncated);
+    }
+
+    let op_code = OperationCode::try_from(op_code_bytes[0])?;
 
     match op_code {
         OperationCode::Insert => {
@@ -234,13 +230,9 @@ fn read_operation<R: BufRead + Seek>(source: &mut R) -> Result<Operation, Error>
     }
 }
 
-fn write_operation_code(destination: &mut impl Write, operation: OperationCode) -> io::Result<()> {
-    let op_code = u8::from(&operation);
-    write!(destination, "{}", op_code)
-}
-
 fn write_operation(destination: &mut impl Write, operation: &Operation) -> io::Result<()> {
-    write_operation_code(destination, OperationCode::from(operation))?;
+    let operation_code = OperationCode::from(operation);
+    destination.write_all(&[u8::from(&operation_code)])?;
 
     match operation {
         Operation::Insert(key, value) => {

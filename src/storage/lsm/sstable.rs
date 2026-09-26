@@ -167,7 +167,7 @@ impl SSTableWriter {
         let checksum = crc64::crc64(0, &self.block[16..]);
         self.block[8..16].clone_from_slice(checksum.to_le_bytes().as_slice());
 
-        self.add_padding()?;
+        self.add_padding();
 
         self.file.write_all(&self.block)?;
         self.block.clear();
@@ -184,7 +184,7 @@ impl SSTableWriter {
         let content_size = self.block.len() - 8;
         self.block[0..8].clone_from_slice(content_size.to_le_bytes().as_slice());
 
-        self.add_padding()?;
+        self.add_padding();
 
         self.file.write_all(&self.block)?;
         self.block.clear();
@@ -192,17 +192,11 @@ impl SSTableWriter {
         Ok(())
     }
 
-    fn add_padding(&mut self) -> io::Result<()> {
-        if self.block.len() % BLOCK_SIZE == 0 {
-            return Ok(());
-        }
-
-        let padding = BLOCK_SIZE - (self.block.len() % BLOCK_SIZE);
-        self.block.resize(self.block.len() + padding, 0);
+    fn add_padding(&mut self) {
+        let padding = calculate_padding(self.block.len() as u64);
+        self.block.resize(self.block.len() + padding as usize, 0);
 
         assert_eq!(self.block.len() % BLOCK_SIZE, 0);
-
-        Ok(())
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
@@ -326,7 +320,7 @@ where
                     Err(err) => return Some(Err(err.into())),
                 };
 
-                let padding = BLOCK_SIZE as u64 - (stream_pos % BLOCK_SIZE as u64);
+                let padding = calculate_padding(stream_pos);
                 let next_index_block = stream_pos + padding;
 
                 if next_index_block >= self.header_offset {
@@ -431,7 +425,7 @@ where
                     Err(err) => return Some(Err(err.into())),
                 };
 
-                let padding = BLOCK_SIZE as u64 - (stream_pos % BLOCK_SIZE as u64);
+                let padding = calculate_padding(stream_pos);
                 let next_data_block = stream_pos + padding;
 
                 if next_data_block >= self.first_index_offset {
@@ -513,6 +507,16 @@ where
         Some(read_operation(&mut self.source))
     }
 }
+
+fn calculate_padding(stream_pos: u64) -> u64 {
+    let padding = if stream_pos % BLOCK_SIZE as u64 == 0 {
+        0
+    } else {
+        BLOCK_SIZE as u64 - (stream_pos % BLOCK_SIZE as u64)
+    };
+    padding
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
