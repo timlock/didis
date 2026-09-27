@@ -11,7 +11,7 @@ use std::io::{BufRead, BufWriter, IntoInnerError, Seek, Write};
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
-use std::{error, fmt, io, usize};
+use std::{error, fmt, io};
 
 #[derive(Debug)]
 pub enum Error {
@@ -152,31 +152,20 @@ impl TryFrom<u8> for OperationCode {
 
 fn read_length_prefixed_string<R: BufRead + Seek>(source: &mut R) -> Result<String, Error> {
     expect_byte(source, b'$')?;
-    let mut buf = Vec::new();
-    source.read_until(b';', &mut buf)?;
-    match buf.pop() {
-        Some(b';') => {}
-        Some(_) | None => return Err(Error::Truncated),
-    }
+    let len = read_length(source)?;
 
-    let bytes_array = buf.as_slice().try_into()?;
-    let len = usize::from_le_bytes(bytes_array);
-    buf.resize(len, 0);
+    let mut buf = vec![0;len as usize];
     source.read_exact(&mut buf)?;
     let string = String::from_utf8(buf)?;
-
-    expect_byte(source, b';')?;
 
     Ok(string)
 }
 
 fn write_length_prefixed_string(destination: &mut impl Write, value: &str) -> io::Result<()> {
     destination.write_all(b"$")?;
-    let bytes = value.len().to_le_bytes();
-    destination.write_all(&bytes)?;
-    destination.write_all(b";")?;
+    write_length(destination, value.len() as u64)?;
 
-    write!(destination, "{};", value)?;
+    write!(destination, "{}", value)?;
     Ok(())
 }
 
@@ -187,6 +176,64 @@ fn write_integer(destination: &mut impl Write, integer: u64) -> io::Result<usize
     destination.write_all(b";")?;
 
     Ok(bytes.len() + 2)
+}
+
+const FOURTEEN_BIT_LEN: u8 = 0b0100_0000;
+
+const FOUR_BYTE_LEN: u8 = 0b1000_0000;
+const EIGHT_BYTE_LEN: u8 = 0b1000_0001;
+
+fn write_length(destination: &mut impl Write, len: u64) -> io::Result<()> {
+    let buf: &[u8] = if len < 1 << 6 {
+        &[len as u8]
+    } else if len < 1 << 14 {
+        &[(len >> 8) as u8 | FOURTEEN_BIT_LEN, len as u8]
+    } else if len <= u32::MAX as u64 {
+        let bytes = (len as u32).to_le_bytes();
+        &[FOUR_BYTE_LEN, bytes[0], bytes[1], bytes[2], bytes[3]]
+    } else {
+        let bytes = len.to_le_bytes();
+        &[
+            EIGHT_BYTE_LEN,
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+        ]
+    };
+
+    destination.write_all(&buf)
+}
+
+fn read_length(mut source: &mut impl BufRead) -> io::Result<u64> {
+    let mut first_part = [0; 1];
+    source.read_exact(&mut first_part)?;
+
+    let len = match first_part[0] >> 6 {
+        0 => first_part[0] as u64,
+        1 => {
+            let mut second_part = [0; 1];
+            source.read_exact(&mut second_part)?;
+            u16::from_le_bytes([first_part[0] & 0b0011_1111, second_part[0]]) as u64
+        }
+        3 if first_part[0] == FOUR_BYTE_LEN => {
+            let mut remaining_parts = [0; 4];
+            source.read_exact(&mut remaining_parts)?;
+            u32::from_le_bytes(remaining_parts) as u64
+        }
+        3 if first_part[0] == EIGHT_BYTE_LEN => {
+            let mut remaining_parts = [0; 8];
+            source.read_exact(&mut remaining_parts)?;
+            u64::from_le_bytes(remaining_parts)
+        }
+        _ => panic!("it should not be possible that a byte right shifted by 6 is greater than 3"),
+    };
+
+    Ok(len)
 }
 
 fn read_integer(mut source: &mut impl BufRead) -> Result<u64, Error> {
