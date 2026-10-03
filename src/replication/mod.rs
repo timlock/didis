@@ -551,10 +551,10 @@ where
     }
 
     fn add_prepares_in_wait(&mut self) {
-        self.in_wait.sort_by(|a, b| a.op_number.cmp(&b.op_number));
+        self.in_wait.sort_by_key(|a| a.op_number);
 
         let mut i = 0;
-        while let Some(prepare) = self.in_wait.iter().next() {
+        while let Some(prepare) = self.in_wait.first() {
             if prepare.op_number == self.op_number + 1 {
                 i += 1;
             }

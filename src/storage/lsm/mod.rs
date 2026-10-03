@@ -206,10 +206,10 @@ fn write_length(destination: &mut impl Write, len: u64) -> io::Result<()> {
         ]
     };
 
-    destination.write_all(&buf)
+    destination.write_all(buf)
 }
 
-fn read_length(mut source: &mut impl BufRead) -> io::Result<u64> {
+fn read_length(source: &mut impl BufRead) -> io::Result<u64> {
     let mut first_part = [0; 1];
     source.read_exact(&mut first_part)?;
 

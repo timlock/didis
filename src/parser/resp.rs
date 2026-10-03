@@ -19,7 +19,7 @@ impl<'a> ValOrRef<'a> {
         }
     }
 
-    pub fn as_ref(&self) -> Reference {
+    pub fn as_ref(&self) -> Reference<'_> {
         match self {
             ValOrRef::Val(value) => value.as_reference(),
             ValOrRef::Ref(reference) => reference.clone(),
@@ -76,8 +76,8 @@ impl Display for Error {
             Error::ParseInt(e) => e.fmt(f),
             Error::LengthMismatch => write!(f, "Length does not match"),
             Error::Io(error) => write!(f, "IO error: {error}"),
-            Error::UnknownResp(byte) => write!(f, "Unknown resp type: {}", &byte),
-            Error::InvalidToken(token) => write!(f, "Invalid token: {}", &token),
+            Error::UnknownResp(byte) => write!(f, "Unknown resp type: {}", byte),
+            Error::InvalidToken(token) => write!(f, "Invalid token: {}", token),
         }
     }
 }
@@ -177,7 +177,7 @@ impl Value {
         bytes
     }
 
-    pub fn as_reference(&self) -> Reference {
+    pub fn as_reference(&self) -> Reference<'_> {
         match self {
             Value::SimpleString(value) => Reference::SimpleString(value),
             Value::SimpleError(value) => Reference::SimpleError(value),
@@ -363,7 +363,7 @@ pub enum ParsedValue<'a, C, I> {
     Incomplete(I),
 }
 
-pub fn parse(value: &[u8]) -> Result<ParsedValue<Reference, Parser>, Error> {
+pub fn parse(value: &[u8]) -> Result<ParsedValue<'_, Reference<'_>, Parser>, Error> {
     match expect_value(value)? {
         Some((value_ref, remaining)) => Ok(ParsedValue::Complete(value_ref, remaining)),
         None => {
@@ -431,7 +431,7 @@ impl<'a> Parser {
                 Some((value, remaining)) => (value, remaining),
                 None => return Ok(None),
             },
-            ParserState::None => match value.get(0) {
+            ParserState::None => match value.first() {
                 Some(identifier) => {
                     self.state = ParserState::try_from(*identifier)?;
                     match self.parse(&value[1..])? {
@@ -628,7 +628,7 @@ impl<'a> ArrayParserNonNullable {
 
 fn try_line(iter: impl IntoIterator<Item = u8>) -> Result<Option<usize>, Error> {
     let mut iter = iter.into_iter().enumerate();
-    if let None = iter.find(|(_, b)| *b == b'\r') {
+    if iter.find(|(_, b)| *b == b'\r').is_none() {
         return Ok(None);
     };
     let lf_pos = match iter.next() {
@@ -668,7 +668,7 @@ fn expect_line(value: &[u8]) -> Result<Option<(&str, &[u8])>, Error> {
     Ok(Some((line, remaining)))
 }
 
-fn expect_simple_string(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+fn expect_simple_string(value: &[u8]) -> Result<Option<(Reference<'_>, &[u8])>, Error> {
     let (line, remaining) = match expect_line(value)? {
         Some((line, remaining)) => (line, remaining),
         None => return Ok(None),
@@ -677,7 +677,7 @@ fn expect_simple_string(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Erro
     Ok(Some((Reference::SimpleString(line), remaining)))
 }
 
-fn expect_simple_error(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+fn expect_simple_error(value: &[u8]) -> Result<Option<(Reference<'_>, &[u8])>, Error> {
     let (line, remaining) = match expect_line(value)? {
         Some((line, remaining)) => (line, remaining),
         None => return Ok(None),
@@ -700,7 +700,7 @@ fn expect_unsigned_length(value: &[u8]) -> Result<Option<(u64, &[u8])>, Error> {
     }
 }
 
-fn expect_integer(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+fn expect_integer(value: &[u8]) -> Result<Option<(Reference<'_>, &[u8])>, Error> {
     let (integer, remaining) = match expect_signed_length(value)? {
         Some((line, remaining)) => (line, remaining),
         None => return Ok(None),
@@ -709,7 +709,7 @@ fn expect_integer(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
     Ok(Some((Reference::Integer(integer), remaining)))
 }
 
-fn expect_bulk_string(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+fn expect_bulk_string(value: &[u8]) -> Result<Option<(Reference<'_>, &[u8])>, Error> {
     let (length, remaining) = match expect_signed_length(value)? {
         Some((length, remaining)) => (length, remaining),
         None => return Ok(None),
@@ -730,7 +730,7 @@ fn expect_bulk_string(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error>
     Ok(Some((Reference::BulkString(string), remaining)))
 }
 
-fn expect_array(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+fn expect_array(value: &[u8]) -> Result<Option<(Reference<'_>, &[u8])>, Error> {
     let (length, mut remaining) = match expect_signed_length(value)? {
         Some((length, remaining)) => (length, remaining),
         None => return Ok(None),
@@ -753,7 +753,7 @@ fn expect_array(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
     Ok(Some((Reference::Array(items), remaining)))
 }
 
-fn expect_push(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+fn expect_push(value: &[u8]) -> Result<Option<(Reference<'_>, &[u8])>, Error> {
     let (length, mut remaining) = match expect_unsigned_length(value)? {
         Some((length, remaining)) => (length, remaining),
         None => return Ok(None),
@@ -773,7 +773,7 @@ fn expect_push(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
     Ok(Some((Reference::Push(items), remaining)))
 }
 
-fn expect_value(value: &[u8]) -> Result<Option<(Reference, &[u8])>, Error> {
+fn expect_value(value: &[u8]) -> Result<Option<(Reference<'_>, &[u8])>, Error> {
     if value.is_empty() {
         return Ok(None);
     }

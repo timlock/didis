@@ -9,7 +9,7 @@ static ID: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(0));
 fn next_id() -> u64 {
     let mut guard = ID.lock().unwrap();
     guard.add_assign(1);
-    guard.clone()
+    *guard
 }
 
 #[derive(Debug)]

@@ -84,7 +84,7 @@ impl Server {
                 self.publish_messages()?;
             }
 
-            for (_, connection) in &mut self.connections {
+            for connection in self.connections.values_mut() {
                 connection.flush(io)?;
             }
 
@@ -132,13 +132,8 @@ impl Server {
         sent: usize,
         client_id: u64,
     ) {
-        let connection = self.connections.get_mut(&client_id).expect(
-            format![
-                "Send data to unknown socket with file descriptor: {}",
-                stream.as_raw_fd()
-            ]
-            .as_str(),
-        );
+        let connection = self.connections.get_mut(&client_id).unwrap_or_else(|| panic!("Send data to unknown socket with file descriptor: {}",
+                stream.as_raw_fd()));
 
         info!(
             "Sent {} bytes to client, remaining bytes {}",
@@ -155,13 +150,8 @@ impl Server {
         received: usize,
         client_id: u64,
     ) -> io::Result<()> {
-        let connection = self.connections.get_mut(&client_id).expect(
-            format![
-                "Received data from unknown socket with file descriptor: {}",
-                stream.as_raw_fd()
-            ]
-            .as_str(),
-        );
+        let connection = self.connections.get_mut(&client_id).unwrap_or_else(|| panic!("Received data from unknown socket with file descriptor: {}",
+                stream.as_raw_fd()));
 
         if received == 0 {
             self.connections.remove(&client_id);

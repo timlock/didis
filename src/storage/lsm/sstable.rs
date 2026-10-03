@@ -274,7 +274,7 @@ impl SSTableReader {
         Ok((header_offset, u64::from_le_bytes(first_index_offset_bytes)))
     }
 
-    pub fn index_iter(&mut self) -> io::Result<SSTableIndexIter<BufReader<File>>> {
+    pub fn index_iter(&mut self) -> io::Result<SSTableIndexIter<'_, BufReader<File>>> {
         let (header_offset, first_index_offset) = self.area_offsets()?;
 
         let index_block_iter = IndexBlockIter::new(&mut self.file, first_index_offset)?;
@@ -285,7 +285,7 @@ impl SSTableReader {
         })
     }
 
-    pub fn data_iter(&mut self) -> Result<SSTableDataIter<BufReader<File>>, Error> {
+    pub fn data_iter(&mut self) -> Result<SSTableDataIter<'_, BufReader<File>>, Error> {
         let (_, first_index_offset) = self.area_offsets()?;
         self.file.rewind()?;
 
@@ -509,12 +509,12 @@ where
 }
 
 fn calculate_padding(stream_pos: u64) -> u64 {
-    let padding = if stream_pos % BLOCK_SIZE as u64 == 0 {
+    
+    if stream_pos.is_multiple_of(BLOCK_SIZE as u64) {
         0
     } else {
         BLOCK_SIZE as u64 - (stream_pos % BLOCK_SIZE as u64)
-    };
-    padding
+    }
 }
 
 #[cfg(test)]

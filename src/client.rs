@@ -96,6 +96,6 @@ impl Client {
     }
 
     pub fn published(&mut self) -> Vec<Value> {
-        self.published.drain(..).collect()
+        std::mem::take(&mut self.published)
     }
 }

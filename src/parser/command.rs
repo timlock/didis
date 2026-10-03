@@ -403,10 +403,10 @@ impl<'a> TryFrom<ValOrRef<'a>> for Command<'a> {
     fn try_from(value: ValOrRef<'a>) -> Result<Self, Self::Error> {
         let mut iter: VecDeque<ValOrRef> = match value {
             ValOrRef::Val(Value::Array(values)) => {
-                values.into_iter().map(|v| ValOrRef::Val(v)).collect()
+                values.into_iter().map(ValOrRef::Val).collect()
             }
             ValOrRef::Ref(Reference::Array(references)) => {
-                references.into_iter().map(|r| ValOrRef::Ref(r)).collect()
+                references.into_iter().map(ValOrRef::Ref).collect()
             }
             other => return Err(Error::ExpectedArray(other.to_value())),
         };
@@ -668,7 +668,7 @@ impl<'a> Parser {
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    commands.push(Err(err.into()));
+                    commands.push(Err(err));
                 }
             };
         }

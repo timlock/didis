@@ -95,11 +95,7 @@ impl<'a> FlagSet<'a> {
     pub fn parse(&mut self, args: impl IntoIterator<Item = String>) -> Result<(), FlagError> {
         let mut iter = args.into_iter();
 
-        loop {
-            let name = match iter.next() {
-                Some(f) => f,
-                None => break,
-            };
+        while let Some(name) = iter.next() {
 
             if !name.starts_with('-') {
                 self.args.push(name);
@@ -113,7 +109,7 @@ impl<'a> FlagSet<'a> {
             }
 
             let stripped = match name.strip_prefix("-") {
-                Some(single) => single.strip_prefix("-").unwrap_or_else(|| single),
+                Some(single) => single.strip_prefix("-").unwrap_or(single),
                 None => panic!("At this point the name should start with a hyphen"),
             };
 
@@ -134,7 +130,7 @@ impl<'a> FlagSet<'a> {
                     .get_mut(stripped)
                     .ok_or(FlagError::UnknownFlag(stripped.to_owned()))?;
 
-                if let Err(_) = flag.value.try_activate() {
+                if flag.value.try_activate().is_err() {
                     let value = match iter.next() {
                         Some(v) => v,
                         None => return Err(FlagError::NoValue(stripped.to_owned())),

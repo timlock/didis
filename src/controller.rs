@@ -28,7 +28,7 @@ impl Controller {
             last_save,
         }
     }
-    pub fn handle_command(&mut self, client_id: u64, command: Command) -> Option<ValOrRef> {
+    pub fn handle_command(&mut self, client_id: u64, command: Command) -> Option<ValOrRef<'_>> {
         let result: ValOrRef = match command {
             Command::Ping(None) => Reference::SimpleString("PONG").into(),
             Command::Ping(Some(text)) => Value::BulkString(text.into_owned()).into(),
@@ -260,18 +260,15 @@ impl Controller {
             result?;
         }
 
-        match self.background_jobs.pop_if_scheduled() {
-            Some(_) => {
-                return if scheduled {
-                    self.background_jobs.push_scheduled();
-                    Ok(false)
-                } else {
-                    Err(Value::simple_error(
-                        "There is already a save process running",
-                    ))
-                };
-            }
-            None => {}
+        if self.background_jobs.pop_if_scheduled().is_some() {
+            return if scheduled {
+                self.background_jobs.push_scheduled();
+                Ok(false)
+            } else {
+                Err(Value::simple_error(
+                    "There is already a save process running",
+                ))
+            };
         }
 
         let process_id = self.do_background_save()?;
@@ -284,7 +281,7 @@ impl Controller {
             result?;
         }
 
-        if let None = self.background_jobs.pop_if_scheduled() {
+        if self.background_jobs.pop_if_scheduled().is_none() {
             return Ok(());
         }
 
@@ -346,7 +343,7 @@ impl JobQueue {
     fn pop_if_done(&mut self) -> Option<io::Result<BackgroundJob>> {
         if let Some(job) = self.inner.front() {
             return match job.status() {
-                Ok(JobStatus::Done) => self.inner.pop_front().map(|job| Ok(job)),
+                Ok(JobStatus::Done) => self.inner.pop_front().map(Ok),
                 Err(err) => Some(Err(err)),
                 _ => None,
             };

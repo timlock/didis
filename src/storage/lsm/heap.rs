@@ -43,7 +43,7 @@ where
             return;
         }
 
-        while index != 0 && &self.inner[index].0 < &self.inner[parent(index)].0 {
+        while index != 0 && self.inner[index].0 < self.inner[parent(index)].0 {
             self.inner.swap(index, parent(index));
             index = parent(index);
         }
@@ -59,7 +59,7 @@ where
                 (Some(_), None) => left_child(index),
                 (None, Some(_)) => right_child(index),
                 (Some(_), Some(_)) => {
-                    if &self.inner[left_child(index)].0 < &self.inner[right_child(index)].0 {
+                    if self.inner[left_child(index)].0 < self.inner[right_child(index)].0 {
                         left_child(index)
                     } else {
                         right_child(index)
@@ -67,7 +67,7 @@ where
                 }
             };
 
-            if &self.inner[index].0 > &self.inner[smaller_child].0 {
+            if self.inner[index].0 > self.inner[smaller_child].0 {
                 self.inner.swap(index, smaller_child);
                 index = smaller_child;
             } else {

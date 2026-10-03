@@ -44,10 +44,7 @@ impl Dictionary {
     }
 
     pub fn delete(&mut self, key: &str) -> bool {
-        match self.inner.remove(key) {
-            Some(_) => true,
-            None => false,
-        }
+        self.inner.remove(key).is_some()
     }
 
     pub fn increment(&mut self, key: &str, by: i64) -> Result<i64, Error> {
@@ -193,7 +190,7 @@ impl Dictionary {
     }
 
     fn get_string_or_insert_mut(&mut self, key: &str, value: &str) -> Result<&mut String, Error> {
-        if let None = self.inner.get(key) {
+        if self.inner.get(key).is_none() {
             self.inner.insert(
                 key.to_string(),
                 Entry::new(EntryType::String(String::from(value)), None),
@@ -205,7 +202,7 @@ impl Dictionary {
     }
 
     fn get_list_or_insert_mut(&mut self, key: &str) -> Result<&mut VecDeque<String>, Error> {
-        if let None = self.inner.get(key) {
+        if self.inner.get(key).is_none() {
             self.inner.insert(
                 key.to_string(),
                 Entry::new(EntryType::List(Default::default()), None),
@@ -254,8 +251,7 @@ impl Dictionary {
 
 fn to_range_index(relative_index: i64, max: usize) -> usize {
     if relative_index < 0 {
-        max.checked_sub(relative_index.abs() as usize)
-            .unwrap_or_default()
+        max.saturating_sub(relative_index.unsigned_abs() as usize)
     } else {
         min(max - 1, relative_index as usize)
     }
@@ -414,7 +410,7 @@ fn increment(string: &mut String, by: i64) -> Result<i64, Error> {
     let mut integer_value: i64 = string.parse().map_err(|_| Error::NoInteger)?;
     integer_value = integer_value
         .checked_add(by)
-        .ok_or_else(|| Error::NoInteger)?;
+        .ok_or(Error::NoInteger)?;
     *string = integer_value.to_string();
 
     Ok(integer_value)
@@ -424,7 +420,7 @@ fn decrement(string: &mut String, by: i64) -> Result<i64, Error> {
     let mut integer_value: i64 = string.parse().map_err(|_| Error::NoInteger)?;
     integer_value = integer_value
         .checked_sub(by)
-        .ok_or_else(|| Error::NoInteger)?;
+        .ok_or(Error::NoInteger)?;
     *string = integer_value.to_string();
 
     Ok(integer_value)

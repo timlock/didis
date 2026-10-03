@@ -1,13 +1,13 @@
 use crate::storage::lsm::heap::MinHeap;
 use crate::storage::lsm::manifest::{ManifestReader, ManifestWriter};
-use crate::storage::lsm::sstable::{SSTable, SSTableDataIter, SSTableReader, SSTableWriter};
+use crate::storage::lsm::sstable::{SSTable, SSTableReader, SSTableWriter};
 use crate::storage::lsm::wal::{WriteAheadLogReader, WriteAheadLogWriter};
-use crate::storage::lsm::{Error, Operation, manifest};
+use crate::storage::lsm::{Error, Operation};
 use log::info;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufRead, ErrorKind, Seek};
+use std::io::ErrorKind;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -44,7 +44,7 @@ impl IdGenerator {
 #[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
-    levels: BTreeMap<u64, Vec<(SSTable)>>,
+    levels: BTreeMap<u64, Vec<SSTable>>,
     id_generator: IdGenerator,
 
     write_ahead_log: WriteAheadLogWriter,

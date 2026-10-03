@@ -43,7 +43,7 @@ impl WriteAheadLogWriter {
     pub fn open(wal_path: &Path) -> io::Result<WriteAheadLogWriter> {
         info!("Opening / Creating write ahead log");
         let wal_file = OpenOptions::new()
-            .write(true)
+            
             .append(true)
             .create(true)
             .open(wal_path)?;
@@ -72,10 +72,7 @@ impl WriteAheadLogWriter {
 
 fn peek_byte<R: BufRead + Seek>(source: &mut R) -> io::Result<Option<u8>> {
     let mut buf = [0u8];
-    match source.read(&mut buf)? {
-        0 => return Ok(None),
-        _ => {}
-    };
+    if source.read(&mut buf)? == 0 { return Ok(None) };
 
     source.seek_relative(-1)?;
 

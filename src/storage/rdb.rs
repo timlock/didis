@@ -11,7 +11,7 @@ use std::string::FromUtf8Error;
 use std::time::{SystemTime, SystemTimeError};
 use log::info;
 
-const MAGIC_NUMBER: &'static [u8] = b"REDIS";
+const MAGIC_NUMBER: &[u8] = b"REDIS";
 
 const RDB_VERSION: &[u8] = b"0007";
 
@@ -27,7 +27,7 @@ pub trait Dump {
     fn memory_usage(&self) -> &str;
     fn dump_iter(
         &self,
-    ) -> impl Iterator<Item = (u8, impl Iterator<Item = (&str, Reference)> + Clone)>;
+    ) -> impl Iterator<Item = (u8, impl Iterator<Item = (&str, Reference<'_>)> + Clone)>;
 }
 
 pub fn write_dump(dump: impl Dump, writer: &mut impl Write) -> Result<(), Error> {
@@ -310,8 +310,8 @@ fn parse_auxiliary_fields<I: Iterator<Item = u8>>(
 fn try_timestamp<I: Iterator<Item = u8>>(
     iter: &mut Peekable<I>,
 ) -> Result<Option<Timestamp>, Error> {
-    match iter.peek().ok_or(Error::Truncated)? {
-        &EXPIRETIME => {
+    match *iter.peek().ok_or(Error::Truncated)? {
+        EXPIRETIME => {
             iter.next()
                 .expect("when peek() returns Some(..) next() should also return Some(..)");
             let bytes = [
@@ -323,7 +323,7 @@ fn try_timestamp<I: Iterator<Item = u8>>(
             let seconds = u32::from_le_bytes(bytes);
             Ok(Some(Timestamp::Seconds(seconds)))
         }
-        &EXPIRETIMEMS => {
+        EXPIRETIMEMS => {
             iter.next()
                 .expect("when peek() returns Some(..) next() should also return Some(..)");
             let bytes = [
@@ -496,7 +496,7 @@ fn encode_string(string: &str) -> Result<Vec<u8>, LzfError> {
 
         Ok(bytes)
     } else if let Ok(i) = string.parse::<i32>() {
-        return Ok(encode_integer(i));
+        Ok(encode_integer(i))
     } else {
         let mut bytes = Size::Length(string.len()).encode();
         bytes.extend_from_slice(string.as_bytes());
