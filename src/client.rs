@@ -1,6 +1,6 @@
-use crate::parser::command::Command;
-use crate::parser::resp;
-use crate::parser::resp::Value;
+use crate::command::Command;
+use crate::resp;
+use crate::resp::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;

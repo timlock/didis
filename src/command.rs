@@ -1,6 +1,6 @@
-use super::resp;
 use crate::dictionary::Timestamp;
-use crate::parser::resp::{parse, ParsedValue, Reference, ValOrRef, Value};
+use crate::resp;
+use crate::resp::{ParsedValue, Reference, ValOrRef, Value, parse};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug, Display, Formatter};

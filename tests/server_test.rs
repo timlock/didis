@@ -1,3 +1,8 @@
+use didis::async_io::IO;
+use didis::client::Client;
+use didis::command::{Command, OverwriteRule};
+use didis::resp::Value;
+use didis::server::{BUFFER_SIZE, Server};
 use std::borrow::Cow;
 use std::net::{SocketAddr, TcpStream};
 use std::str::FromStr;
@@ -6,11 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use didis::async_io::IO;
-use didis::client::Client;
-use didis::parser::command::{Command, OverwriteRule};
-use didis::parser::resp::Value;
-use didis::server::{Server, BUFFER_SIZE};
 
 fn launch_server(address: SocketAddr) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let mut server = Server::new(address);

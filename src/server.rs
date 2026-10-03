@@ -1,7 +1,7 @@
 use crate::async_io::{AsyncIO, Completion};
+use crate::command::Parser;
 use crate::controller::Controller;
-use crate::parser::command::Parser;
-use crate::parser::resp::Value;
+use crate::resp::Value;
 use log::{error, info, warn};
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};

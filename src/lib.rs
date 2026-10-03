@@ -2,7 +2,6 @@ pub mod async_io;
 pub mod controller;
 pub mod dictionary;
 pub mod flags;
-pub mod parser;
 pub mod replication;
 pub mod server;
 pub mod client;
@@ -11,3 +10,6 @@ pub mod storage;
 pub mod temp_dir;
 
 pub mod logger;
+mod heap;
+pub mod command;
+pub mod resp;

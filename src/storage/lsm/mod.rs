@@ -1,4 +1,3 @@
-mod heap;
 mod manifest;
 mod sstable;
 pub mod storage;

@@ -1,4 +1,4 @@
-use crate::storage::lsm::heap::MinHeap;
+use crate::heap::MinHeap;
 use crate::storage::lsm::manifest::{ManifestReader, ManifestWriter};
 use crate::storage::lsm::sstable::{SSTable, SSTableReader, SSTableWriter};
 use crate::storage::lsm::wal::{WriteAheadLogReader, WriteAheadLogWriter};
