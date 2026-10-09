@@ -1,6 +1,7 @@
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::iter;
+use std::mem::take;
 
 #[derive(Debug)]
 pub struct RadixTree<V> {
@@ -16,15 +17,6 @@ impl<V> RadixTree<V> {
     pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
         self.root.get_mut(key)
     }
-
-    pub fn first_key_value(&mut self) -> Option<(String, &V)> {
-        self.root.first_key_value()
-    }
-
-    pub fn last_key_value(&mut self) -> Option<(String, &V)> {
-        self.root.last_key_value()
-    }
-
     pub fn insert(&mut self, key: String, value: V) -> Option<V> {
         match self.root.put(key, value) {
             Some(old_value) => Some(old_value),
@@ -120,54 +112,6 @@ impl<V> Node<V> {
         current.value.as_mut()
     }
 
-    fn first_key_value(&self) -> Option<(String, &V)> {
-        if self.children.is_empty() {
-            return None;
-        }
-        let mut current = self;
-        let mut key = String::new();
-
-        loop {
-            if let Some(next) = current
-                .children
-                .iter()
-                .filter(|n| n.value.is_some())
-                .min_by(|a, b| a.label.cmp(&b.label))
-            {
-                key += next.label.as_str();
-                return Some((key, next.value.as_ref().unwrap()));
-            } else if let Some(next) = current.children.iter().min_by(|a, b| a.label.cmp(&b.label))
-            {
-                current = next;
-                key += next.label.as_str();
-            } else {
-                break;
-            }
-        }
-
-        let value = current.value.as_ref()?;
-
-        Some((key, value))
-    }
-
-    fn last_key_value(&self) -> Option<(String, &V)> {
-        if self.children.is_empty() {
-            return None;
-        }
-
-        let mut current = self;
-        let mut key = String::new();
-
-        while let Some(next) = current.children.iter().max_by(|a, b| a.label.cmp(&b.label)) {
-            current = next;
-            key += next.label.as_str();
-        }
-
-        let value = current.value.as_ref()?;
-
-        Some((key, value))
-    }
-
     fn put(&mut self, key: String, value: V) -> Option<V> {
         let mut remaining = key;
         let mut current = self;
@@ -178,6 +122,7 @@ impl<V> Node<V> {
                 .iter_mut()
                 .map(|n| shared_prefix(&remaining, &n.label))
                 .enumerate()
+                .filter(|(_, p)| !p.is_empty())
                 .max_by_key(|(_, p)| p.len());
 
             let (i, prefix_len) = match candidate {
@@ -224,13 +169,13 @@ impl<V> Node<V> {
     }
 }
 
-impl<'a, V> IntoIterator for &'a RadixTree<V> {
-    type Item = (String, &'a V);
-    type IntoIter = RadixTreeIter<'a, V>;
+impl<V> IntoIterator for RadixTree<V> {
+    type Item = (String, V);
+    type IntoIter = RadixTreeIter<V>;
 
     fn into_iter(self) -> Self::IntoIter {
         let mut to_visit = VecDeque::new();
-        to_visit.push_front((&self.root, false));
+        to_visit.push_front((self.root, false));
 
         RadixTreeIter {
             to_visit,
@@ -239,36 +184,40 @@ impl<'a, V> IntoIterator for &'a RadixTree<V> {
     }
 }
 
-pub struct RadixTreeIter<'a, V> {
-    to_visit: VecDeque<(&'a Node<V>, bool)>,
+pub struct RadixTreeIter<V> {
+    to_visit: VecDeque<(Node<V>, bool)>,
     label: String,
 }
 
-impl<'a, V> Iterator for RadixTreeIter<'a, V> {
-    type Item = (String, &'a V);
+impl<V> Iterator for RadixTreeIter<V> {
+    type Item = (String, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next = loop {
-            let (node, fully_visited) = self.to_visit.front_mut()?;
-            if *fully_visited {
-                self.label.truncate(self.label.len() - node.label.len());
-                self.to_visit.pop_front().unwrap();
-            } else {
-                *fully_visited = true;
-                break self.to_visit.front()?.0;
+        let mut next;
+
+        loop {
+            next = loop {
+                let (node, fully_visited) = self.to_visit.pop_front()?;
+                if fully_visited {
+                    self.label.truncate(self.label.len() - node.label.len());
+                } else {
+                    break node;
+                }
+            };
+
+            let children = take(&mut next.children);
+            self.label += next.label.as_str();
+            let value = next.value.take();
+
+            self.to_visit.push_front((next, true));
+
+            for child in children.into_iter().rev() {
+                self.to_visit.push_front((child, false));
             }
-        };
 
-        for child in next.children.iter().rev() {
-            self.to_visit.push_front((child, false));
-        }
-
-        self.label += next.label.as_str();
-
-        //TODO remove recursiveness
-        match &next.value {
-            Some(value) => Some((self.label.clone(), value)),
-            None => self.next(),
+            if let Some(value) = value {
+                return Some((self.label.clone(), value));
+            }
         }
     }
 }
@@ -303,7 +252,7 @@ mod test {
     fn single_insert() {
         let mut tree = RadixTree::default();
         tree.insert("value".to_string(), "value".to_string());
-        assert_eq!(Some("value"), tree.get("value").map(String::as_str));
+        assert_eq!(Some(&"value".to_string()), tree.get("value"));
         assert_eq!(1, tree.len());
     }
 
@@ -321,7 +270,7 @@ mod test {
     }
 
     #[test]
-    fn multiple_inserts() {
+    fn insert_in_order() {
         let mut tree = RadixTree::default();
         let values = [
             "romane".to_string(),
@@ -345,15 +294,16 @@ mod test {
         }
 
         let mut iter = tree.into_iter();
-        for value in &values {
+        for value in values {
             assert_eq!(Some((value.clone(), value)), iter.next());
         }
-    }
 
+        assert_eq!(None, iter.next());
+    }
     #[test]
-    fn first_key_value() {
+    fn insert_reverse_order() {
         let mut tree = RadixTree::default();
-        let values = [
+        let mut values = [
             "romane".to_string(),
             "romanus".to_string(),
             "romulus".to_string(),
@@ -363,38 +313,54 @@ mod test {
             "rubicundus".to_string(),
         ];
 
+        values.reverse();
+
         for value in &values {
             tree.insert(value.clone(), value.clone());
+            assert_eq!(Some(value), tree.get(value));
         }
 
-        assert_eq!(
-            Some(("romane".to_string(), "romane")),
-            tree.first_key_value()
-                .map(|(key, value)| (key, value.as_str()))
-        );
+        assert_eq!(values.len(), tree.len());
+
+        for value in &values {
+            assert_eq!(Some(value), tree.get(value));
+        }
+
+        let mut iter = tree.into_iter();
+        for value in values.into_iter().rev() {
+            assert_eq!(Some((value.clone(), value)), iter.next());
+        }
+
+        assert_eq!(None, iter.next());
     }
 
     #[test]
-    fn last_key_value() {
+    fn insert_keys_without_shared_prefix() {
         let mut tree = RadixTree::default();
         let values = [
-            "romane".to_string(),
-            "romanus".to_string(),
-            "romulus".to_string(),
-            "rubens".to_string(),
-            "ruber".to_string(),
-            "rubicon".to_string(),
-            "rubicundus".to_string(),
+            "apple".to_string(),
+            "banana".to_string(),
+            "citrus".to_string(),
+            "dragon fruit".to_string(),
+            "eggplant".to_string(),
         ];
 
         for value in &values {
             tree.insert(value.clone(), value.clone());
+            assert_eq!(Some(value), tree.get(value));
         }
 
-        assert_eq!(
-            Some(("rubicundus".to_string(), "rubicundus")),
-            tree.first_key_value()
-                .map(|(key, value)| (key, value.as_str()))
-        );
+        assert_eq!(values.len(), tree.len());
+
+        for value in &values {
+            assert_eq!(Some(value), tree.get(value));
+        }
+
+        let mut iter = tree.into_iter();
+        for value in values {
+            assert_eq!(Some((value.clone(), value)), iter.next());
+        }
+
+        assert_eq!(None, iter.next());
     }
 }

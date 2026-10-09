@@ -1,4 +1,5 @@
 use crate::heap::MinHeap;
+use crate::radix_tree::RadixTree;
 use crate::storage::lsm::manifest::{ManifestReader, ManifestWriter};
 use crate::storage::lsm::sstable::{SSTable, SSTableReader, SSTableWriter};
 use crate::storage::lsm::wal::{WriteAheadLogReader, WriteAheadLogWriter};
@@ -210,18 +211,6 @@ impl Storage {
 
         let (table, mut writer) = self.create_table(0)?;
 
-        let min = mem_table
-            .inner
-            .first_key_value()
-            .map(|(key, _)| String::from(key))
-            .unwrap_or_default();
-        let max = mem_table
-            .inner
-            .last_key_value()
-            .map(|(key, _)| String::from(key))
-            .unwrap_or_default();
-        table.key_range = min..=max;
-
         let operations = mem_table
             .inner
             .into_iter()
@@ -230,6 +219,19 @@ impl Storage {
                 MemTableValue::Deleted => Operation::Delete(key),
             })
             .collect::<Vec<_>>();
+
+        let min = operations
+            .first()
+            .expect("flush should not be called when mem_table is empty")
+            .key()
+            .to_owned();
+        let max = operations
+            .last()
+            .expect("flush should not be called when mem_table is empty")
+            .key()
+            .to_owned();
+        table.key_range = min..=max;
+
         writer.write_data_blocks(&operations)?;
         writer.write_index_blocks()?;
         self.sync_dir()?;
@@ -452,7 +454,7 @@ impl PartialOrd for MinHeapKey {
 
 #[derive(Default, Debug)]
 struct MemTable {
-    inner: BTreeMap<String, MemTableValue>,
+    inner: RadixTree<MemTableValue>,
 }
 
 impl MemTable {
@@ -466,7 +468,7 @@ impl MemTable {
             return Ok(());
         }
 
-        self.inner.insert(key.to_string(), MemTableValue::Deleted);
+        self.inner.insert(key.to_owned(), MemTableValue::Deleted);
 
         Ok(())
     }
@@ -547,8 +549,8 @@ mod tests {
             (
                 0,
                 vec![
-                    Ok(Operation::Delete("1".to_string())),
-                    Ok(Operation::Delete("2".to_string())),
+                    Ok(Operation::Delete("1".to_owned())),
+                    Ok(Operation::Delete("2".to_owned())),
                 ]
                 .into_iter(),
             ),
@@ -558,8 +560,8 @@ mod tests {
             (
                 0,
                 vec![
-                    Ok(Operation::Delete("1".to_string())),
-                    Ok(Operation::Delete("2".to_string())),
+                    Ok(Operation::Delete("1".to_owned())),
+                    Ok(Operation::Delete("2".to_owned())),
                 ]
                 .into_iter(),
             ),
@@ -569,8 +571,8 @@ mod tests {
             (
                 1,
                 vec![
-                    Ok(Operation::Delete("1".to_string())),
-                    Ok(Operation::Delete("2".to_string())),
+                    Ok(Operation::Delete("1".to_owned())),
+                    Ok(Operation::Delete("2".to_owned())),
                 ]
                 .into_iter(),
             ),
@@ -580,8 +582,8 @@ mod tests {
             (
                 1,
                 vec![
-                    Ok(Operation::Delete("1".to_string())),
-                    Ok(Operation::Delete("2".to_string())),
+                    Ok(Operation::Delete("1".to_owned())),
+                    Ok(Operation::Delete("2".to_owned())),
                 ]
                 .into_iter(),
             ),
@@ -591,11 +593,11 @@ mod tests {
         assert_eq!(
             (
                 MinHeapKey {
-                    key: "1".to_string(),
+                    key: "1".to_owned(),
                     table_id: 4,
                     table_level: 0
                 },
-                Operation::Delete("1".to_string())
+                Operation::Delete("1".to_owned())
             ),
             merger.next().unwrap()?,
         );
@@ -603,11 +605,11 @@ mod tests {
         assert_eq!(
             (
                 MinHeapKey {
-                    key: "2".to_string(),
+                    key: "2".to_owned(),
                     table_id: 4,
                     table_level: 0
                 },
-                Operation::Delete("2".to_string())
+                Operation::Delete("2".to_owned())
             ),
             merger.next().unwrap()?,
         );
