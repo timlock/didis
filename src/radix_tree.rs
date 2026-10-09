@@ -1,6 +1,4 @@
 use std::cmp::min;
-use std::collections::VecDeque;
-use std::iter;
 use std::mem::take;
 
 #[derive(Debug)]
@@ -128,7 +126,7 @@ impl<V> Node<V> {
             let (i, prefix_len) = match candidate {
                 Some((i, prefix)) => (i, prefix.len()),
                 None => {
-                    current.add_children(iter::once(Node::new(remaining, Some(value), Vec::new())));
+                    current.add_child(Node::new(remaining, Some(value), []));
                     return None;
                 }
             };
@@ -138,14 +136,14 @@ impl<V> Node<V> {
             if prefix_len < current.children[i].label.len() {
                 let mut candidate = current.children.remove(i);
                 let new_candidate_label = candidate.label.split_off(prefix_len);
-                current.add_children(iter::once(Node::new(
+                current.add_child(Node::new(
                     candidate.label,
                     None,
-                    vec![
+                    [
                         Node::new(new_candidate_label, candidate.value, candidate.children),
-                        Node::new(remaining, Some(value), Vec::new()),
+                        Node::new(remaining, Some(value), []),
                     ],
-                )));
+                ));
                 return None;
             }
 
@@ -163,8 +161,8 @@ impl<V> Node<V> {
         None
     }
 
-    fn add_children(&mut self, children: impl IntoIterator<Item = Node<V>>) {
-        self.children.extend(children);
+    fn add_child(&mut self, child: Node<V>) {
+        self.children.push(child);
         self.children.sort_by(|a, b| a.label.cmp(&b.label));
     }
 }
@@ -174,8 +172,8 @@ impl<V> IntoIterator for RadixTree<V> {
     type IntoIter = RadixTreeIter<V>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let mut to_visit = VecDeque::new();
-        to_visit.push_front((self.root, false));
+        let mut to_visit = Vec::with_capacity(self.len());
+        to_visit.push((self.root, false));
 
         RadixTreeIter {
             to_visit,
@@ -185,7 +183,8 @@ impl<V> IntoIterator for RadixTree<V> {
 }
 
 pub struct RadixTreeIter<V> {
-    to_visit: VecDeque<(Node<V>, bool)>,
+    // TODO replace Vec with custom stack based on this https://doc.rust-lang.org/nomicon/vec/vec-layout.html
+    to_visit: Vec<(Node<V>, bool)>,
     label: String,
 }
 
@@ -197,7 +196,7 @@ impl<V> Iterator for RadixTreeIter<V> {
 
         loop {
             next = loop {
-                let (node, fully_visited) = self.to_visit.pop_front()?;
+                let (node, fully_visited) = self.to_visit.pop()?;
                 if fully_visited {
                     self.label.truncate(self.label.len() - node.label.len());
                 } else {
@@ -209,10 +208,10 @@ impl<V> Iterator for RadixTreeIter<V> {
             self.label += next.label.as_str();
             let value = next.value.take();
 
-            self.to_visit.push_front((next, true));
+            self.to_visit.push((next, true));
 
             for child in children.into_iter().rev() {
-                self.to_visit.push_front((child, false));
+                self.to_visit.push((child, false));
             }
 
             if let Some(value) = value {
@@ -251,20 +250,20 @@ mod test {
     #[test]
     fn single_insert() {
         let mut tree = RadixTree::default();
-        tree.insert("value".to_string(), "value".to_string());
-        assert_eq!(Some(&"value".to_string()), tree.get("value"));
+        tree.insert("value".to_owned(), "value".to_owned());
+        assert_eq!(Some(&"value".to_owned()), tree.get("value"));
         assert_eq!(1, tree.len());
     }
 
     #[test]
     fn insert_for_existing_key() {
         let mut tree = RadixTree::default();
-        assert_eq!(None, tree.insert("value".to_string(), "value".to_string()));
+        assert_eq!(None, tree.insert("value".to_owned(), "value".to_owned()));
         assert_eq!(1, tree.len());
 
         assert_eq!(
-            Some("value".to_string()),
-            tree.insert("value".to_string(), "updated".to_string())
+            Some("value".to_owned()),
+            tree.insert("value".to_owned(), "updated".to_owned())
         );
         assert_eq!(1, tree.len());
     }
@@ -273,13 +272,13 @@ mod test {
     fn insert_in_order() {
         let mut tree = RadixTree::default();
         let values = [
-            "romane".to_string(),
-            "romanus".to_string(),
-            "romulus".to_string(),
-            "rubens".to_string(),
-            "ruber".to_string(),
-            "rubicon".to_string(),
-            "rubicundus".to_string(),
+            "romane".to_owned(),
+            "romanus".to_owned(),
+            "romulus".to_owned(),
+            "rubens".to_owned(),
+            "ruber".to_owned(),
+            "rubicon".to_owned(),
+            "rubicundus".to_owned(),
         ];
 
         for value in &values {
@@ -304,13 +303,13 @@ mod test {
     fn insert_reverse_order() {
         let mut tree = RadixTree::default();
         let mut values = [
-            "romane".to_string(),
-            "romanus".to_string(),
-            "romulus".to_string(),
-            "rubens".to_string(),
-            "ruber".to_string(),
-            "rubicon".to_string(),
-            "rubicundus".to_string(),
+            "romane".to_owned(),
+            "romanus".to_owned(),
+            "romulus".to_owned(),
+            "rubens".to_owned(),
+            "ruber".to_owned(),
+            "rubicon".to_owned(),
+            "rubicundus".to_owned(),
         ];
 
         values.reverse();
@@ -338,11 +337,11 @@ mod test {
     fn insert_keys_without_shared_prefix() {
         let mut tree = RadixTree::default();
         let values = [
-            "apple".to_string(),
-            "banana".to_string(),
-            "citrus".to_string(),
-            "dragon fruit".to_string(),
-            "eggplant".to_string(),
+            "apple".to_owned(),
+            "banana".to_owned(),
+            "citrus".to_owned(),
+            "dragon fruit".to_owned(),
+            "eggplant".to_owned(),
         ];
 
         for value in &values {
