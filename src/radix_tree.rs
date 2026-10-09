@@ -66,7 +66,7 @@ impl<V> Node<V> {
     fn new(
         label: String,
         value: Option<V>,
-        children: impl IntoIterator<Item = Node<V>>,
+        children: impl IntoIterator<Item=Node<V>>,
     ) -> Node<V> {
         let mut node = Node {
             label,
@@ -163,7 +163,7 @@ impl<V> Node<V> {
         None
     }
 
-    fn add_children(&mut self, children: impl IntoIterator<Item = Node<V>>) {
+    fn add_children(&mut self, children: impl IntoIterator<Item=Node<V>>) {
         self.children.extend(children);
         self.children.sort_by(|a, b| a.label.cmp(&b.label));
     }
@@ -185,6 +185,7 @@ impl<V> IntoIterator for RadixTree<V> {
 }
 
 pub struct RadixTreeIter<V> {
+    // TODO replace VecDeque with custom stack based on this https://doc.rust-lang.org/nomicon/vec/vec-layout.html and make this mod #![no_std]
     to_visit: VecDeque<(Node<V>, bool)>,
     label: String,
 }
