@@ -166,7 +166,7 @@ impl ManifestWriter {
 fn parse_table_id(value: &str) -> Result<u64, Error> {
     value
         .strip_prefix("TABLE_")
-        .ok_or_else(|| Error::InvalidTableName(value.to_string()))?
+        .ok_or_else(|| Error::InvalidTableName(value.to_owned()))?
         .parse::<u64>()
         .map_err(|err| err.into())
 }

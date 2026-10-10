@@ -1,11 +1,9 @@
+use didis::logger;
+use didis::storage::lsm::storage::Storage;
+use didis::temp_dir::TempDir;
 use log::Level;
 use std::sync::Once;
 use std::{env, error};
-use std::collections::HashMap;
-use didis::logger;
-use didis::storage::lsm::Operation;
-use didis::storage::lsm::storage::Storage;
-use didis::temp_dir::TempDir;
 
 static PUT_FILE: &str = include_str!("testdata/put.txt");
 static PUT_DELETE_FILE: &str = include_str!("testdata/put-delete.txt");
@@ -14,7 +12,7 @@ static INIT: Once = Once::new();
 
 fn initialize() {
     INIT.call_once(|| {
-        logger::init(Level::Info).unwrap();
+        let _ = logger::init(Level::Info); // returns err when logger is already initialized, can be ignored
     });
 }
 
@@ -139,13 +137,13 @@ fn data_survives_crash_before_flush() -> Result<(), Box<dyn error::Error>> {
     let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
     let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 5)?;
 
-    storage.insert("one".to_string(), "value one".to_string())?;
-    storage.insert("two".to_string(), "value two".to_string())?;
-    storage.delete("two".to_string())?;
+    storage.insert("one".to_owned(), "value one".to_owned())?;
+    storage.insert("two".to_owned(), "value two".to_owned())?;
+    storage.delete("two".to_owned())?;
 
     let mut storage = Storage::new(temp_dir.path().to_path_buf(), 10, 5)?;
 
-    assert_eq!(Some("value one".to_string()), storage.get("one")?);
+    assert_eq!(Some("value one".to_owned()), storage.get("one")?);
     assert_eq!(None, storage.get("two")?);
 
     Ok(())
@@ -157,21 +155,21 @@ fn compaction() -> Result<(), Box<dyn error::Error>> {
     let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
     let mut storage = Storage::new(temp_dir.path().to_path_buf(), 2, 2)?;
 
-    storage.insert("1".to_string(), "one".to_string())?;
-    storage.insert("2".to_string(), "two".to_string())?;
-    storage.insert("3".to_string(), "three".to_string())?;
-    storage.insert("4".to_string(), "four".to_string())?;
-    storage.insert("5".to_string(), "five".to_string())?;
-    storage.delete("2".to_string())?;
+    storage.insert("1".to_owned(), "one".to_owned())?;
+    storage.insert("2".to_owned(), "two".to_owned())?;
+    storage.insert("3".to_owned(), "three".to_owned())?;
+    storage.insert("4".to_owned(), "four".to_owned())?;
+    storage.insert("5".to_owned(), "five".to_owned())?;
+    storage.delete("2".to_owned())?;
     assert_eq!(None, storage.get("2")?);
-    storage.insert("2".to_string(), "two".to_string())?;
-    storage.insert("3".to_string(), "updated three".to_string())?;
+    storage.insert("2".to_owned(), "two".to_owned())?;
+    storage.insert("3".to_owned(), "updated three".to_owned())?;
 
-    assert_eq!(Some("one".to_string()), storage.get("1")?);
-    assert_eq!(Some("two".to_string()), storage.get("2")?);
-    assert_eq!(Some("updated three".to_string()), storage.get("3")?);
-    assert_eq!(Some("four".to_string()), storage.get("4")?);
-    assert_eq!(Some("five".to_string()), storage.get("5")?);
+    assert_eq!(Some("one".to_owned()), storage.get("1")?);
+    assert_eq!(Some("two".to_owned()), storage.get("2")?);
+    assert_eq!(Some("updated three".to_owned()), storage.get("3")?);
+    assert_eq!(Some("four".to_owned()), storage.get("4")?);
+    assert_eq!(Some("five".to_owned()), storage.get("5")?);
 
     Ok(())
 }

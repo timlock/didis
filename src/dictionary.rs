@@ -91,7 +91,7 @@ impl Dictionary {
             .and_then(|r| r.calculate_expire_time(old_expires_at));
 
         self.inner.insert(
-            key.to_string(),
+            key.to_owned(),
             Entry::new(EntryType::String(value), expires_at),
         );
 
@@ -192,7 +192,7 @@ impl Dictionary {
     fn get_string_or_insert_mut(&mut self, key: &str, value: &str) -> Result<&mut String, Error> {
         if self.inner.get(key).is_none() {
             self.inner.insert(
-                key.to_string(),
+                key.to_owned(),
                 Entry::new(EntryType::String(String::from(value)), None),
             );
         }
@@ -204,7 +204,7 @@ impl Dictionary {
     fn get_list_or_insert_mut(&mut self, key: &str) -> Result<&mut VecDeque<String>, Error> {
         if self.inner.get(key).is_none() {
             self.inner.insert(
-                key.to_string(),
+                key.to_owned(),
                 Entry::new(EntryType::List(Default::default()), None),
             );
         }

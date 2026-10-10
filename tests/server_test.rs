@@ -1,46 +1,60 @@
 use didis::async_io::IO;
 use didis::client::Client;
 use didis::command::{Command, OverwriteRule};
+use didis::logger;
 use didis::resp::Value;
-use didis::server::{BUFFER_SIZE, Server};
+use didis::server::{BUFFER_SIZE, Server, ServerHandle};
+use log::Level;
 use std::borrow::Cow;
 use std::net::{SocketAddr, TcpStream};
+use std::ops::AddAssign;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, Once};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-fn launch_server(address: SocketAddr) -> (Arc<AtomicBool>, JoinHandle<()>) {
-    let mut server = Server::new(address);
-    let server_handle = server.handle();
+static INIT: Once = Once::new();
 
-    let thread_launched = Arc::new(AtomicBool::new(false));
-    let thread_launched_clone = thread_launched.clone();
+fn initialize() {
+    INIT.call_once(|| {
+        let _ = logger::init(Level::Info); // returns err when logger is already initialized, can be ignored
+    });
+}
+
+static PORT: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(10000));
+
+fn next_port() -> u64 {
+    let mut guard = PORT.lock().unwrap();
+    guard.add_assign(1);
+    *guard
+}
+
+fn launch_server() -> (SocketAddr, ServerHandle, JoinHandle<()>) {
+    let address = SocketAddr::from_str(format!("127.0.0.1:{}", next_port()).as_str()).unwrap();
+    let mut server = Server::new(address);
+    let mut server_handle = server.handle();
 
     let thread_handle = thread::spawn(move || {
         println!("Server thread launched");
 
         let mut io = IO::new(256).unwrap();
 
-        thread_launched_clone.store(true, Ordering::SeqCst);
-
         server.run(&mut io).unwrap();
 
         println!("Server thread closed");
     });
 
-    while !thread_launched.load(Ordering::SeqCst) {}
+    server_handle.wait_until_listening().unwrap();
 
-    (server_handle, thread_handle)
+    (address, server_handle, thread_handle)
 }
 
 #[test]
 fn set_value() -> Result<(), Box<dyn std::error::Error>> {
-    let address = SocketAddr::from_str("127.0.0.1:10001")?;
+    initialize();
 
-    let (server_handle, thread_handle) = launch_server(address);
+    let (address, server_handle, thread_handle) = launch_server();
 
     println!("Connecting to server on {}", address);
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -52,8 +66,8 @@ fn set_value() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(Value::Null, response);
 
     let set_cmd = Command::Set {
-        key: Cow::Owned("Key".to_string()),
-        value: Cow::Owned("Value".to_string()),
+        key: Cow::Owned("Key".to_owned()),
+        value: Cow::Owned("Value".to_owned()),
         overwrite_rule: None,
         get: false,
         expire_rule: None,
@@ -73,16 +87,16 @@ fn set_value() -> Result<(), Box<dyn std::error::Error>> {
     let response = client.send(get_cmd)?;
     assert_eq!(Value::Integer(1), response);
 
-    server_handle.store(true, Ordering::SeqCst);
+    server_handle.stop();
     thread_handle.join().unwrap();
 
     Ok(())
 }
 #[test]
 fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
-    let address = SocketAddr::from_str("127.0.0.1:10002")?;
+    initialize();
 
-    let (server_handle, thread_handle) = launch_server(address);
+    let (address, server_handle, thread_handle) = launch_server();
 
     println!("Connecting to server on {}", address);
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -134,7 +148,7 @@ fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
         response[6]
     );
 
-    server_handle.store(true, Ordering::SeqCst);
+    server_handle.stop();
     thread_handle.join().unwrap();
 
     Ok(())
@@ -142,9 +156,9 @@ fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
-    let address = SocketAddr::from_str("127.0.0.1:10003")?;
+    initialize();
 
-    let (server_handle, thread_handle) = launch_server(address);
+    let (address, server_handle, thread_handle) = launch_server();
 
     println!("Connecting to server on {}", address);
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -161,7 +175,7 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let set_cmd = Command::Set {
-        key: Cow::Owned("Key".to_string()),
+        key: Cow::Owned("Key".to_owned()),
         value: Cow::Owned(large_value.clone()),
         overwrite_rule: None,
         get: false,
@@ -174,7 +188,7 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
     let response = client.send(get_cmd)?;
     assert_eq!(Value::BulkString(String::from(large_value)), response);
 
-    server_handle.store(true, Ordering::SeqCst);
+    server_handle.stop();
     thread_handle.join().unwrap();
 
     Ok(())
@@ -182,9 +196,9 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
-    let address = SocketAddr::from_str("127.0.0.1:10004")?;
+    initialize();
 
-    let (server_handle, thread_handle) = launch_server(address);
+    let (address, server_handle, thread_handle) = launch_server();
 
     println!("Connecting to server on {}", address);
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -260,7 +274,7 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
         published[1]
     );
 
-    server_handle.store(true, Ordering::SeqCst);
+    server_handle.stop();
     thread_handle.join().unwrap();
 
     Ok(())
@@ -268,9 +282,9 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
-    let address = SocketAddr::from_str("127.0.0.1:10005")?;
+    initialize();
 
-    let (server_handle, thread_handle) = launch_server(address);
+    let (address, server_handle, thread_handle) = launch_server();
 
     println!("Connecting to server on {}", address);
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -298,8 +312,8 @@ fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(Value::Integer(0), response);
 
     let set_cmd = Command::Set {
-        key: Cow::Owned("faulty".to_string()),
-        value: Cow::Owned("Value".to_string()),
+        key: Cow::Owned("faulty".to_owned()),
+        value: Cow::Owned("Value".to_owned()),
         overwrite_rule: None,
         get: false,
         expire_rule: None,
@@ -314,7 +328,7 @@ fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
         response
     );
 
-    server_handle.store(true, Ordering::SeqCst);
+    server_handle.stop();
     thread_handle.join().unwrap();
 
     Ok(())
@@ -322,9 +336,9 @@ fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn list() -> Result<(), Box<dyn std::error::Error>> {
-    let address = SocketAddr::from_str("127.0.0.1:10006")?;
+    initialize();
 
-    let (server_handle, thread_handle) = launch_server(address);
+    let (address, server_handle, thread_handle) = launch_server();
 
     println!("Connecting to server on {}", address);
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -416,7 +430,7 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
         response
     );
 
-    server_handle.store(true, Ordering::SeqCst);
+    server_handle.stop();
     thread_handle.join().unwrap();
 
     Ok(())

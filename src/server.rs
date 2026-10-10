@@ -6,8 +6,9 @@ use log::{error, info, warn};
 use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvError, Sender};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 use std::{
     collections::HashMap,
@@ -22,7 +23,8 @@ pub struct Server {
     address: SocketAddr,
     connections: HashMap<u64, Connection>,
     controller: Controller,
-    done: Arc<AtomicBool>,
+    should_stop: Arc<AtomicBool>,
+    is_listening_sender: Option<Sender<()>>,
     id_counter: u64,
 }
 
@@ -32,7 +34,8 @@ impl Server {
             address,
             connections: Default::default(),
             controller: Controller::new(SystemTime::now()),
-            done: Arc::new(AtomicBool::new(false)),
+            is_listening_sender: None,
+            should_stop: Arc::new(AtomicBool::new(false)),
             id_counter: 0,
         }
     }
@@ -53,6 +56,12 @@ impl Server {
         let listener = TcpListener::bind(self.address)?;
         listener.set_nonblocking(true)?;
         io.accept(listener);
+
+        if let Some(sender) = self.is_listening_sender.as_ref()
+            && let Err(err) = sender.send(())
+        {
+            warn!("Could not signal observers that server is listening: {err}");
+        }
 
         loop {
             for completion in io.poll_timeout(Duration::from_secs(1))? {
@@ -90,18 +99,22 @@ impl Server {
 
             self.controller.do_jobs()?;
 
-            if self.done.load(Ordering::SeqCst) {
+            if self.should_stop.load(Ordering::Relaxed) {
                 info!("Server stopped");
                 return Ok(());
             }
         }
     }
 
-    pub fn handle(&self) -> Arc<AtomicBool> {
-        self.done.clone()
-    }
-    pub fn stop(&mut self) {
-        self.done.store(true, Ordering::SeqCst);
+    pub fn handle(&mut self) -> ServerHandle {
+        let (tx, rx) = mpsc::channel();
+        self.is_listening_sender = Some(tx);
+
+        ServerHandle {
+            is_listening: false,
+            is_listening_receiver: rx,
+            should_stop: self.should_stop.clone(),
+        }
     }
 
     fn handle_accept(
@@ -213,6 +226,29 @@ impl Server {
     }
 }
 
+pub struct ServerHandle {
+    should_stop: Arc<AtomicBool>,
+    is_listening: bool,
+    is_listening_receiver: Receiver<()>,
+}
+
+impl ServerHandle {
+    pub fn wait_until_listening(&mut self) -> Result<(), RecvError> {
+        if self.is_listening {
+            return Ok(());
+        }
+
+        self.is_listening_receiver.recv()?;
+        self.is_listening = true;
+
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.should_stop.store(true, Ordering::Relaxed);
+    }
+}
+
 struct Connection {
     id: u64,
     remaining_out: Vec<u8>,
@@ -276,7 +312,7 @@ impl Connection {
         }
     }
 
-    fn flush(&mut self, io: &mut dyn AsyncIO) -> io::Result<()> {
+    fn flush(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
         if self.buffer_out_len > 0
             && let Some(buffer_out) = self.buffer_out.take()
         {

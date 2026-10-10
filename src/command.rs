@@ -616,7 +616,7 @@ impl TryFrom<&str> for OverwriteRule {
             "NX" => Ok(OverwriteRule::NotExists),
             "XX" => Ok(OverwriteRule::Exists),
             other => Err(Error::UnknownArguments(vec![Value::BulkString(
-                other.to_string(),
+                other.to_owned(),
             )])),
         }
     }
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn parse_ping() -> Result<(), Box<dyn error::Error>> {
-        let name = "PING".to_string();
+        let name = "PING".to_owned();
         let resp = ValOrRef::Val(Value::Array(vec![Value::BulkString(name)]));
         let command = Command::try_from(resp)?;
         assert_eq!(Command::Ping(None), command);
@@ -900,8 +900,8 @@ mod tests {
 
     #[test]
     fn parse_echo() -> Result<(), Box<dyn error::Error>> {
-        let name = "ECHO".to_string();
-        let arg = "test".to_string();
+        let name = "ECHO".to_owned();
+        let arg = "test".to_owned();
         let resp = Value::Array(vec![
             Value::BulkString(name),
             Value::BulkString(arg.clone()),
@@ -914,18 +914,18 @@ mod tests {
     #[test]
     fn parse_set() -> Result<(), Box<dyn error::Error>> {
         let resp = Value::Array(vec![
-            Value::BulkString("SET".to_string()),
-            Value::BulkString("key".to_string()),
-            Value::BulkString("value".to_string()),
-            Value::BulkString("XX".to_string()),
-            Value::BulkString("GET".to_string()),
-            Value::BulkString("EX 10".to_string()),
+            Value::BulkString("SET".to_owned()),
+            Value::BulkString("key".to_owned()),
+            Value::BulkString("value".to_owned()),
+            Value::BulkString("XX".to_owned()),
+            Value::BulkString("GET".to_owned()),
+            Value::BulkString("EX 10".to_owned()),
         ]);
         let command = Command::try_from(ValOrRef::Val(resp))?;
         assert_eq!(
             Command::Set {
-                key: Cow::Owned("key".to_string()),
-                value: Cow::Owned("value".to_string()),
+                key: Cow::Owned("key".to_owned()),
+                value: Cow::Owned("value".to_owned()),
                 overwrite_rule: Some(OverwriteRule::Exists),
                 get: true,
                 expire_rule: Some(SetValueExpireRule::ExpiresInSecs(10)),
@@ -962,15 +962,15 @@ mod tests {
     #[test]
     fn parse_set_no_options() -> Result<(), Box<dyn error::Error>> {
         let resp = Value::Array(vec![
-            Value::BulkString("SET".to_string()),
-            Value::BulkString("key".to_string()),
-            Value::BulkString("value".to_string()),
+            Value::BulkString("SET".to_owned()),
+            Value::BulkString("key".to_owned()),
+            Value::BulkString("value".to_owned()),
         ]);
         let command = Command::try_from(ValOrRef::Val(resp))?;
         assert_eq!(
             Command::Set {
-                key: Cow::Owned("key".to_string()),
-                value: Cow::Owned("value".to_string()),
+                key: Cow::Owned("key".to_owned()),
+                value: Cow::Owned("value".to_owned()),
                 overwrite_rule: None,
                 get: false,
                 expire_rule: None,
