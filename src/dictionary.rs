@@ -182,7 +182,7 @@ impl Dictionary {
 
     pub fn snapshot(&self) -> RDB {
         let mut hash_map = HashMap::new();
-        for (key, entry) in &self.inner {
+        for (key, entry) in self.inner.iter() {
             hash_map.insert(key.clone(), rdb::Value::from(entry.clone()));
         }
 

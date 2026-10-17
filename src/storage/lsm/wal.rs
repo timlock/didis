@@ -20,7 +20,7 @@ impl WriteAheadLogReader {
     }
 }
 
-impl<'a> Iterator for WriteAheadLogReader {
+impl Iterator for WriteAheadLogReader {
     type Item = Result<Operation, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {

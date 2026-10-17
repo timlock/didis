@@ -24,3 +24,4 @@ Cargo.lock
 .vscode/launch.json
 
 temp/
+profile.json.gz

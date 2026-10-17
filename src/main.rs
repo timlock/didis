@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    logger::init(Level::Info)?;
+    logger::init(Level::Warn)?;
 
     let address = SocketAddr::from_str("127.0.0.1:6379")?;
 

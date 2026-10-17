@@ -5,7 +5,7 @@ use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
-use crate::storage::lsm::sstable::SSTable;
+use crate::storage::lsm::sstable::SSTableReader;
 
 #[derive(Debug)]
 pub struct Entry {
@@ -14,8 +14,8 @@ pub struct Entry {
     pub key_range: RangeInclusive<String>,
 }
 
-impl From<SSTable> for Entry{
-    fn from(value: SSTable) -> Self {
+impl From<SSTableReader> for Entry{
+    fn from(value: SSTableReader) -> Self {
         Entry{
             id: value.id,
             name: value.name,
@@ -141,7 +141,7 @@ impl ManifestWriter {
     pub fn write_level<'a>(
         &mut self,
         level: u64,
-        tables: impl IntoIterator<Item = &'a SSTable>,
+        tables: impl IntoIterator<Item = &'a SSTableReader>,
     ) -> io::Result<()> {
         writeln!(self.file, "[L{level}]")?;
         for table in tables {

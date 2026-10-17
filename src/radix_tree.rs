@@ -8,6 +8,10 @@ pub struct RadixTree<V> {
 }
 
 impl<V> RadixTree<V> {
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.root.get(key).is_some()
+    }
+
     pub fn get(&self, key: &str) -> Option<&V> {
         self.root.get(key)
     }
@@ -31,6 +35,16 @@ impl<V> RadixTree<V> {
 
     pub fn is_empty(&self) -> bool {
         self.items == 0
+    }
+
+    pub fn iter(&self) -> Iter<'_, V> {
+        let mut to_visit = Vec::with_capacity(self.len());
+        to_visit.push((&self.root, false));
+
+        Iter {
+            to_visit,
+            label: String::new(),
+        }
     }
 }
 
@@ -169,26 +183,64 @@ impl<V> Node<V> {
 
 impl<V> IntoIterator for RadixTree<V> {
     type Item = (String, V);
-    type IntoIter = RadixTreeIter<V>;
+    type IntoIter = IntoIter<V>;
 
     fn into_iter(self) -> Self::IntoIter {
         let mut to_visit = Vec::with_capacity(self.len());
         to_visit.push((self.root, false));
 
-        RadixTreeIter {
+        IntoIter {
             to_visit,
             label: String::new(),
         }
     }
 }
 
-pub struct RadixTreeIter<V> {
+pub struct Iter<'a, V> {
+    // TODO replace Vec with custom stack based on this https://doc.rust-lang.org/nomicon/vec/vec-layout.html
+    to_visit: Vec<(&'a Node<V>, bool)>,
+    label: String,
+}
+
+impl<'a, V> Iterator for Iter<'a, V> {
+    type Item = (String, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut next;
+
+        loop {
+            next = loop {
+                let (node, fully_visited) = self.to_visit.last_mut()?;
+                if *fully_visited {
+                    self.label.truncate(self.label.len() - node.label.len());
+                    self.to_visit.pop().unwrap();
+                } else {
+                    *fully_visited = true;
+                    break node;
+                }
+            };
+
+            self.label += next.label.as_str();
+            let value = next.value.as_ref();
+
+            for child in next.children.iter().rev() {
+                self.to_visit.push((child, false));
+            }
+
+            if let Some(value) = value {
+                return Some((self.label.clone(), value));
+            }
+        }
+    }
+}
+
+pub struct IntoIter<V> {
     // TODO replace Vec with custom stack based on this https://doc.rust-lang.org/nomicon/vec/vec-layout.html
     to_visit: Vec<(Node<V>, bool)>,
     label: String,
 }
 
-impl<V> Iterator for RadixTreeIter<V> {
+impl<V> Iterator for IntoIter<V> {
     type Item = (String, V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -292,6 +344,11 @@ mod test {
             assert_eq!(Some(value), tree.get(value));
         }
 
+        let mut iter = tree.iter();
+        for value in values.iter() {
+            assert_eq!(Some((value.clone(), value)), iter.next());
+        }
+
         let mut iter = tree.into_iter();
         for value in values {
             assert_eq!(Some((value.clone(), value)), iter.next());
@@ -325,6 +382,12 @@ mod test {
             assert_eq!(Some(value), tree.get(value));
         }
 
+
+        let mut iter = tree.iter();
+        for value in values.iter().rev() {
+            assert_eq!(Some((value.clone(), value)), iter.next());
+        }
+
         let mut iter = tree.into_iter();
         for value in values.into_iter().rev() {
             assert_eq!(Some((value.clone(), value)), iter.next());
@@ -355,10 +418,16 @@ mod test {
             assert_eq!(Some(value), tree.get(value));
         }
 
+        let mut iter = tree.iter();
+        for value in values.iter() {
+            assert_eq!(Some((value.clone(), value)), iter.next());
+        }
+
         let mut iter = tree.into_iter();
         for value in values {
             assert_eq!(Some((value.clone(), value)), iter.next());
         }
+
 
         assert_eq!(None, iter.next());
     }

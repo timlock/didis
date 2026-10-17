@@ -1,7 +1,7 @@
 use crate::heap::MinHeap;
 use crate::radix_tree::RadixTree;
 use crate::storage::lsm::manifest::{ManifestReader, ManifestWriter};
-use crate::storage::lsm::sstable::{SSTable, SSTableReader, SSTableWriter};
+use crate::storage::lsm::sstable::{SSTableReader, SSTableWriter};
 use crate::storage::lsm::wal::{WriteAheadLogReader, WriteAheadLogWriter};
 use crate::storage::lsm::{Error, Operation};
 use log::info;
@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use std::{fs, io, mem};
+use std::{fs, io, iter, mem};
 
 #[derive(Debug)]
 struct Locations {
@@ -23,8 +23,16 @@ struct Locations {
 }
 
 impl Locations {
-    fn table_path(&self, table_name: impl AsRef<Path>) -> PathBuf {
+    fn table_dir_path(&self, table_name: impl AsRef<Path>) -> PathBuf {
         self.directory.join(table_name)
+    }
+
+    fn data_file_path(&self, table_name: impl AsRef<Path>) -> PathBuf {
+        self.table_dir_path(table_name).join("data.db")
+    }
+
+    fn index_file_path(&self, table_name: impl AsRef<Path>) -> PathBuf {
+        self.table_dir_path(table_name).join("index.db")
     }
 }
 
@@ -45,7 +53,7 @@ impl IdGenerator {
 #[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
-    levels: BTreeMap<u64, Vec<SSTable>>,
+    levels: BTreeMap<u64, Vec<SSTableReader>>,
     id_generator: IdGenerator,
 
     write_ahead_log: WriteAheadLogWriter,
@@ -69,7 +77,7 @@ impl Storage {
             directory: directory_path,
         };
         info!("Reading manifest file");
-        let levels = match read_manifest(&locations.manifest) {
+        let levels = match read_manifest(&locations.manifest, &locations) {
             Ok(levels) => {
                 info!(
                     "Found {} tables",
@@ -137,7 +145,7 @@ impl Storage {
         for (level, tables) in self.levels.iter_mut() {
             for table in tables.iter_mut().rev() {
                 if table.has_key_in_range(key) {
-                    let value = table.reader.find_value(key)?;
+                    let value = table.find_value(key)?;
                     match value {
                         None => {
                             if *level > 0 {
@@ -232,8 +240,8 @@ impl Storage {
             .to_owned();
         table.key_range = min..=max;
 
-        writer.write_data_blocks(&operations)?;
-        writer.write_index_blocks()?;
+        writer.write(&operations)?;
+        writer.sync()?;
         self.sync_dir()?;
 
         self.save_manifest()?;
@@ -269,7 +277,7 @@ impl Storage {
 
         let mut old_table_iters = HashMap::new();
         for (level, old_table) in &mut old_tables {
-            old_table_iters.insert(old_table.id, (*level, old_table.reader.data_iter()?));
+            old_table_iters.insert(old_table.id, (*level, old_table.iter()?));
         }
 
         let (mut table, mut writer) = self.create_table(level + 1)?;
@@ -290,26 +298,24 @@ impl Storage {
             entries += 1;
 
             if entries > max_table_size {
-                writer.write_index_blocks()?;
                 writer.sync()?;
 
                 (table, writer) = self.create_table(level + 1)?;
                 entries = 1;
             }
 
-            writer.write_operation(operation)?;
+            writer.write(iter::once(&operation))?;
             table.key_range = grow_range(heap_key.key, table.key_range.clone());
         }
 
-        writer.write_index_blocks()?;
         writer.sync()?;
 
         self.sync_dir()?;
         self.save_manifest()?;
 
         for (_, table) in old_tables {
-            info!("Deleting old table {:?}", table.path);
-            fs::remove_file(table.path)?;
+            info!("Deleting old table directory {:?}", table.dir_path);
+            fs::remove_dir_all(table.dir_path)?;
         }
 
         info!("Compaction complete, took {:?}", start.elapsed());
@@ -334,21 +340,24 @@ impl Storage {
         Ok(())
     }
 
-    fn create_table(&mut self, level: u64) -> Result<(&mut SSTable, SSTableWriter), Error> {
+    fn create_table(&mut self, level: u64) -> Result<(&mut SSTableReader, SSTableWriter), Error> {
         let table_id = self.id_generator.next();
-        let path = self.locations.table_path(format!("TABLE_{table_id}"));
+        let table_name = format!("TABLE_{table_id}");
+        let table_dir_path = self.locations.table_dir_path(&table_name);
+        let data_file_path = self.locations.data_file_path(&table_name);
+        let index_file_path = self.locations.index_file_path(&table_name);
 
-        let writer = SSTableWriter::create(&path)?;
+        fs::create_dir(&table_dir_path)?;
+        let writer = SSTableWriter::create(&data_file_path, &index_file_path)?;
 
-        let reader = SSTableReader::open(&path)?;
-
-        let table = SSTable::new(
+        let table = SSTableReader::open(
             table_id,
-            format!("TABLE_{table_id}"),
-            path,
+            table_name,
+            table_dir_path,
+            index_file_path,
+            data_file_path,
             String::new()..=String::new(),
-            reader,
-        );
+        )?;
 
         let level_tables = self.levels.entry(level).or_default();
         level_tables.push(table);
@@ -485,7 +494,10 @@ impl MemTableValue {
         MemTableValue::Value(value)
     }
 }
-fn read_manifest(manifest_path: impl AsRef<Path>) -> Result<BTreeMap<u64, Vec<SSTable>>, Error> {
+fn read_manifest(
+    manifest_path: impl AsRef<Path>,
+    locations: &Locations,
+) -> Result<BTreeMap<u64, Vec<SSTableReader>>, Error> {
     let mut manifest_reader = ManifestReader::open(&manifest_path)?;
 
     let level_entries = manifest_reader.read_all()?;
@@ -494,19 +506,18 @@ fn read_manifest(manifest_path: impl AsRef<Path>) -> Result<BTreeMap<u64, Vec<SS
         let mut tables = Vec::new();
 
         for entry in entries {
-            let table_path = match manifest_path.as_ref().parent() {
-                Some(path) => path.join(&entry.name),
-                None => PathBuf::from(&entry.name),
-            };
+            let table_dir_path = locations.table_dir_path(&entry.name);
+            let table_path = locations.data_file_path(&entry.name);
+            let index_path = locations.index_file_path(&entry.name);
 
-            let reader = SSTableReader::open(&table_path)?;
-            tables.push(SSTable {
-                id: entry.id,
-                name: entry.name,
-                path: table_path,
-                key_range: entry.key_range,
-                reader,
-            });
+            tables.push(SSTableReader::open(
+                entry.id,
+                entry.name,
+                table_dir_path,
+                index_path,
+                table_path,
+                entry.key_range,
+            )?);
         }
 
         levels.insert(level, tables);

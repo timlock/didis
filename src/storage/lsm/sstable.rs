@@ -4,158 +4,155 @@ use crate::storage::lsm::{
 };
 use log::info;
 use std::fs::File;
-use std::io;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::{fs, io, iter};
 
 const BLOCK_SIZE: usize = 4096;
 
 #[derive(Debug)]
-pub struct SSTable {
+pub struct SSTableReader {
     pub id: u64,
     pub name: String,
-    pub path: PathBuf,
+    pub dir_path: PathBuf,
     pub key_range: RangeInclusive<String>,
-    pub reader: SSTableReader,
+    index_reader: IndexReader,
+    data_reader: DataReader,
 }
 
-impl SSTable {
-    pub fn new(
+impl SSTableReader {
+    pub fn open<P: AsRef<Path>>(
         id: u64,
         name: String,
-        path: PathBuf,
+        dir_path: PathBuf,
+        index_file_path: P,
+        data_file_path: P,
         key_range: RangeInclusive<String>,
-        reader: SSTableReader,
-    ) -> SSTable {
-        SSTable {
+    ) -> io::Result<SSTableReader> {
+        let index_reader = IndexReader::open(index_file_path)?;
+        let data_reader = DataReader::open(data_file_path)?;
+
+        Ok(SSTableReader {
             id,
             name,
-            path,
+            dir_path,
             key_range,
-            reader,
-        }
+            index_reader,
+            data_reader,
+        })
     }
     pub fn has_key_in_range(&self, key: &str) -> bool {
         self.key_range.start().as_str() <= key && key <= self.key_range.end().as_str()
+    }
+
+    pub fn find_value(&mut self, key: &str) -> Result<Option<Operation>, Error> {
+        let block_offset = match self.index_reader.find_block(key)? {
+            Some(block_offset) => block_offset,
+            None => return Ok(None),
+        };
+        self.data_reader.find_value(key, block_offset)
+    }
+
+    pub fn iter(&mut self) -> Result<DataIter<'_, BufReader<File>>, Error> {
+        self.data_reader.iter()
     }
 }
 
 #[derive(Debug)]
 pub struct SSTableWriter {
-    file: File,
-    block: Vec<u8>,
-    keys: Vec<(String, u64)>,
+    index_writer: IndexWriter,
+    data_writer: DataWriter,
+    expect_first_key: bool,
 }
 impl SSTableWriter {
-    pub fn create(table_path: &Path) -> io::Result<SSTableWriter> {
-        info!("Creating new table {table_path:?}");
-        let file = File::create(table_path)?;
+    pub fn create<P: AsRef<Path>>(
+        data_file_path: P,
+        index_file_path: P,
+    ) -> io::Result<SSTableWriter> {
         Ok(SSTableWriter {
-            file,
-            block: Vec::with_capacity(BLOCK_SIZE),
-            keys: Vec::new(),
+            index_writer: IndexWriter::create(index_file_path)?,
+            data_writer: DataWriter::create(data_file_path)?,
+            expect_first_key: true,
         })
     }
 
-    pub fn write_operation(&mut self, operation: Operation) -> io::Result<()> {
-        if self.block.is_empty() {
-            self.block.resize(16, 0);
+    pub fn write<'a>(
+        &mut self,
+        operations: impl IntoIterator<Item=&'a Operation>,
+    ) -> io::Result<()> {
+        let mut operations = operations.into_iter().peekable();
 
-            let stream_pos = self.file.stream_position()?;
-            self.keys.push((operation.key().to_owned(), stream_pos));
+        if self.expect_first_key {
+            match operations.peek() {
+                Some(first_operation) => self
+                    .index_writer
+                    .write_keys(iter::once((first_operation.key(), 0)))?,
+                None => return Ok(()),
+            };
+            self.expect_first_key = false;
         }
 
-        let mut buf = Vec::new();
-        write_operation(&mut buf, &operation)?;
-
-        if buf.len() + self.block.len() > BLOCK_SIZE && !self.block.is_empty() {
-            self.flush_data_block()?;
-            self.block.resize(16, 0);
-
-            let data_block_offset = self.file.stream_position()?;
-            assert_eq!(data_block_offset % BLOCK_SIZE as u64, 0);
-            self.keys
-                .push((operation.key().to_owned(), data_block_offset));
-        }
-
-        self.block.extend(&buf);
-        buf.clear();
+        let keys = self.data_writer.write(operations)?;
+        self.index_writer.write_keys(keys)?;
 
         Ok(())
     }
 
-    pub fn write_data_blocks<'a>(
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.index_writer.sync()?;
+        self.data_writer.sync()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DataWriter {
+    file: File,
+    block: Vec<u8>,
+    buf: Vec<u8>,
+}
+impl DataWriter {
+    fn create<P: AsRef<Path>>(table_path: P) -> io::Result<DataWriter> {
+        info!("Creating new table {:?}", table_path.as_ref());
+        let file = File::create(table_path)?;
+
+        let mut block = Vec::with_capacity(BLOCK_SIZE);
+        block.resize(16, 0);
+
+        Ok(DataWriter {
+            file,
+            block,
+            buf: Vec::new(),
+        })
+    }
+
+    fn write<'a>(
         &mut self,
-        operations: impl IntoIterator<Item = &'a Operation>,
-    ) -> io::Result<()> {
-        assert!(self.block.is_empty());
-        self.block.resize(16, 0);
+        operations: impl IntoIterator<Item=&'a Operation>,
+    ) -> io::Result<impl Iterator<Item=(&'a str, u64)>> {
+        let mut keys = Vec::new();
 
-        let mut operations = operations.into_iter().peekable();
-
-        let first_operation = operations
-            .peek()
-            .expect("write_operations should not be called with an empty slice");
-        self.keys.push((first_operation.key().to_owned(), 0));
-
-        let mut buf = Vec::new();
         for operation in operations {
-            write_operation(&mut buf, operation)?;
+            write_operation(&mut self.buf, operation)?;
 
-            if buf.len() + self.block.len() > BLOCK_SIZE && !self.block.is_empty() {
-                self.flush_data_block()?;
+            if self.buf.len() + self.block.len() > BLOCK_SIZE && !self.block.is_empty() {
+                self.flush()?;
                 self.block.resize(16, 0);
 
                 let data_block_offset = self.file.stream_position()?;
                 assert_eq!(data_block_offset % BLOCK_SIZE as u64, 0);
-                self.keys
-                    .push((operation.key().to_owned(), data_block_offset));
+                keys.push((operation.key(), data_block_offset));
             }
 
-            self.block.extend(&buf);
-            buf.clear();
+            self.block.append(&mut self.buf);
+            self.buf.clear();
         }
-        self.flush_data_block()?;
 
-        Ok(())
+        Ok(keys.into_iter())
     }
 
-    pub fn write_index_blocks(&mut self) -> io::Result<()> {
-        self.flush_data_block()?;
-        assert!(self.block.is_empty());
-        self.block.resize(8, 0);
-
-        let index_block_offset = self.file.stream_position()?;
-        assert_eq!(index_block_offset as usize % BLOCK_SIZE, 0);
-
-        let mut buf = Vec::new();
-        for i in 0..self.keys.len() {
-            let (key, offset) = &self.keys[i];
-
-            write_length_prefixed_string(&mut buf, key)?;
-            write_integer(&mut buf, *offset)?;
-
-            if buf.len() + self.block.len() > BLOCK_SIZE {
-                self.flush_index_block()?;
-
-                self.block.resize(8, 0);
-
-                let index_block_offset = self.file.stream_position()? as usize;
-                assert_eq!(index_block_offset % BLOCK_SIZE, 0);
-            }
-
-            self.block.extend(&buf);
-            buf.clear();
-        }
-        self.flush_index_block()?;
-
-        self.file.write_all(&index_block_offset.to_le_bytes())?;
-
-        Ok(())
-    }
-
-    fn flush_data_block(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         if self.block.is_empty() {
             return Ok(());
         }
@@ -170,23 +167,8 @@ impl SSTableWriter {
         self.add_padding();
 
         self.file.write_all(&self.block)?;
-        self.block.clear();
+        self.file.flush()?;
 
-        Ok(())
-    }
-
-    fn flush_index_block(&mut self) -> io::Result<()> {
-        if self.block.is_empty() {
-            return Ok(());
-        }
-
-        assert_eq!([0u8; 8], &self.block[..8]);
-        let content_size = self.block.len() - 8;
-        self.block[0..8].clone_from_slice(content_size.to_le_bytes().as_slice());
-
-        self.add_padding();
-
-        self.file.write_all(&self.block)?;
         self.block.clear();
 
         Ok(())
@@ -200,34 +182,106 @@ impl SSTableWriter {
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
-        self.file.flush()?;
+        self.flush()?;
         self.file.sync_all()?;
         Ok(())
     }
 }
 
 #[derive(Debug)]
-pub struct SSTableReader {
+struct IndexWriter {
+    file: File,
+    block: Vec<u8>,
+    buf: Vec<u8>,
+}
+impl IndexWriter {
+    fn create<P: AsRef<Path>>(table_path: P) -> io::Result<IndexWriter> {
+        info!("Creating new index {:?}", table_path.as_ref());
+        let file = File::create(table_path)?;
+
+        let mut block = Vec::with_capacity(BLOCK_SIZE);
+        block.resize(8, 0);
+
+        Ok(IndexWriter {
+            file,
+            block,
+            buf: Vec::new(),
+        })
+    }
+
+    fn write_keys<'a>(&mut self, keys: impl IntoIterator<Item=(&'a str, u64)>) -> io::Result<()> {
+        for (key, offset) in keys.into_iter() {
+            write_length_prefixed_string(&mut self.buf, key)?;
+            write_integer(&mut self.buf, offset)?;
+
+            if self.buf.len() + self.block.len() > BLOCK_SIZE {
+                self.flush()?;
+
+                self.block.resize(8, 0);
+
+                let index_block_offset = self.file.stream_position()? as usize;
+                assert_eq!(index_block_offset % BLOCK_SIZE, 0);
+            }
+
+            self.block.append(&mut self.buf);
+            self.buf.clear();
+        }
+
+        Ok(())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+
+        assert_eq!([0u8; 8], &self.block[..8]);
+        let content_size = self.block.len() - 8;
+        self.block[0..8].clone_from_slice(content_size.to_le_bytes().as_slice());
+
+        self.add_padding();
+
+        self.file.write_all(&self.block)?;
+        self.file.flush()?;
+
+        self.block.clear();
+
+        Ok(())
+    }
+
+    fn add_padding(&mut self) {
+        let padding = calculate_padding(self.block.len() as u64);
+        self.block.resize(self.block.len() + padding as usize, 0);
+
+        assert_eq!(self.block.len() % BLOCK_SIZE, 0);
+    }
+
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.flush()?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DataReader {
     file: BufReader<File>,
 }
 
-impl SSTableReader {
-    pub fn open(table_path: impl AsRef<Path>) -> io::Result<SSTableReader> {
+impl DataReader {
+    fn open(table_path: impl AsRef<Path>) -> io::Result<DataReader> {
         info!("Opening table {:?}", table_path.as_ref());
 
         let file = File::open(table_path)?;
-        Ok(SSTableReader {
+        Ok(DataReader {
             file: BufReader::new(file),
         })
     }
 
-    pub fn find_value(&mut self, key: &str) -> Result<Option<Operation>, Error> {
-        let offset = match self.find_block(key)? {
-            Some(offset) => offset,
+    fn find_value(&mut self, key: &str, block_offset: u64) -> Result<Option<Operation>, Error> {
+        let data_block_iter = match DataBlockIter::new(&mut self.file, block_offset)? {
+            Some(data_block_iter) => data_block_iter,
             None => return Ok(None),
         };
-
-        let data_block_iter = DataBlockIter::new(&mut self.file, offset)?;
 
         for next in data_block_iter {
             let operation = next?;
@@ -244,8 +298,32 @@ impl SSTableReader {
         Ok(None)
     }
 
-    pub fn find_block(&mut self, key: &str) -> Result<Option<u64>, Error> {
-        let index_iter = self.index_iter()?;
+    pub fn iter(&mut self) -> Result<DataIter<'_, BufReader<File>>, Error> {
+        self.file.rewind()?;
+
+        let data_block_iter = DataBlockIter::new(&mut self.file, 0)?;
+
+        Ok(DataIter { data_block_iter })
+    }
+}
+
+#[derive(Debug)]
+struct IndexReader {
+    file: BufReader<File>,
+}
+
+impl IndexReader {
+    fn open(table_path: impl AsRef<Path>) -> io::Result<IndexReader> {
+        info!("Opening table {:?}", table_path.as_ref());
+
+        let file = File::open(table_path)?;
+        Ok(IndexReader {
+            file: BufReader::new(file),
+        })
+    }
+
+    fn find_block(&mut self, key: &str) -> Result<Option<u64>, Error> {
+        let index_iter = self.iter()?;
 
         let mut candidate = None;
 
@@ -265,44 +343,17 @@ impl SSTableReader {
         Ok(candidate)
     }
 
-    fn area_offsets(&mut self) -> io::Result<(u64, u64)> {
-        let header_offset = self.file.seek(SeekFrom::End(-8))?;
-
-        let mut first_index_offset_bytes = [0; 8];
-        self.file.read_exact(&mut first_index_offset_bytes)?;
-
-        Ok((header_offset, u64::from_le_bytes(first_index_offset_bytes)))
-    }
-
-    pub fn index_iter(&mut self) -> io::Result<SSTableIndexIter<'_, BufReader<File>>> {
-        let (header_offset, first_index_offset) = self.area_offsets()?;
-
-        let index_block_iter = IndexBlockIter::new(&mut self.file, first_index_offset)?;
-
-        Ok(SSTableIndexIter {
-            index_block_iter: Some(index_block_iter),
-            header_offset,
-        })
-    }
-
-    pub fn data_iter(&mut self) -> Result<SSTableDataIter<'_, BufReader<File>>, Error> {
-        let (_, first_index_offset) = self.area_offsets()?;
-        self.file.rewind()?;
-
-        let data_block_iter = DataBlockIter::new(&mut self.file, 0)?;
-
-        Ok(SSTableDataIter {
-            data_block_iter: Some(data_block_iter),
-            first_index_offset,
-        })
+    fn iter(&mut self) -> io::Result<IndexIter<'_, BufReader<File>>> {
+        let index_block_iter = IndexBlockIter::new(&mut self.file, 0)?;
+        Ok(IndexIter { index_block_iter })
     }
 }
 
-pub struct SSTableIndexIter<'a, R> {
+pub struct IndexIter<'a, R> {
     index_block_iter: Option<IndexBlockIter<'a, R>>,
-    header_offset: u64,
 }
-impl<'a, R> Iterator for SSTableIndexIter<'a, R>
+
+impl<'a, R> Iterator for IndexIter<'a, R>
 where
     R: BufRead + Seek,
 {
@@ -323,17 +374,13 @@ where
                 let padding = calculate_padding(stream_pos);
                 let next_index_block = stream_pos + padding;
 
-                if next_index_block >= self.header_offset {
-                    return None;
-                }
-
                 match file.seek_relative(padding as i64) {
                     Ok(()) => {}
                     Err(err) => return Some(Err(err.into())),
                 };
 
                 let mut index_block_iter = match IndexBlockIter::new(file, next_index_block) {
-                    Ok(index_block_iter) => index_block_iter,
+                    Ok(index_block_iter) => index_block_iter?,
                     Err(err) => return Some(Err(err.into())),
                 };
 
@@ -356,19 +403,23 @@ impl<'a, R> IndexBlockIter<'a, R>
 where
     R: BufRead + Seek,
 {
-    fn new(source: &'a mut R, offset: u64) -> io::Result<IndexBlockIter<'a, R>> {
+    fn new(source: &'a mut R, offset: u64) -> io::Result<Option<IndexBlockIter<'a, R>>> {
         assert_eq!(0, offset % BLOCK_SIZE as u64);
         source.seek(SeekFrom::Start(offset))?;
 
         let mut buf = [0u8; 8];
-        source.read_exact(&mut buf)?;
+        match source.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(err),
+        }
         let content_len = u64::from_le_bytes(buf);
 
-        Ok(IndexBlockIter {
+        Ok(Some(IndexBlockIter {
             source,
             offset,
             content_len,
-        })
+        }))
     }
 }
 
@@ -402,12 +453,11 @@ where
     }
 }
 
-pub struct SSTableDataIter<'a, R> {
+pub struct DataIter<'a, R> {
     data_block_iter: Option<DataBlockIter<'a, R>>,
-    first_index_offset: u64,
 }
 
-impl<'a, R> Iterator for SSTableDataIter<'a, R>
+impl<'a, R> Iterator for DataIter<'a, R>
 where
     R: BufRead + Seek,
 {
@@ -428,12 +478,8 @@ where
                 let padding = calculate_padding(stream_pos);
                 let next_data_block = stream_pos + padding;
 
-                if next_data_block >= self.first_index_offset {
-                    return None;
-                }
-
                 let mut data_block_iter = match DataBlockIter::new(file, next_data_block) {
-                    Ok(data_block_iter) => data_block_iter,
+                    Ok(data_block_iter) => data_block_iter?,
                     Err(err) => return Some(Err(err)),
                 };
 
@@ -456,12 +502,16 @@ impl<'a, R> DataBlockIter<'a, R>
 where
     R: BufRead + Seek,
 {
-    fn new(source: &'a mut R, offset: u64) -> Result<DataBlockIter<'a, R>, Error> {
+    fn new(source: &'a mut R, offset: u64) -> Result<Option<DataBlockIter<'a, R>>, Error> {
         assert_eq!(0, offset % BLOCK_SIZE as u64);
         source.seek(SeekFrom::Start(offset))?;
 
         let mut buf = [0u8; 8];
-        source.read_exact(&mut buf)?;
+        match source.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
         let content_len = u64::from_le_bytes(buf);
 
         source.read_exact(&mut buf)?;
@@ -480,11 +530,11 @@ where
 
         source.seek(SeekFrom::Start(offset + 16))?;
 
-        Ok(DataBlockIter {
+        Ok(Some(DataBlockIter {
             source,
             offset,
             content_len,
-        })
+        }))
     }
 }
 
@@ -509,7 +559,6 @@ where
 }
 
 fn calculate_padding(stream_pos: u64) -> u64 {
-    
     if stream_pos.is_multiple_of(BLOCK_SIZE as u64) {
         0
     } else {
@@ -526,8 +575,17 @@ mod tests {
     #[test]
     fn write_data_blocks() -> Result<(), Box<dyn error::Error>> {
         let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
-        let path = temp_dir.path().join("table");
-        let mut writer = SSTableWriter::create(&path)?;
+        let index_path = temp_dir.path().join("index.db");
+        let table_path = temp_dir.path().join("data.db");
+        let mut writer = SSTableWriter::create(table_path.clone(), index_path.clone())?;
+        let mut table = SSTableReader::open(
+            0,
+            String::new(),
+            temp_dir.path().to_owned(),
+            index_path,
+            table_path,
+            String::new()..=String::new(),
+        )?;
 
         let mut operations = Vec::new();
         for i in 0..1000 {
@@ -535,15 +593,13 @@ mod tests {
         }
         operations.sort_by(|a, b| a.key().cmp(b.key()));
 
-        writer.write_data_blocks(&operations)?;
+        writer.write(&operations)?;
 
-        writer.write_index_blocks()?;
         writer.sync()?;
 
-        let mut reader = SSTableReader::open(&path)?;
         for operation in operations {
             let key = operation.key().to_string();
-            assert_eq!(Some(operation), reader.find_value(&key)?);
+            assert_eq!(Some(operation), table.find_value(&key)?);
         }
 
         Ok(())
