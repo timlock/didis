@@ -5,45 +5,29 @@ use crate::storage::lsm::{
 use log::info;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
-use std::{fs, io, iter};
+use std::path::Path;
+use std::{io, iter};
 
 const BLOCK_SIZE: usize = 4096;
 
 #[derive(Debug)]
 pub struct SSTableReader {
-    pub id: u64,
-    pub name: String,
-    pub dir_path: PathBuf,
-    pub key_range: RangeInclusive<String>,
     index_reader: IndexReader,
     data_reader: DataReader,
 }
 
 impl SSTableReader {
     pub fn open<P: AsRef<Path>>(
-        id: u64,
-        name: String,
-        dir_path: PathBuf,
         index_file_path: P,
         data_file_path: P,
-        key_range: RangeInclusive<String>,
     ) -> io::Result<SSTableReader> {
         let index_reader = IndexReader::open(index_file_path)?;
         let data_reader = DataReader::open(data_file_path)?;
 
         Ok(SSTableReader {
-            id,
-            name,
-            dir_path,
-            key_range,
             index_reader,
             data_reader,
         })
-    }
-    pub fn has_key_in_range(&self, key: &str) -> bool {
-        self.key_range.start().as_str() <= key && key <= self.key_range.end().as_str()
     }
 
     pub fn find_value(&mut self, key: &str) -> Result<Option<Operation>, Error> {
@@ -79,7 +63,7 @@ impl SSTableWriter {
 
     pub fn write<'a>(
         &mut self,
-        operations: impl IntoIterator<Item=&'a Operation>,
+        operations: impl IntoIterator<Item = &'a Operation>,
     ) -> io::Result<()> {
         let mut operations = operations.into_iter().peekable();
 
@@ -129,8 +113,8 @@ impl DataWriter {
 
     fn write<'a>(
         &mut self,
-        operations: impl IntoIterator<Item=&'a Operation>,
-    ) -> io::Result<impl Iterator<Item=(&'a str, u64)>> {
+        operations: impl IntoIterator<Item = &'a Operation>,
+    ) -> io::Result<impl Iterator<Item = (&'a str, u64)>> {
         let mut keys = Vec::new();
 
         for operation in operations {
@@ -209,7 +193,7 @@ impl IndexWriter {
         })
     }
 
-    fn write_keys<'a>(&mut self, keys: impl IntoIterator<Item=(&'a str, u64)>) -> io::Result<()> {
+    fn write_keys<'a>(&mut self, keys: impl IntoIterator<Item = (&'a str, u64)>) -> io::Result<()> {
         for (key, offset) in keys.into_iter() {
             write_length_prefixed_string(&mut self.buf, key)?;
             write_integer(&mut self.buf, offset)?;
@@ -578,14 +562,7 @@ mod tests {
         let index_path = temp_dir.path().join("index.db");
         let table_path = temp_dir.path().join("data.db");
         let mut writer = SSTableWriter::create(table_path.clone(), index_path.clone())?;
-        let mut table = SSTableReader::open(
-            0,
-            String::new(),
-            temp_dir.path().to_owned(),
-            index_path,
-            table_path,
-            String::new()..=String::new(),
-        )?;
+        let mut table = SSTableReader::open(index_path, table_path)?;
 
         let mut operations = Vec::new();
         for i in 0..1000 {

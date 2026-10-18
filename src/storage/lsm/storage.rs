@@ -1,6 +1,7 @@
 use crate::heap::MinHeap;
 use crate::radix_tree::RadixTree;
-use crate::storage::lsm::manifest::{ManifestReader, ManifestWriter};
+use crate::storage::lsm::bloom::BloomFilter;
+use crate::storage::lsm::manifest::{Entry, ManifestReader, ManifestWriter};
 use crate::storage::lsm::sstable::{SSTableReader, SSTableWriter};
 use crate::storage::lsm::wal::{WriteAheadLogReader, WriteAheadLogWriter};
 use crate::storage::lsm::{Error, Operation};
@@ -34,6 +35,10 @@ impl Locations {
     fn index_file_path(&self, table_name: impl AsRef<Path>) -> PathBuf {
         self.table_dir_path(table_name).join("index.db")
     }
+
+    fn bloom_filter_file_path(&self, table_name: impl AsRef<Path>) -> PathBuf {
+        self.table_dir_path(table_name).join("bloom-filter.db")
+    }
 }
 
 #[derive(Debug)]
@@ -51,9 +56,24 @@ impl IdGenerator {
 }
 
 #[derive(Debug)]
+struct SSTableMetadata {
+    id: u64,
+    name: String,
+    dir_path: PathBuf,
+    key_range: RangeInclusive<String>,
+    level: u64,
+}
+
+impl SSTableMetadata {
+    fn has_key_in_range(&self, key: &str) -> bool {
+        self.key_range.start().as_str() <= key && key <= self.key_range.end().as_str()
+    }
+}
+
+#[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
-    levels: BTreeMap<u64, Vec<SSTableReader>>,
+    levels: BTreeMap<u64, Vec<(SSTableMetadata, SSTableReader, BloomFilter)>>,
     id_generator: IdGenerator,
 
     write_ahead_log: WriteAheadLogWriter,
@@ -99,20 +119,26 @@ impl Storage {
         let next_id = levels
             .values()
             .flatten()
-            .map(|table| table.id)
+            .map(|(table)| table.id)
             .max()
             .map_or(1, |id| id + 1);
         let id_generator = IdGenerator { next_id };
 
         let mut storage = Storage {
             mem_table: MemTable::default(),
-            levels,
+            levels: BTreeMap::new(),
             write_ahead_log: wal_writer,
             locations,
             max_table_size,
             level_ratio,
             id_generator,
         };
+
+        for (_, tables) in levels {
+            for table in tables {
+                storage.add_table(table)?;
+            }
+        }
 
         let wal_reader = match WriteAheadLogReader::open(&storage.locations.wal) {
             Ok(wal_reader) => Some(wal_reader),
@@ -143,9 +169,9 @@ impl Storage {
         }
 
         for (level, tables) in self.levels.iter_mut() {
-            for table in tables.iter_mut().rev() {
-                if table.has_key_in_range(key) {
-                    let value = table.find_value(key)?;
+            for (table, reader, bloom_filter) in tables.iter_mut().rev() {
+                if table.has_key_in_range(key) && bloom_filter.contains(key) {
+                    let value = reader.find_value(key)?;
                     match value {
                         None => {
                             if *level > 0 {
@@ -217,7 +243,7 @@ impl Storage {
 
         let mem_table = mem::take(&mut self.mem_table);
 
-        let (table, mut writer) = self.create_table(0)?;
+        let (mut table, mut writer) = self.create_table(0)?;
 
         let operations = mem_table
             .inner
@@ -242,11 +268,21 @@ impl Storage {
 
         writer.write(&operations)?;
         writer.sync()?;
-        self.sync_dir()?;
+
+        let mut bloom_filter = BloomFilter::new(operations.len() as u32, 0.01, 5);
+        bloom_filter.append(operations.iter().map(|operation| operation.key()));
+
+        let bloom_filter_file_path = self.locations.bloom_filter_file_path(&table.name);
+        write_bloom_filter(&bloom_filter, &bloom_filter_file_path)?;
+
+        self.add_table(table)?;
 
         self.save_manifest()?;
 
+        self.sync_dir()?;
+
         self.write_ahead_log.truncate()?;
+
 
         info!("Flush complete took {:?}", start.elapsed());
 
@@ -276,13 +312,13 @@ impl Storage {
         );
 
         let mut old_table_iters = HashMap::new();
-        for (level, old_table) in &mut old_tables {
-            old_table_iters.insert(old_table.id, (*level, old_table.iter()?));
+        for (level, (old_table, old_table_reader, _)) in &mut old_tables {
+            old_table_iters.insert(old_table.id, (*level, old_table_reader.iter()?));
         }
 
         let (mut table, mut writer) = self.create_table(level + 1)?;
-        let mut entries = 0;
 
+        let mut to_write = Vec::new();
         let merger = Merger::new(old_table_iters)?;
         for extracted in merger {
             let (heap_key, operation) = extracted?;
@@ -295,25 +331,41 @@ impl Storage {
                 continue;
             }
 
-            entries += 1;
-
-            if entries > max_table_size {
+            if to_write.len() > max_table_size {
+                writer.write(&to_write)?;
                 writer.sync()?;
 
+                let mut bloom_filter = BloomFilter::new(to_write.len() as u32, 0.01, 5);
+                bloom_filter.append(to_write.iter().map(|operation| operation.key()));
+
+                let bloom_filter_file_path = self.locations.bloom_filter_file_path(&table.name);
+                write_bloom_filter(&bloom_filter, &bloom_filter_file_path)?;
+
+                self.add_table(table)?;
+
                 (table, writer) = self.create_table(level + 1)?;
-                entries = 1;
+                to_write.clear();
             }
 
-            writer.write(iter::once(&operation))?;
+            to_write.push(operation);
             table.key_range = grow_range(heap_key.key, table.key_range.clone());
         }
 
         writer.sync()?;
 
-        self.sync_dir()?;
-        self.save_manifest()?;
+        let mut bloom_filter = BloomFilter::new(to_write.len() as u32, 0.01, 5);
+        bloom_filter.append(to_write.iter().map(|operation| operation.key()));
 
-        for (_, table) in old_tables {
+
+        let bloom_filter_file_path = self.locations.bloom_filter_file_path(&table.name);
+        write_bloom_filter(&bloom_filter, &bloom_filter_file_path)?;
+
+        self.add_table(table)?;
+
+        self.save_manifest()?;
+        self.sync_dir()?;
+
+        for (_, (table, _, _)) in old_tables {
             info!("Deleting old table directory {:?}", table.dir_path);
             fs::remove_dir_all(table.dir_path)?;
         }
@@ -329,7 +381,14 @@ impl Storage {
         let mut manifest_writer = ManifestWriter::create(&self.locations.manifest_temp)?;
 
         for (level, tables) in self.levels.iter() {
-            manifest_writer.write_level(*level, tables)?;
+            manifest_writer.write_level(
+                *level,
+                tables.into_iter().map(|(table, _, _)| Entry {
+                    id: table.id.to_owned(),
+                    name: table.name.to_owned(),
+                    key_range: table.key_range.to_owned(),
+                }),
+            )?;
         }
 
         manifest_writer.sync()?;
@@ -340,7 +399,7 @@ impl Storage {
         Ok(())
     }
 
-    fn create_table(&mut self, level: u64) -> Result<(&mut SSTableReader, SSTableWriter), Error> {
+    fn create_table(&mut self, level: u64) -> Result<(SSTableMetadata, SSTableWriter), Error> {
         let table_id = self.id_generator.next();
         let table_name = format!("TABLE_{table_id}");
         let table_dir_path = self.locations.table_dir_path(&table_name);
@@ -350,22 +409,29 @@ impl Storage {
         fs::create_dir(&table_dir_path)?;
         let writer = SSTableWriter::create(&data_file_path, &index_file_path)?;
 
-        let table = SSTableReader::open(
-            table_id,
-            table_name,
-            table_dir_path,
-            index_file_path,
-            data_file_path,
-            String::new()..=String::new(),
-        )?;
+        let table = SSTableMetadata {
+            id: table_id,
+            name: table_name,
+            dir_path: table_dir_path,
+            key_range: String::new()..=String::new(),
+            level,
+        };
 
-        let level_tables = self.levels.entry(level).or_default();
-        level_tables.push(table);
-
-        let table = level_tables
-            .last_mut()
-            .expect("Table should be present after it has been pushed to the level vec");
         Ok((table, writer))
+    }
+
+    fn add_table(&mut self, metadata: SSTableMetadata) -> Result<(), Error> {
+        let data_file_path = self.locations.data_file_path(&metadata.name);
+        let index_file_path = self.locations.index_file_path(&metadata.name);
+        let bloom_filter_file_path = self.locations.bloom_filter_file_path(&metadata.name);
+
+        let reader = SSTableReader::open(index_file_path, data_file_path)?;
+        let bloom_filter = BloomFilter::open(bloom_filter_file_path)?;
+
+        let level_tables = self.levels.entry(metadata.level).or_default();
+        level_tables.push((metadata, reader, bloom_filter));
+
+        Ok(())
     }
 }
 
@@ -497,7 +563,7 @@ impl MemTableValue {
 fn read_manifest(
     manifest_path: impl AsRef<Path>,
     locations: &Locations,
-) -> Result<BTreeMap<u64, Vec<SSTableReader>>, Error> {
+) -> Result<BTreeMap<u64, Vec<SSTableMetadata>>, Error> {
     let mut manifest_reader = ManifestReader::open(&manifest_path)?;
 
     let level_entries = manifest_reader.read_all()?;
@@ -507,23 +573,28 @@ fn read_manifest(
 
         for entry in entries {
             let table_dir_path = locations.table_dir_path(&entry.name);
-            let table_path = locations.data_file_path(&entry.name);
-            let index_path = locations.index_file_path(&entry.name);
 
-            tables.push(SSTableReader::open(
-                entry.id,
-                entry.name,
-                table_dir_path,
-                index_path,
-                table_path,
-                entry.key_range,
-            )?);
+            tables.push(SSTableMetadata {
+                id: entry.id,
+                name: entry.name,
+                dir_path: table_dir_path,
+                key_range: entry.key_range,
+                level,
+            });
         }
 
         levels.insert(level, tables);
     }
 
     Ok(levels)
+}
+
+
+fn write_bloom_filter(bloom_filter: &BloomFilter, path: impl AsRef<Path>) -> io::Result<()> {
+    let bytes = Vec::try_from(bloom_filter)?;
+    fs::write(&path, bytes)?;
+
+    File::open(&path)?.sync_all()
 }
 
 fn grow_range(key: String, range: RangeInclusive<String>) -> RangeInclusive<String> {

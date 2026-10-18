@@ -1,27 +1,17 @@
 use crate::storage::lsm::Error;
+use crate::storage::lsm::sstable::SSTableReader;
 use log::info;
 use std::fs::File;
 use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
-use crate::storage::lsm::sstable::SSTableReader;
 
 #[derive(Debug)]
 pub struct Entry {
     pub id: u64,
     pub name: String,
     pub key_range: RangeInclusive<String>,
-}
-
-impl From<SSTableReader> for Entry{
-    fn from(value: SSTableReader) -> Self {
-        Entry{
-            id: value.id,
-            name: value.name,
-            key_range: value.key_range,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -138,10 +128,10 @@ impl ManifestWriter {
         })
     }
 
-    pub fn write_level<'a>(
+    pub fn write_level(
         &mut self,
         level: u64,
-        tables: impl IntoIterator<Item = &'a SSTableReader>,
+        tables: impl IntoIterator<Item = Entry>,
     ) -> io::Result<()> {
         writeln!(self.file, "[L{level}]")?;
         for table in tables {

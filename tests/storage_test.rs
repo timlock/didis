@@ -62,6 +62,9 @@ fn put() -> Result<(), Box<dyn error::Error>> {
         let cmd = Cmd::try_from(line)?;
         match cmd {
             Cmd::Get { key, want } => {
+                if key == "xxfmv" {
+                    dbg!()
+                }
                 let got = storage.get(key)?;
                 assert_eq!(want, got.as_deref(), "line {i} {cmd:?}");
             }

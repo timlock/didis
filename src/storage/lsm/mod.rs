@@ -2,6 +2,7 @@ mod manifest;
 mod sstable;
 pub mod storage;
 mod wal;
+mod bloom;
 
 use std::array::TryFromSliceError;
 use std::fmt::{Debug, Display};
