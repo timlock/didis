@@ -1,10 +1,43 @@
 use crate::storage::lsm::{Error, read_integer, write_integer};
-use std::io::Cursor;
 use std::io;
+use std::io::Cursor;
 use xxhash_rust::xxh64::xxh64;
 
 const SEED_1: u64 = 0x9E3779B185EBCA87;
 const SEED_2: u64 = 0xC2B2AE3D27D4EB4F;
+
+#[derive(Debug, Default)]
+pub struct BloomFilterBuilder {
+    hashes: Vec<(u64, u64)>,
+}
+
+impl BloomFilterBuilder {
+    pub fn insert(&mut self, value: &str) {
+        self.hashes
+            .push((xxh64(value.as_bytes(), SEED_1), xxh64(value.as_bytes(), SEED_2)))
+    }
+
+    pub fn append<'a>(&mut self, values: impl IntoIterator<Item= &'a str>) {
+        for value in values {
+            self.insert(value);
+        }
+        
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn build(self, desired_error_rate: f32, hash_functions: u32) -> BloomFilter {
+        let mut bloom_filter =
+            BloomFilter::new(self.hashes.len() as u32, desired_error_rate, hash_functions);
+        for (first_hash, second_hash) in self.hashes {
+            bloom_filter.insert_hash(first_hash, second_hash);
+        }
+
+        bloom_filter
+    }
+}
 
 #[derive(Debug)]
 pub struct BloomFilter {
@@ -23,7 +56,15 @@ impl BloomFilter {
     }
 
     pub fn insert(&mut self, value: &str) {
-        let (block, bits) = self.positions(value);
+        let (block, bits) = self.positions_string(value);
+
+        for bit in bits {
+            self.blocks[block] |= 1 << bit;
+        }
+    }
+
+    fn insert_hash(&mut self, first_hash: u64, second_hash: u64) {
+        let (block, bits) = self.positions_hashes(first_hash, second_hash);
 
         for bit in bits {
             self.blocks[block] |= 1 << bit;
@@ -37,7 +78,7 @@ impl BloomFilter {
     }
 
     pub fn contains(&self, value: &str) -> bool {
-        let (block, bits) = self.positions(value);
+        let (block, bits) = self.positions_string(value);
 
         for bit in bits {
             if self.blocks[block] >> bit & 1 == 0 {
@@ -47,9 +88,17 @@ impl BloomFilter {
         true
     }
 
-    fn positions(&self, key: &str) -> (usize, impl Iterator<Item = usize> + use<>) {
-        let first_hash = xxh64(key.as_bytes(), SEED_1) as u128;
-        let second_hash = xxh64(key.as_bytes(), SEED_2) as u128;
+    fn positions_string(&self, key: &str) -> (usize, impl Iterator<Item = usize> + use<>) {
+        self.positions_hashes(xxh64(key.as_bytes(), SEED_1), xxh64(key.as_bytes(), SEED_2))
+    }
+
+    fn positions_hashes(
+        &self,
+        first_hash: u64,
+        second_hash: u64,
+    ) -> (usize, impl Iterator<Item = usize> + use<>) {
+        let first_hash = first_hash as u128;
+        let second_hash = second_hash as u128;
 
         let blocks_len = self.blocks.len() as u128;
 

@@ -1,6 +1,6 @@
 use crate::heap::MinHeap;
 use crate::radix_tree::RadixTree;
-use crate::storage::lsm::bloom::BloomFilter;
+use crate::storage::lsm::bloom::{BloomFilter, BloomFilterBuilder};
 use crate::storage::lsm::manifest::{Entry, ManifestReader, ManifestWriter};
 use crate::storage::lsm::sstable::{SSTableReader, SSTableWriter};
 use crate::storage::lsm::wal::{WriteAheadLogReader, WriteAheadLogWriter};
@@ -271,20 +271,14 @@ impl Storage {
         table.key_range = min..=max;
 
         writer.write(&operations)?;
-        writer.sync()?;
+        let mut bloom_filter_builder = BloomFilterBuilder::default();
+        let keys = operations.iter().map(|operation| operation.key());
+        bloom_filter_builder.append(keys);
 
-        let mut bloom_filter = BloomFilter::new(operations.len() as u32, 0.01, 5);
-        bloom_filter.append(operations.iter().map(|operation| operation.key()));
-
-        let bloom_filter_file_path = self.locations.bloom_filter_file_path(&table.name);
-        create_bloom_filter(&bloom_filter, &bloom_filter_file_path)?;
-
-        self.sync_table_dir(&table.name)?;
+        self.save_table(table, writer, bloom_filter_builder)?;
         self.save_manifest()?;
 
         self.write_ahead_log.truncate()?;
-
-        self.open_table(table)?;
 
         info!("Flush complete took {:?}", start.elapsed());
 
@@ -321,7 +315,7 @@ impl Storage {
         let (mut table, mut writer) =
             create_table(self.id_generator.next(), level + 1, &self.locations)?;
 
-        let mut to_write = Vec::new();
+        let mut bloom_filter_builder = BloomFilterBuilder::default();
         let merger = Merger::new(old_table_iters)?;
         for extracted in merger {
             let (heap_key, operation) = extracted?;
@@ -334,39 +328,20 @@ impl Storage {
                 continue;
             }
 
-            if to_write.len() > max_table_size {
-                writer.write(&to_write)?;
-                writer.sync()?;
-
-                let mut bloom_filter = BloomFilter::new(to_write.len() as u32, 0.01, 5);
-                bloom_filter.append(to_write.iter().map(|operation| operation.key()));
-
-                let bloom_filter_file_path = self.locations.bloom_filter_file_path(&table.name);
-                create_bloom_filter(&bloom_filter, &bloom_filter_file_path)?;
-
-                self.sync_table_dir(&table.name)?;
-
-                self.open_table(table)?;
+            if bloom_filter_builder.len() > max_table_size {
+                self.save_table(table, writer, bloom_filter_builder)?;
+                bloom_filter_builder = BloomFilterBuilder::default();
 
                 (table, writer) =
                     create_table(self.id_generator.next(), level + 1, &self.locations)?;
-                to_write.clear();
             }
 
-            to_write.push(operation);
+            bloom_filter_builder.insert(operation.key());
+            writer.write(iter::once(&operation))?;
             table.key_range = grow_range(heap_key.key, table.key_range.clone());
         }
 
-        writer.write(&to_write)?;
-        writer.sync()?;
-
-        let mut bloom_filter = BloomFilter::new(to_write.len() as u32, 0.01, 5);
-        bloom_filter.append(to_write.iter().map(|operation| operation.key()));
-
-        let bloom_filter_file_path = self.locations.bloom_filter_file_path(&table.name);
-        create_bloom_filter(&bloom_filter, &bloom_filter_file_path)?;
-
-        self.sync_table_dir(&table.name)?;
+        self.save_table(table, writer, bloom_filter_builder)?;
 
         self.save_manifest()?;
 
@@ -375,16 +350,31 @@ impl Storage {
             fs::remove_dir_all(table.dir_path)?;
         }
 
-        self.open_table(table)?;
-
         info!("Compaction complete, took {:?}", start.elapsed());
 
         Ok(())
     }
 
-    fn save_manifest(&mut self) -> Result<(), Error> {
-        info!("Saving manifest entries");
+    fn save_table(
+        &mut self,
+        metadata: SSTableMetadata,
+        mut writer: SSTableWriter,
+        bloom_filter_builder: BloomFilterBuilder,
+    ) -> Result<(), Error> {
+        writer.sync()?;
 
+        let bloom_filter = bloom_filter_builder.build(0.01, 5);
+
+        let bloom_filter_file_path = self.locations.bloom_filter_file_path(&metadata.name);
+        create_bloom_filter(&bloom_filter, &bloom_filter_file_path)?;
+
+        self.sync_table_dir(&metadata.name)?;
+
+        self.open_table(metadata)?;
+        Ok(())
+    }
+
+    fn save_manifest(&mut self) -> Result<(), Error> {
         let mut manifest_writer = ManifestWriter::create(&self.locations.manifest_temp)?;
 
         for (level, tables) in self.levels.iter() {
