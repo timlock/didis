@@ -1,5 +1,4 @@
 use crate::storage::lsm::Error;
-use crate::storage::lsm::sstable::SSTableReader;
 use log::info;
 use std::fs::File;
 use std::io;
@@ -128,19 +127,19 @@ impl ManifestWriter {
         })
     }
 
-    pub fn write_level(
+    pub fn write_level<'a, 'b>(
         &mut self,
         level: u64,
-        tables: impl IntoIterator<Item = Entry>,
+        tables: impl IntoIterator<Item = (&'a RangeInclusive<String>, &'b str)>,
     ) -> io::Result<()> {
         writeln!(self.file, "[L{level}]")?;
-        for table in tables {
+        for (key_range, name) in tables {
             writeln!(
                 self.file,
                 "{}-{}:{}",
-                table.key_range.start(),
-                table.key_range.end(),
-                table.name
+                key_range.start(),
+                key_range.end(),
+                name
             )?;
         }
 

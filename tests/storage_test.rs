@@ -56,15 +56,12 @@ impl<'a> TryFrom<&'a str> for Cmd<'a> {
 fn put() -> Result<(), Box<dyn error::Error>> {
     initialize();
     let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
-    let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
+    let mut storage = Storage::new(temp_dir.path().to_path_buf(), 4000, 5)?;
     let lines = PUT_FILE.lines();
     for (i, line) in lines.enumerate() {
         let cmd = Cmd::try_from(line)?;
         match cmd {
             Cmd::Get { key, want } => {
-                if key == "xxfmv" {
-                    dbg!()
-                }
                 let got = storage.get(key)?;
                 assert_eq!(want, got.as_deref(), "line {i} {cmd:?}");
             }
@@ -84,7 +81,7 @@ fn put() -> Result<(), Box<dyn error::Error>> {
 fn put_delete() -> Result<(), Box<dyn error::Error>> {
     initialize();
     let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
-    let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
+    let mut storage = Storage::new(temp_dir.path().to_path_buf(), 4000, 5)?;
     let lines = PUT_DELETE_FILE.lines();
     for (i, line) in lines.enumerate() {
         let cmd = Cmd::try_from(line)?;
@@ -109,11 +106,11 @@ fn put_delete() -> Result<(), Box<dyn error::Error>> {
 fn put_delete_with_storage_resets() -> Result<(), Box<dyn error::Error>> {
     initialize();
     let temp_dir = TempDir::create(env::current_dir()?.join("temp"))?;
-    let mut storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
+    let mut storage = Storage::new(temp_dir.path().to_path_buf(), 4000, 5)?;
     let lines = PUT_DELETE_FILE.lines();
     for (i, line) in lines.enumerate() {
         if i % 800 == 0 {
-            storage = Storage::new(temp_dir.path().to_path_buf(), 200, 5)?;
+            storage = Storage::new(temp_dir.path().to_path_buf(), 4000, 5)?;
         }
 
         let cmd = Cmd::try_from(line)?;
