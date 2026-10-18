@@ -61,7 +61,7 @@ struct SSTableMetadata {
     name: String,
     dir_path: PathBuf,
     key_range: RangeInclusive<String>,
-    level: u64,
+    level: u32,
 }
 
 impl SSTableMetadata {
@@ -73,7 +73,7 @@ impl SSTableMetadata {
 #[derive(Debug)]
 pub struct Storage {
     mem_table: MemTable,
-    levels: BTreeMap<u64, Vec<(SSTableMetadata, SSTableReader, BloomFilter)>>,
+    levels: BTreeMap<u32, Vec<(SSTableMetadata, SSTableReader, BloomFilter)>>,
     id_generator: IdGenerator,
 
     write_ahead_log: WriteAheadLogWriter,
@@ -223,9 +223,9 @@ impl Storage {
             self.flush()?;
 
             for level in 0..self.levels.len() {
-                let tables_len = self.levels.get(&(level as u64)).map(Vec::len).unwrap_or(0);
+                let tables_len = self.levels.get(&(level as u32)).map(Vec::len).unwrap_or(0);
                 if tables_len >= (level + 1) * self.level_ratio {
-                    self.compact_level(level as u64)?;
+                    self.compact_level(level as u32)?;
                 }
             }
         }
@@ -285,31 +285,19 @@ impl Storage {
         Ok(())
     }
 
-    fn compact_level(&mut self, level: u64) -> Result<(), Error> {
+    fn compact_level(&mut self, level: u32) -> Result<(), Error> {
         info!("Compacting level {level}");
         let start = Instant::now();
 
         let (max_table_size, highest_level) = (self.max_table_size, self.levels.len());
 
-        let mut old_tables = self
-            .levels
-            .remove(&level)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|table| (level, table))
-            .collect::<Vec<_>>();
-
-        old_tables.extend(
-            self.levels
-                .remove(&(level + 1))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|table| (level + 1, table)),
-        );
+        let mut old_levels = self.remove_levels(level..=level + 1);
 
         let mut old_table_iters = HashMap::new();
-        for (level, (old_table_metadata, old_table_reader, _)) in &mut old_tables {
-            old_table_iters.insert(old_table_metadata.id, (*level, old_table_reader.iter()?));
+        for (level, tables) in &mut old_levels {
+            for (old_table_metadata, old_table_reader, _) in tables {
+                old_table_iters.insert(old_table_metadata.id, (*level, old_table_reader.iter()?));
+            }
         }
 
         let (mut table, mut writer) =
@@ -321,7 +309,7 @@ impl Storage {
             let (heap_key, operation) = extracted?;
 
             if let Operation::Delete(_) = &operation
-                && level == highest_level as u64
+                && level == highest_level as u32
             {
                 // Tombstones may only be dropped at the highest level, otherwise operations at
                 // levels higher than the current one could resurface
@@ -345,9 +333,13 @@ impl Storage {
 
         self.save_manifest()?;
 
-        for (_, (table, _, _)) in old_tables {
-            info!("Deleting old table directory {:?}", table.dir_path);
-            fs::remove_dir_all(table.dir_path)?;
+        for metadata in old_levels
+            .into_values()
+            .flatten()
+            .map(|(metadata, _, _)| metadata)
+        {
+            info!("Deleting old table directory {:?}", metadata.dir_path);
+            fs::remove_dir_all(metadata.dir_path)?;
         }
 
         info!("Compaction complete, took {:?}", start.elapsed());
@@ -409,10 +401,22 @@ impl Storage {
 
         Ok(())
     }
+
+    fn remove_levels(
+        &mut self,
+        levels: RangeInclusive<u32>,
+    ) -> HashMap<u32, Vec<(SSTableMetadata, SSTableReader, BloomFilter)>> {
+        let mut tables = HashMap::new();
+        for level in levels {
+            tables.insert(level, self.levels.remove(&level).unwrap_or_default());
+        }
+
+        tables
+    }
 }
 
 struct Merger<I> {
-    sources: HashMap<u64, (u64, I)>,
+    sources: HashMap<u64, (u32, I)>,
     min_heap: MinHeap<MinHeapKey, Operation>,
 }
 
@@ -420,7 +424,7 @@ impl<I> Merger<I>
 where
     I: Iterator<Item = Result<Operation, Error>>,
 {
-    fn new(mut sources: HashMap<u64, (u64, I)>) -> Result<Merger<I>, Error> {
+    fn new(mut sources: HashMap<u64, (u32, I)>) -> Result<Merger<I>, Error> {
         let mut min_heap = MinHeap::default();
 
         for (table_id, (level, table)) in sources.iter_mut() {
@@ -475,7 +479,7 @@ where
 
 fn create_table(
     table_id: u64,
-    level: u64,
+    level: u32,
     locations: &Locations,
 ) -> Result<(SSTableMetadata, SSTableWriter), Error> {
     let table_name = format!("TABLE_{table_id}");
@@ -509,11 +513,11 @@ fn create_bloom_filter(bloom_filter: &BloomFilter, path: impl AsRef<Path>) -> io
 struct MinHeapKey {
     key: String,
     table_id: u64,
-    table_level: u64,
+    table_level: u32,
 }
 
 impl MinHeapKey {
-    fn new(key: String, table_id: u64, table_level: u64) -> MinHeapKey {
+    fn new(key: String, table_id: u64, table_level: u32) -> MinHeapKey {
         MinHeapKey {
             key,
             table_id,
@@ -571,7 +575,7 @@ impl MemTableValue {
 fn read_manifest(
     manifest_path: impl AsRef<Path>,
     locations: &Locations,
-) -> Result<BTreeMap<u64, Vec<SSTableMetadata>>, Error> {
+) -> Result<BTreeMap<u32, Vec<SSTableMetadata>>, Error> {
     let mut manifest_reader = ManifestReader::open(&manifest_path)?;
 
     let level_entries = manifest_reader.read_all()?;

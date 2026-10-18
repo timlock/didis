@@ -21,7 +21,7 @@ impl BloomFilterBuilder {
         for value in values {
             self.insert(value);
         }
-        
+
     }
 
     pub fn len(&self) -> usize {
@@ -47,7 +47,7 @@ pub struct BloomFilter {
 impl BloomFilter {
     pub fn new(max_entries: u32, desired_error_rate: f32, hash_functions: u32) -> BloomFilter {
         let bit_len = estimate_bit_vector_size(max_entries, desired_error_rate, hash_functions);
-        let blocks = vec![0u64; bit_len / 64 * 8];
+        let blocks = vec![0u64; bit_len / 64];
 
         BloomFilter {
             hash_functions,
@@ -106,7 +106,7 @@ impl BloomFilter {
         let mut index = Vec::new();
 
         for i in 1u128..self.hash_functions as u128 {
-            index.push(((first_hash + i * second_hash) % blocks_len) as usize);
+            index.push(((first_hash + i * second_hash) % 64) as usize);
         }
 
         (block as usize, index.into_iter())
@@ -158,9 +158,9 @@ fn estimate_bit_vector_size(
     hash_functions: u32,
 ) -> usize {
     // source https://read.thecoder.cafe/p/bloom-filters
-    let size = -((max_entries * hash_functions) as f32
-        / (1.0 - desired_error_rate.powf(1.0 / hash_functions as f32)))
-    .ln();
+    let size = -((max_entries as u64 * hash_functions as u64) as f32
+        / (1.0 - desired_error_rate.powf(1.0 / hash_functions as f32)).ln())
+    ;
 
     let filler = 64 * 8 - (size as usize % (64 * 8));
     size as usize + filler

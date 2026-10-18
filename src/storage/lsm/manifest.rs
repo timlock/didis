@@ -26,7 +26,7 @@ impl ManifestReader {
         })
     }
 
-    pub fn read_all(&mut self) -> Result<Vec<(u64, Vec<Entry>)>, Error> {
+    pub fn read_all(&mut self) -> Result<Vec<(u32, Vec<Entry>)>, Error> {
         self.file.seek(SeekFrom::Start(0))?;
 
         let mut result = Vec::new();
@@ -37,7 +37,7 @@ impl ManifestReader {
         Ok(result)
     }
 
-    fn read_next_level(&mut self) -> Option<Result<(u64, Vec<Entry>), Error>> {
+    fn read_next_level(&mut self) -> Option<Result<(u32, Vec<Entry>), Error>> {
         let level = match self.read_level_header()? {
             Ok(level) => level,
             Err(err) => return Some(Err(err)),
@@ -77,7 +77,7 @@ impl ManifestReader {
         Ok(lines)
     }
 
-    fn read_level_header(&mut self) -> Option<Result<u64, Error>> {
+    fn read_level_header(&mut self) -> Option<Result<u32, Error>> {
         let mut line = String::new();
         while line.trim().is_empty() {
             match self.file.read_line(&mut line) {
@@ -92,7 +92,7 @@ impl ManifestReader {
         }
 
         let level_str = &line[2..line.len() - 2];
-        Some(level_str.parse::<u64>().map_err(Error::from))
+        Some(level_str.parse::<u32>().map_err(Error::from))
     }
 
     fn parse_entry(line: &str) -> Result<Entry, Error> {
@@ -129,7 +129,7 @@ impl ManifestWriter {
 
     pub fn write_level<'a, 'b>(
         &mut self,
-        level: u64,
+        level: u32,
         tables: impl IntoIterator<Item = (&'a RangeInclusive<String>, &'b str)>,
     ) -> io::Result<()> {
         writeln!(self.file, "[L{level}]")?;
