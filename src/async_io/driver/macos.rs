@@ -1,4 +1,4 @@
-use crate::async_io::{AsyncIO, Completion};
+use crate::async_io::{DriverOS, Completion, Task, TaskHandle};
 use libc::{
     close, kevent, kqueue, timespec, EVFILT_READ, EVFILT_WRITE, EV_ADD, EV_CLEAR, EV_ONESHOT,
 };
@@ -6,35 +6,32 @@ use std::collections::VecDeque;
 use std::io;
 use std::io::{Read, Write};
 use std::mem::zeroed;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 impl From<Task> for Completion {
     fn from(value: Task) -> Self {
         match value {
-            Task::Accept(socket) => {
+            Task::Accept(socket,handle) => {
                 let result = socket.accept();
-                Completion::Accept(socket, result)
+                Completion::Accept(result, handle)
             }
-            Task::Receive(mut socket, mut buf, id) => {
+            Task::Receive(mut socket, mut buf, handle) => {
                 let n = socket.read(buf.as_mut());
-                Completion::Receive(socket, buf, n, id)
+                Completion::Receive( buf, n, handle)
             }
-            Task::Send(mut socket, mut buf, len,id) => {
+            Task::Send(mut socket, mut buf, len,handle) => {
                 let n = socket.write(&mut buf[..len]);
-                Completion::Send(socket, buf, n, id)
+                Completion::Send( buf, n, handle)
             }
         }
     }
 }
 
-enum Task {
-    Accept(TcpListener),
-    Receive(TcpStream, Box<[u8]>, u64),
-    Send(TcpStream, Box<[u8]>, usize, u64),
-}
+
 
 pub struct IO {
     kqueue: c_int,
@@ -94,10 +91,15 @@ impl IO {
     }
 }
 
-impl AsyncIO for IO {
-    fn accept(&mut self, socket: TcpListener) {
+impl DriverOS for IO {
+    fn accept(&mut self, socket: TcpListener) -> TaskHandle<io::Result<(TcpStream, SocketAddr)>>{
+        let handle = TaskHandle {
+            result: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        };
+        
         let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Accept(socket)));
+        let task_ptr = Box::into_raw(Box::new(Task::Accept(socket, handle.clone())));
 
         let event = kevent {
             ident: fd as usize,
@@ -109,11 +111,21 @@ impl AsyncIO for IO {
         };
 
         self.pending.push_back(event);
+        handle
     }
 
-    fn receive(&mut self, socket: TcpStream, buf: Box<[u8]>, id: u64) {
+    fn receive(
+        &mut self,
+        socket: TcpStream,
+        mut buffer: Box<[u8]>,
+    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        let handle = TaskHandle {
+            result: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        };
+        
         let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buf, id)));
+        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer, handle.clone())));
 
         let event = kevent {
             ident: fd as usize,
@@ -125,11 +137,22 @@ impl AsyncIO for IO {
         };
 
         self.pending.push_back(event);
+        handle.clone()
     }
 
-    fn send(&mut self, socket: TcpStream, buf: Box<[u8]>, len: usize, id: u64) {
+    fn send(
+        &mut self,
+        socket: TcpStream,
+        buffer: Box<[u8]>,
+        len: usize,
+    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        let handle = TaskHandle {
+            result: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        };
+        
         let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buf, len, id)));
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, len, handle.clone())));
 
         let event = kevent {
             ident: fd as usize,
@@ -141,6 +164,7 @@ impl AsyncIO for IO {
         };
 
         self.pending.push_back(event);
+        handle
     }
 
     fn poll(&mut self) -> io::Result<Vec<Completion>> {

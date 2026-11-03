@@ -1,37 +1,43 @@
+use crate::async_io::driver::{Driver, IO};
+use log::warn;
+use std::cell::RefCell;
 use std::pin::{Pin, pin};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::thread::Thread;
+use std::time::Duration;
+
+thread_local! {
+    pub static CURRENT: RefCell<Option<Executor> > =  RefCell::new(None) ;
+}
 
 struct Task {
-    task_future: Mutex<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
-    executor: mpsc::Sender<Arc<Task>>,
-    thread_waker: ThreadWaker,
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    scheduler: Scheduler,
 }
 impl Task {
     fn poll(self: Arc<Self>) -> Poll<()> {
         let waker = Waker::from(self.clone());
         let mut cx = Context::from_waker(&waker);
 
-        let mut task_future = self.task_future.try_lock().unwrap();
+        let mut task_future = self.future.try_lock().unwrap();
 
         task_future.as_mut().poll(&mut cx)
     }
 
-    fn spawn<F>(future: F, executor_sender: &mpsc::Sender<Arc<Task>>) -> TaskHandle<F::Output>
+    fn spawn<F>(future: F, scheduler: Scheduler) -> TaskHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         let (handle_sender, handle_receiver) = mpsc::channel();
-
         let handle_waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
-
         let handle_waker_clone = handle_waker.clone();
 
         let task = Arc::new(Task {
-            task_future: Mutex::new(Box::pin(async move {
+            future: Mutex::new(Box::pin(async move {
                 let result = future.await;
 
                 // error can be ignored because the handle might have been dropped
@@ -42,31 +48,21 @@ impl Task {
                     waker.wake_by_ref();
                 }
             })),
-            executor: executor_sender.clone(),
-            thread_waker: ThreadWaker(thread::current()),
+            scheduler: scheduler.clone(),
         });
 
-        let _ = executor_sender.send(task);
+        let _ = scheduler.sender.send(task);
 
         TaskHandle {
             receiver: handle_receiver,
             waker: handle_waker,
         }
     }
-
-    fn schedule(self: &Arc<Self>) {
-        self.executor.send(self.clone()).unwrap();
-        self.thread_waker.0.unpark();
-    }
 }
 
 impl Wake for Task {
     fn wake(self: Arc<Self>) {
-        self.schedule();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.schedule();
+        self.scheduler.schedule(self.clone())
     }
 }
 
@@ -87,76 +83,125 @@ pub struct TaskHandle<T> {
 }
 
 impl<T> Future for TaskHandle<T> {
-    type Output = Result<T, ()>;
+    type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let new_waker = cx.waker();
         let mut current_waker = self.waker.lock().unwrap();
 
-        if current_waker.is_some() && current_waker.as_ref().unwrap().will_wake(new_waker)
+        if current_waker
+            .as_ref()
+            .is_some_and(|current_waker| current_waker.will_wake(new_waker))
             || current_waker.is_none()
         {
             *current_waker = Some(new_waker.clone());
         }
 
         match self.receiver.try_recv() {
-            Ok(result) => Poll::Ready(Ok(result)),
-            Err(_) => Poll::Pending,
+            Ok(result) => Poll::Ready(result),
+            Err(TryRecvError::Empty) => Poll::Pending,
+            Err(TryRecvError::Disconnected) => todo!(),
         }
     }
 }
 
 pub struct Executor {
+    scheduler: Scheduler,
     scheduled: mpsc::Receiver<Arc<Task>>,
-    sender: mpsc::Sender<Arc<Task>>,
+    pub driver: RefCell<Driver>,
 }
 impl Executor {
-    pub fn new() -> Executor {
+    pub fn new(driver: RefCell<Driver>) -> Executor {
         let (sender, scheduled) = mpsc::channel();
-        Executor { sender, scheduled }
-    }
-    pub fn spawn<F>(&mut self, future: F) -> TaskHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        Task::spawn(future, &self.sender)
-    }
-
-    pub fn run(&mut self) {
-        while let Ok(task) = self.scheduled.recv() {
-            let _ = task.poll();
+        Executor {
+            scheduled,
+            scheduler: Scheduler {
+                executor_thread: thread::current(),
+                sender,
+            },
+            driver,
         }
     }
+}
 
-    pub fn block_on<F>(&mut self, future: F) -> F::Output
+pub struct Runtime;
+
+impl Runtime {
+    pub fn new(io: IO) -> Runtime {
+        let executor = Executor::new(RefCell::new(Driver::new(io)));
+        CURRENT.set(Some(executor));
+        Runtime
+    }
+    pub fn block_on<F>(&self, future: F) -> F::Output
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future + 'static,
+        F::Output: 'static,
     {
-        let thread_waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
-        let mut context = Context::from_waker(&thread_waker);
+        CURRENT.with(|executor| {
+            let thread_waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+            let mut context = Context::from_waker(&thread_waker);
 
-        let mut future = pin!(future);
+            let mut future = pin!(future);
 
-        loop {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(result) => return result,
-                Poll::Pending => {}
+            loop {
+                match future.as_mut().poll(&mut context) {
+                    Poll::Ready(result) => return result,
+                    Poll::Pending => {}
+                }
+
+                let tasks = executor
+                    .borrow_mut()
+                    .as_ref()
+                    .unwrap()
+                    .scheduled
+                    .try_iter()
+                    .collect::<Vec<_>>();
+                for task in tasks {
+                    let _ = task.poll();
+                }
+
+                let result = executor
+                    .borrow_mut()
+                    .as_ref()
+                    .unwrap()
+                    .driver
+                    .borrow_mut()
+                    .poll_timeout(Duration::from_secs(1));
+                
+                if let Err(err) = result {
+                    warn!("Poll error {err}")
+                }
             }
+        })
+    }
+}
 
-            for task in self.scheduled.try_iter() {
-                let _ = task.poll();
-            }
+pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    CURRENT
+        .with_borrow(|executor| Task::spawn(future, executor.as_ref().unwrap().scheduler.clone()))
+}
 
-            thread::park();
-        }
+#[derive(Clone)]
+struct Scheduler {
+    executor_thread: Thread,
+    sender: mpsc::Sender<Arc<Task>>,
+}
+
+impl Scheduler {
+    fn schedule(&self, task: Arc<Task>) {
+        self.sender.send(task).unwrap();
+        self.executor_thread.unpark();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::async_io::executor::Executor;
+    use crate::async_io::driver::IO;
+    use crate::async_io::runtime::{Runtime, spawn};
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -198,9 +243,9 @@ mod tests {
 
     #[test]
     fn test() -> Result<(), Box<dyn std::error::Error>> {
-        let mut executor = Executor::new();
+        let runtime = Runtime::new(IO::new(256)?);
 
-        executor.block_on(async {
+        runtime.block_on(async {
             let when = Instant::now() + Duration::from_millis(10);
             let future = Delay { when };
 
@@ -223,16 +268,16 @@ mod tests {
 
     #[test]
     fn block_on_continues_other_tasks() -> Result<(), Box<dyn std::error::Error>> {
-        let mut executor = Executor::new();
+        let runtime = Runtime::new(IO::new(256)?);
 
         let counter = Arc::new(Mutex::new(0));
         let counter_clone = counter.clone();
 
-        executor.spawn(async move {
+        spawn(async move {
             *counter_clone.lock().unwrap() = 1;
         });
 
-        executor.block_on(async {
+        runtime.block_on(async {
             let when = Instant::now() + Duration::from_millis(10);
             let future = Delay { when };
 
@@ -247,16 +292,16 @@ mod tests {
 
     #[test]
     fn join_task() -> Result<(), Box<dyn std::error::Error>> {
-        let mut executor = Executor::new();
+        let runtime = Runtime::new(IO::new(256)?);
 
-        let task_handle = executor.spawn(async move {
+        let task_handle = spawn(async move {
             println!("sub task");
             1
         });
 
-        executor.block_on(async {
+        runtime.block_on(async {
             let result = task_handle.await;
-            assert_eq!(1, result.unwrap());
+            assert_eq!(1, result);
         });
 
         Ok(())

@@ -5,13 +5,14 @@
 #[cfg(not(rust_analyzer))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-use crate::async_io::{AsyncIO, Completion};
+use crate::async_io::driver::{Completion, DriverOS, Task, TaskHandle};
 use std::collections::VecDeque;
 use std::io;
 use std::mem::zeroed;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr::null_mut;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 impl From<&io_uring_cqe> for Completion {
@@ -20,49 +21,42 @@ impl From<&io_uring_cqe> for Completion {
         let task = unsafe { Box::from_raw(task_ptr) };
 
         match *task {
-            Task::Accept(listener) => {
+            Task::Accept(_,task_handle) => {
                 if cqe.res < 0 {
                     return Completion::Accept(
-                        listener,
                         Err(io::Error::from_raw_os_error(-cqe.res)),
+                        task_handle,
                     );
                 }
                 let socket = unsafe { TcpStream::from_raw_fd(cqe.res) };
                 match socket.peer_addr() {
-                    Ok(address) => Completion::Accept(listener, Ok((socket, address))),
-                    Err(err) => Completion::Accept(listener, Err(err)),
+                    Ok(address) => Completion::Accept(Ok((socket, address)), task_handle),
+                    Err(err) => Completion::Accept(Err(err), task_handle),
                 }
             }
-            Task::Receive(socket, received, id) => {
+            Task::Receive(_,received, task_handle) => {
                 if cqe.res < 0 {
                     return Completion::Receive(
-                        socket,
                         received,
                         Err(io::Error::from_raw_os_error(-cqe.res)),
-                        id
+                        task_handle,
                     );
                 }
-                Completion::Receive(socket, received, Ok(cqe.res as _), id)
+                Completion::Receive(received, Ok(cqe.res as _), task_handle)
             }
-            Task::Send(socket, sent, id) => {
+            Task::Send(_,sent, _, task_handle) => {
                 if cqe.res < 0 {
                     return Completion::Send(
-                        socket,
                         sent,
                         Err(io::Error::from_raw_os_error(-cqe.res)),
-                        id
+                        task_handle,
                     );
                 }
-                Completion::Send(socket, sent, Ok(cqe.res as _), id)
+
+                Completion::Receive(sent, Ok(cqe.res as _), task_handle)
             }
         }
     }
-}
-
-enum Task {
-    Accept(TcpListener),
-    Send(TcpStream, Box<[u8]>, u64),
-    Receive(TcpStream, Box<[u8]>, u64),
 }
 
 pub struct IO {
@@ -128,57 +122,89 @@ impl IO {
     }
 }
 
-impl AsyncIO for IO {
-    fn accept(&mut self, listener: TcpListener) {
+impl DriverOS for IO {
+    fn accept(&mut self, listener: TcpListener) -> TaskHandle<io::Result<(TcpStream, SocketAddr)>> {
+        let handle = TaskHandle {
+            result: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        };
+
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            self.pending.push_back(Task::Accept(listener));
-            return;
+            self.pending.push_back(Task::Accept(listener, handle.clone()));
+            return handle;
         }
 
         let fd = listener.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Accept(listener)));
+        let task_ptr = Box::into_raw(Box::new(Task::Accept(listener, handle.clone())));
 
         unsafe {
             io_uring_prep_accept(sqe, fd, null_mut(), null_mut(), 0);
             (*sqe).user_data = task_ptr as _;
         }
+
+        handle
     }
 
-    fn receive(&mut self, socket: TcpStream, mut buffer: Box<[u8]>, id: u64) {
+    fn receive(
+        &mut self,
+        socket: TcpStream,
+        mut buffer: Box<[u8]>,
+    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        let handle = TaskHandle {
+            result: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        };
+
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            self.pending.push_back(Task::Receive(socket, buffer, id));
-            return;
+            self.pending
+                .push_back(Task::Receive(socket, buffer, handle.clone()));
+            return handle;
         }
 
         let fd = socket.as_raw_fd();
         let buf_ptr = buffer.as_mut_ptr();
         let buf_len = buffer.len();
-        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer, id)));
+        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer, handle.clone())));
 
         unsafe {
             io_uring_prep_recv(sqe, fd, buf_ptr as _, buf_len, 0);
             (*sqe).user_data = task_ptr as _;
         }
+
+        handle
     }
 
-    fn send(&mut self, socket: TcpStream, buffer: Box<[u8]>, len: usize, id: u64) {
+    fn send(
+        &mut self,
+        socket: TcpStream,
+        buffer: Box<[u8]>,
+        len: usize,
+    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        let handle = TaskHandle {
+            result: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        };
+
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            self.pending.push_back(Task::Send(socket, buffer, id));
-            return;
+            self.pending
+                .push_back(Task::Send(socket, buffer, len, handle.clone()));
+            return handle;
         }
 
         let fd = socket.as_raw_fd();
         let mut buffer = buffer;
         let buf_ptr = buffer.as_mut_ptr();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, id)));
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, len, handle.clone())));
 
         unsafe {
             io_uring_prep_send(sqe, fd, buf_ptr as _, len, 0);
             (*sqe).user_data = task_ptr as _;
         }
+
+        handle
     }
 
     fn poll(&mut self) -> io::Result<Vec<Completion>> {

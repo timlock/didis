@@ -1,4 +1,5 @@
-use crate::async_io::{AsyncIO, Completion};
+use crate::async_io::net::{AsyncAccept, AsyncReceive, AsyncSend};
+use crate::async_io::runtime::spawn;
 use crate::command::Parser;
 use crate::controller::Controller;
 use crate::resp::Value;
@@ -8,8 +9,8 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, Sender};
-use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Instant, SystemTime};
 use std::{
     collections::HashMap,
     fs,
@@ -22,7 +23,7 @@ pub const BUFFER_SIZE: usize = 4096;
 pub struct Server {
     address: SocketAddr,
     connections: HashMap<u64, Connection>,
-    controller: Controller,
+    controller: Arc<Mutex<Controller>>,
     should_stop: Arc<AtomicBool>,
     is_listening_sender: Option<Sender<()>>,
     id_counter: u64,
@@ -33,17 +34,22 @@ impl Server {
         Self {
             address,
             connections: Default::default(),
-            controller: Controller::new(SystemTime::now()),
+            controller: Arc::new(Mutex::new(Controller::new(SystemTime::now()))),
             is_listening_sender: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             id_counter: 0,
         }
     }
 
-    pub fn run(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
+    pub async fn run(&mut self) -> io::Result<()> {
         if fs::exists("save.rdb")? {
             info!("Loading save.rdb file");
-            if let Err(err) = self.controller.restore_from_snapshot("save.rdb") {
+            if let Err(err) = self
+                .controller
+                .lock()
+                .unwrap()
+                .restore_from_snapshot("save.rdb")
+            {
                 error!("Failed to restore database from save.rdb {err}");
                 return Ok(());
             }
@@ -55,7 +61,6 @@ impl Server {
 
         let listener = TcpListener::bind(self.address)?;
         listener.set_nonblocking(true)?;
-        io.accept(listener);
 
         if let Some(sender) = self.is_listening_sender.as_ref()
             && let Err(err) = sender.send(())
@@ -64,40 +69,68 @@ impl Server {
         }
 
         loop {
-            for completion in io.poll_timeout(Duration::from_secs(1))? {
-                match completion {
-                    Completion::Accept(listener, result) => {
-                        self.handle_accept(io, result)?;
-                        io.accept(listener);
-                    }
-                    Completion::Send(stream, buf, result, client_id) => match result {
-                        Ok(sent) => self.handle_send(stream, buf, sent, client_id),
-                        Err(err) => {
-                            self.connections.remove(&client_id);
-                            self.controller.remove_client(&client_id);
-                            info!("Closed connection {stream:?}: {err}");
-                        }
-                    },
-                    Completion::Receive(stream, buf, result, client_id) => match result {
-                        Ok(received) => self.handle_receive(stream, buf, received, client_id)?,
-                        Err(err) => {
-                            self.connections.remove(&client_id);
-                            self.controller.remove_client(&client_id);
-                            warn!("Closed connection {stream:?} IO error: {err}");
-                        }
-                    },
-                }
-            }
+            let (stream, address) = listener.async_accept().await?;
 
-            if self.controller.has_messages() {
+            let client_id = self.id_counter;
+            self.id_counter += 1;
+            let controller = self.controller.clone();
+
+            info!("New client connected with id {}", client_id);
+
+            spawn(async move {
+                let mut buffer_in: Box<[u8]> = Box::new([0u8; BUFFER_SIZE]);
+                let buffer_out: Box<[u8]> = Box::new([0u8; BUFFER_SIZE]);
+
+                let mut client =
+                    Connection::new(client_id, stream.try_clone()?, None, Some(buffer_out));
+
+                loop {
+                    let (received, buffer) = client.tcp_stream.async_receive(buffer_in).await;
+                    let received = received?;
+                    if received == 0 {
+                        info!("Closed connection {stream:?}");
+                        return io::Result::Ok(());
+                    }
+                    buffer_in = buffer;
+
+                    info!("Received {} bytes from client", received);
+
+                    let commands = client.command_parser.parse_all(&buffer_in[..received]);
+
+                    for command in commands {
+                        let response = match command {
+                            Ok(command) => {
+                                let start = Instant::now();
+                                info!("Received command: {}", command);
+                                if let Some(response) = controller
+                                    .lock()
+                                    .unwrap()
+                                    .handle_command(client_id, command)
+                                {
+                                    info!("Sending response {response} took {:?}", start.elapsed());
+
+                                    response.to_bytes()
+                                } else {
+                                    info!("Took {:?}", start.elapsed());
+                                    Default::default()
+                                }
+                            }
+                            Err(err) => {
+                                warn!("Received faulty command: {:?}", err);
+                                Value::SimpleError(err.to_string()).to_bytes()
+                            }
+                        };
+                        client.send(response);
+                    }
+                    client.flush().await?;
+                }
+            });
+
+            if self.controller.lock().unwrap().has_messages() {
                 self.publish_messages()?;
             }
 
-            for connection in self.connections.values_mut() {
-                connection.flush(io)?;
-            }
-
-            self.controller.do_jobs()?;
+            self.controller.lock().unwrap().do_jobs()?;
 
             if self.should_stop.load(Ordering::Relaxed) {
                 info!("Server stopped");
@@ -115,27 +148,6 @@ impl Server {
             is_listening_receiver: rx,
             should_stop: self.should_stop.clone(),
         }
-    }
-
-    fn handle_accept(
-        &mut self,
-        io: &mut impl AsyncIO,
-        result: io::Result<(TcpStream, SocketAddr)>,
-    ) -> io::Result<()> {
-        let (stream, _) = result?;
-
-        let client_id = self.id_counter;
-        self.id_counter += 1;
-        info!("New client connected with id {}", client_id);
-
-        let buffer_in = Box::new([0u8; BUFFER_SIZE]);
-        let buffer_out = Box::new([0u8; BUFFER_SIZE]);
-
-        let client = Connection::new(client_id, stream.try_clone()?, None, Some(buffer_out));
-        self.connections.insert(client_id, client);
-
-        io.receive(stream, buffer_in, client_id);
-        Ok(())
     }
 
     fn handle_send(
@@ -160,58 +172,8 @@ impl Server {
         connection.handle_sent(sent, buffer_out);
     }
 
-    fn handle_receive(
-        &mut self,
-        stream: TcpStream,
-        buffer_in: Box<[u8]>,
-        received: usize,
-        client_id: u64,
-    ) -> io::Result<()> {
-        let connection = self.connections.get_mut(&client_id).unwrap_or_else(|| {
-            panic!(
-                "Received data from unknown socket with file descriptor: {}",
-                stream.as_raw_fd()
-            )
-        });
-
-        if received == 0 {
-            self.connections.remove(&client_id);
-            self.controller.remove_client(&client_id);
-            info!("Closed connection {stream:?}");
-            return Ok(());
-        }
-
-        info!("Received {} bytes from client", received);
-
-        let commands = connection.command_parser.parse_all(&buffer_in[..received]);
-        for command in commands {
-            let response = match command {
-                Ok(command) => {
-                    let start = Instant::now();
-                    info!("Received command: {}", command);
-                    if let Some(response) = self.controller.handle_command(connection.id, command) {
-                        info!("Sending response {response} took {:?}", start.elapsed());
-
-                        response.to_bytes()
-                    } else {
-                        info!("Took {:?}", start.elapsed());
-                        Default::default()
-                    }
-                }
-                Err(err) => {
-                    warn!("Received faulty command: {:?}", err);
-                    Value::SimpleError(err.to_string()).to_bytes()
-                }
-            };
-            connection.send(response);
-        }
-        connection.buffer_in = Some(buffer_in);
-
-        Ok(())
-    }
-
     fn publish_messages(&mut self) -> io::Result<()> {
-        let messages = self.controller.messages();
+        let messages = self.controller.lock().unwrap().messages();
         for message in messages {
             let bytes = message.value.to_bytes();
 
@@ -312,20 +274,15 @@ impl Connection {
         }
     }
 
-    fn flush(&mut self, io: &mut impl AsyncIO) -> io::Result<()> {
+    async fn flush(&mut self) -> io::Result<()> {
         if self.buffer_out_len > 0
             && let Some(buffer_out) = self.buffer_out.take()
         {
-            io.send(
-                self.tcp_stream.try_clone()?,
-                buffer_out,
-                self.buffer_out_len,
-                self.id,
-            );
-        } else if self.buffer_out_len == 0
-            && let Some(buffer_in) = self.buffer_in.take()
-        {
-            io.receive(self.tcp_stream.try_clone()?, buffer_in, self.id);
+            let (sent, buffer_out) = self
+                .tcp_stream
+                .async_send(buffer_out, self.buffer_out_len)
+                .await;
+            self.handle_sent(sent?, buffer_out);
         }
         Ok(())
     }
