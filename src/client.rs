@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;
 
+//todo make client async
 pub struct Client {
     tcp_stream: TcpStream,
     resp_parser: resp::Parser,

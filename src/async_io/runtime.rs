@@ -217,7 +217,6 @@ mod tests {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
             if Instant::now() >= self.when {
-                println!("Hello world");
                 Poll::Ready("done")
             } else {
                 // Get a handle to the waker for the current task
@@ -232,7 +231,6 @@ mod tests {
                         thread::sleep(when - now);
                     }
 
-                    println!("waking");
                     waker.wake();
                 });
 
@@ -259,8 +257,6 @@ mod tests {
 
             let out = future.await;
             assert_eq!(out, "done");
-
-            println!("Done 2");
         });
 
         Ok(())
@@ -294,14 +290,25 @@ mod tests {
     fn join_task() -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Runtime::new(IO::new(256)?);
 
-        let task_handle = spawn(async move {
-            println!("sub task");
-            1
-        });
+        let task_handle = spawn(async move { 1 });
 
         runtime.block_on(async {
             let result = task_handle.await;
             assert_eq!(1, result);
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_spawn() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Runtime::new(IO::new(256)?);
+
+        runtime.block_on(async {
+            let task_handle =
+                spawn(async { 1 + spawn(async { 2 + spawn(async { 3 }).await }).await });
+            let result = task_handle.await;
+            assert_eq!(6, result);
         });
 
         Ok(())

@@ -1,3 +1,4 @@
+use crate::async_io::mpsc::{Receiver, Sender, channel};
 use crate::async_io::net::{AsyncAccept, AsyncReceive, AsyncSend};
 use crate::async_io::runtime::spawn;
 use crate::command::Parser;
@@ -8,8 +9,8 @@ use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvError, Sender};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc::RecvError;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 use std::{
     collections::HashMap,
@@ -140,7 +141,7 @@ impl Server {
     }
 
     pub fn handle(&mut self) -> ServerHandle {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = channel();
         self.is_listening_sender = Some(tx);
 
         ServerHandle {
@@ -195,12 +196,12 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    pub fn wait_until_listening(&mut self) -> Result<(), RecvError> {
+    pub async fn wait_until_listening(&mut self) -> Result<(), RecvError> {
         if self.is_listening {
             return Ok(());
         }
 
-        self.is_listening_receiver.recv()?;
+        self.is_listening_receiver.recv().await?;
         self.is_listening = true;
 
         Ok(())
