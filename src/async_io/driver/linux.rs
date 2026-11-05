@@ -15,6 +15,8 @@ use std::ptr::null_mut;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+//TODO use provided buffers https://manpages.ubuntu.com/manpages/resolute/man7/io_uring_provided_buffers.7.html
+
 impl From<&io_uring_cqe> for Completion {
     fn from(cqe: &io_uring_cqe) -> Self {
         let task_ptr: *mut Task = cqe.user_data as _;

@@ -1,6 +1,6 @@
 use crate::async_io::mpsc::{Receiver, Sender, channel};
 use crate::async_io::net::{AsyncAccept, AsyncReceive, AsyncSend};
-use crate::async_io::runtime::spawn;
+use crate::async_io::runtime::{select_pair, spawn, SelectResult};
 use crate::command::Parser;
 use crate::controller::Controller;
 use crate::resp::Value;
@@ -25,19 +25,23 @@ pub struct Server {
     address: SocketAddr,
     connections: HashMap<u64, Connection>,
     controller: Arc<Mutex<Controller>>,
-    should_stop: Arc<AtomicBool>,
+    stop_sender: Sender<()>,
+    stop_receiver: Receiver<()>,
     is_listening_sender: Option<Sender<()>>,
     id_counter: u64,
 }
 
 impl Server {
     pub fn new(address: SocketAddr) -> Self {
+        let (stop_sender, stop_receiver) = channel();
+
         Self {
             address,
             connections: Default::default(),
             controller: Arc::new(Mutex::new(Controller::new(SystemTime::now()))),
             is_listening_sender: None,
-            should_stop: Arc::new(AtomicBool::new(false)),
+            stop_sender,
+            stop_receiver,
             id_counter: 0,
         }
     }
@@ -70,7 +74,19 @@ impl Server {
         }
 
         loop {
-            let (stream, address) = listener.async_accept().await?;
+            let select_result = select_pair(listener.async_accept(), self.stop_receiver.recv()).await;
+            let accept_result = match select_result{
+                SelectResult::First(accept_result) => {accept_result}
+                SelectResult::Second(Err(RecvError)) => {
+                    warn!("server handle got dropped");
+                    continue;
+                }
+                SelectResult::Second(Ok(())) => {
+                    info!("Server stopped");
+                    return Ok(());
+                }
+            };
+            let (stream, address) = accept_result?;
 
             let client_id = self.id_counter;
             self.id_counter += 1;
@@ -127,16 +143,13 @@ impl Server {
                 }
             });
 
+            //TODO move to async channel
             if self.controller.lock().unwrap().has_messages() {
                 self.publish_messages()?;
             }
 
             self.controller.lock().unwrap().do_jobs()?;
 
-            if self.should_stop.load(Ordering::Relaxed) {
-                info!("Server stopped");
-                return Ok(());
-            }
         }
     }
 
@@ -147,7 +160,7 @@ impl Server {
         ServerHandle {
             is_listening: false,
             is_listening_receiver: rx,
-            should_stop: self.should_stop.clone(),
+            stop_sender: self.stop_sender.clone()
         }
     }
 
@@ -190,7 +203,7 @@ impl Server {
 }
 
 pub struct ServerHandle {
-    should_stop: Arc<AtomicBool>,
+    stop_sender: Sender<()>,
     is_listening: bool,
     is_listening_receiver: Receiver<()>,
 }
@@ -208,7 +221,7 @@ impl ServerHandle {
     }
 
     pub fn stop(&self) {
-        self.should_stop.store(true, Ordering::Relaxed);
+        self.stop_sender.send(()).unwrap(); // TODO requires receiver to be Send check if the pattern makes sense
     }
 }
 

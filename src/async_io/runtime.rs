@@ -1,6 +1,7 @@
 use crate::async_io::driver::{Driver, IO};
 use log::warn;
 use std::cell::RefCell;
+use std::future::poll_fn;
 use std::pin::{Pin, pin};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex, mpsc};
@@ -167,7 +168,7 @@ impl Runtime {
                     .driver
                     .borrow_mut()
                     .poll_timeout(Duration::from_secs(1));
-                
+
                 if let Err(err) = result {
                     warn!("Poll error {err}")
                 }
@@ -196,6 +197,47 @@ impl Scheduler {
         self.sender.send(task).unwrap();
         self.executor_thread.unpark();
     }
+}
+
+pub async fn select<T>(futures: &mut [Pin<&mut impl Future<Output = T>>]) -> T {
+    poll_fn(|cx| {
+        for future in futures.iter_mut() {
+            match future.as_mut().poll(cx) {
+                Poll::Ready(result) => return Poll::Ready(result),
+                Poll::Pending => {}
+            };
+        }
+
+        Poll::Pending
+    })
+    .await
+}
+
+#[derive(Debug, Hash, PartialEq, PartialOrd, Eq, Ord)]
+pub enum SelectResult<A, B> {
+    First(A),
+    Second(B),
+}
+pub async fn select_pair<A, B>(
+    first: impl Future<Output = A>,
+    second: impl Future<Output = B>,
+) -> SelectResult<A, B> {
+    let mut first_pinned = pin!(first);
+    let mut second_pinned = pin!(second);
+    poll_fn(|cx| {
+        match first_pinned.as_mut().poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(SelectResult::First(result)),
+            Poll::Pending => {}
+        }
+
+        match second_pinned.as_mut().poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(SelectResult::Second(result)),
+            Poll::Pending => {}
+        }
+
+        Poll::Pending
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -240,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test() -> Result<(), Box<dyn std::error::Error>> {
+    fn wait_for_timer() -> Result<(), Box<dyn std::error::Error>> {
         let runtime = Runtime::new(IO::new(256)?);
 
         runtime.block_on(async {

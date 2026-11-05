@@ -1,14 +1,17 @@
 use crate::async_io::driver::DriverOS;
 use crate::async_io::runtime::CURRENT;
-use std::io;
+use std::{error, io};
+use std::fmt::{Display, Formatter};
+use std::future::poll_fn;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::task::Poll;
 
 pub trait AsyncAccept {
-    fn async_accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>>;
+    fn async_accept(&self) -> impl Future<Output=io::Result<(TcpStream, SocketAddr)>>;
 }
 
 impl AsyncAccept for TcpListener {
-    fn async_accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> {
+    fn async_accept(&self) -> impl Future<Output=io::Result<(TcpStream, SocketAddr)>> {
         CURRENT.with_borrow(|executor| {
             executor
                 .as_ref()
@@ -22,13 +25,13 @@ impl AsyncAccept for TcpListener {
 
 pub trait AsyncReceive {
     fn async_receive(&self, buf: Box<[u8]>)
-    -> impl Future<Output = (io::Result<usize>, Box<[u8]>)>;
+                     -> impl Future<Output=(io::Result<usize>, Box<[u8]>)>;
 }
 impl AsyncReceive for TcpStream {
     fn async_receive(
         &self,
         buf: Box<[u8]>,
-    ) -> impl Future<Output = (io::Result<usize>, Box<[u8]>)> {
+    ) -> impl Future<Output=(io::Result<usize>, Box<[u8]>)> {
         CURRENT.with_borrow(|executor| {
             executor
                 .as_ref()
@@ -45,7 +48,7 @@ pub trait AsyncSend {
         &self,
         buf: Box<[u8]>,
         len: usize,
-    ) -> impl Future<Output = (io::Result<(usize)>, Box<[u8]>)>;
+    ) -> impl Future<Output=(io::Result<usize>, Box<[u8]>)>;
 }
 
 impl AsyncSend for TcpStream {
@@ -53,7 +56,7 @@ impl AsyncSend for TcpStream {
         &self,
         buf: Box<[u8]>,
         len: usize,
-    ) -> impl Future<Output = (io::Result<(usize)>, Box<[u8]>)> {
+    ) -> impl Future<Output=(io::Result<(usize)>, Box<[u8]>)> {
         CURRENT.with_borrow(|executor| {
             executor
                 .as_ref()

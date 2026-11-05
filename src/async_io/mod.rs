@@ -1,4 +1,4 @@
 pub mod driver;
-pub mod runtime;
-pub mod net;
 pub mod mpsc;
+pub mod net;
+pub mod runtime;

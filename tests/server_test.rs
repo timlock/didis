@@ -61,7 +61,7 @@ fn set_value() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = Client::new(stream);
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
 
         assert_eq!(Value::Null, response);
 
@@ -72,19 +72,19 @@ fn set_value() -> Result<(), Box<dyn std::error::Error>> {
             get: false,
             expire_rule: None,
         };
-        let response = client.send(set_cmd)?;
+        let response = client.send(set_cmd).await?;
         assert_eq!(Value::ok(), response);
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
         assert_eq!(Value::BulkString(String::from("Value")), response);
 
         let get_cmd = Command::Exists(vec![Cow::Owned(String::from("Key"))]);
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
         assert_eq!(Value::Integer(1), response);
 
         let get_cmd = Command::Delete(vec![Cow::Owned(String::from("Key"))]);
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
         assert_eq!(Value::Integer(1), response);
 
         server_handle.stop();
@@ -138,7 +138,7 @@ fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
             },
             Command::Get(Cow::Borrowed("Key2")),
         ];
-        let response = client.send_batch(cmd_batch)?;
+        let response = client.send_batch(cmd_batch).await?;
         assert_eq!(7, response.len());
         assert_eq!(Value::ok(), response[0]);
         assert_eq!(Value::ok(), response[1]);
@@ -171,7 +171,7 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = Client::new(stream);
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
 
         assert_eq!(Value::Null, response);
 
@@ -187,11 +187,11 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
             get: false,
             expire_rule: None,
         };
-        let response = client.send(set_cmd)?;
+        let response = client.send(set_cmd).await?;
         assert_eq!(Value::ok(), response);
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
         assert_eq!(Value::BulkString(String::from(large_value)), response);
 
         server_handle.stop();
@@ -217,7 +217,7 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
             Cow::Owned(String::from("first")),
             Cow::Owned(String::from("second")),
         ]);
-        let response = client.send(subscribe_cmd)?;
+        let response = client.send(subscribe_cmd).await?;
         assert_eq!(Value::Null, response);
 
         let published = client.published();
@@ -243,7 +243,7 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
             channel: Cow::Owned(String::from("first")),
             message: Cow::Owned(String::from("hello first")),
         };
-        let response = client.send(publish_cmd)?;
+        let response = client.send(publish_cmd).await?;
         assert_eq!(Value::Integer(1), response);
 
         let published = client.published();
@@ -261,7 +261,7 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
             Cow::Owned(String::from("first")),
             Cow::Owned(String::from("second")),
         ]);
-        let response = client.send(unsubscribe_cmd)?;
+        let response = client.send(unsubscribe_cmd).await?;
         assert_eq!(Value::Null, response);
 
         let published = client.published();
@@ -303,24 +303,24 @@ fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = Client::new(stream);
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
 
         assert_eq!(Value::Null, response);
 
         let incr_cmd = Command::Increment(Cow::Borrowed("Key"));
-        let response = client.send(incr_cmd)?;
+        let response = client.send(incr_cmd).await?;
         assert_eq!(Value::Integer(1), response);
 
         let decr_cmd = Command::Decrement(Cow::Borrowed("Key"));
-        let response = client.send(decr_cmd)?;
+        let response = client.send(decr_cmd).await?;
         assert_eq!(Value::Integer(0), response);
 
         let incr_cmd = Command::IncrementBy(Cow::Borrowed("Key"), 5);
-        let response = client.send(incr_cmd)?;
+        let response = client.send(incr_cmd).await?;
         assert_eq!(Value::Integer(5), response);
 
         let decr_cmd = Command::DecrementBy(Cow::Borrowed("Key"), 5);
-        let response = client.send(decr_cmd)?;
+        let response = client.send(decr_cmd).await?;
         assert_eq!(Value::Integer(0), response);
 
         let set_cmd = Command::Set {
@@ -330,11 +330,11 @@ fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
             get: false,
             expire_rule: None,
         };
-        let response = client.send(set_cmd)?;
+        let response = client.send(set_cmd).await?;
         assert_eq!(Value::ok(), response);
 
         let incr_faulty_key_cmd = Command::Increment(Cow::Borrowed("faulty"));
-        let response = client.send(incr_faulty_key_cmd)?;
+        let response = client.send(incr_faulty_key_cmd).await?;
         assert_eq!(
             Value::SimpleError(String::from("value is not an integer or out of range")),
             response
@@ -360,7 +360,7 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = Client::new(stream);
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
-        let response = client.send(get_cmd)?;
+        let response = client.send(get_cmd).await?;
 
         assert_eq!(Value::Null, response);
 
@@ -368,11 +368,11 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
             Cow::Borrowed("Key"),
             vec![Cow::Borrowed("first"), Cow::Borrowed("second")],
         );
-        let response = client.send(lpush_cmd)?;
+        let response = client.send(lpush_cmd).await?;
         assert_eq!(Value::Integer(2), response);
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 0, -1);
-        let response = client.send(lrange_cmd)?;
+        let response = client.send(lrange_cmd).await?;
         assert_eq!(
             Value::Array(vec![
                 Value::BulkString(String::from("second")),
@@ -385,11 +385,11 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
             Cow::Borrowed("Key"),
             vec![Cow::Borrowed("third"), Cow::Borrowed("fourth")],
         );
-        let response = client.send(rpush_cmd)?;
+        let response = client.send(rpush_cmd).await?;
         assert_eq!(Value::Integer(4), response);
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 0, -1);
-        let response = client.send(lrange_cmd)?;
+        let response = client.send(lrange_cmd).await?;
         assert_eq!(
             Value::Array(vec![
                 Value::BulkString(String::from("second")),
@@ -401,11 +401,11 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 1, 0);
-        let response = client.send(lrange_cmd)?;
+        let response = client.send(lrange_cmd).await?;
         assert_eq!(Value::Array(vec![]), response);
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), -2, -1);
-        let response = client.send(lrange_cmd)?;
+        let response = client.send(lrange_cmd).await?;
         assert_eq!(
             Value::Array(vec![
                 Value::BulkString(String::from("third")),
@@ -415,14 +415,14 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), 0, 0);
-        let response = client.send(lrange_cmd)?;
+        let response = client.send(lrange_cmd).await?;
         assert_eq!(
             Value::Array(vec![Value::BulkString(String::from("second")),]),
             response
         );
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), -4, 3);
-        let response = client.send(lrange_cmd)?;
+        let response = client.send(lrange_cmd).await?;
         assert_eq!(
             Value::Array(vec![
                 Value::BulkString(String::from("second")),
@@ -434,7 +434,7 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let lrange_cmd = Command::ListRange(Cow::Borrowed("Key"), -100, 100);
-        let response = client.send(lrange_cmd)?;
+        let response = client.send(lrange_cmd).await?;
         assert_eq!(
             Value::Array(vec![
                 Value::BulkString(String::from("second")),
