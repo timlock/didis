@@ -3,7 +3,6 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::{RecvError, SendError};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
-use log::info;
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let (inner_sender, inner_receiver) = std::sync::mpsc::channel();
@@ -22,30 +21,28 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 pub struct Receiver<T> {
-    inner:  Mutex<std::sync::mpsc::Receiver<T>>, // TODO check if mutex is necessary
+    inner: Mutex<std::sync::mpsc::Receiver<T>>, // TODO check if mutex is necessary
     waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl<T> Receiver<T> {
-    pub async fn recv(&self) -> Result<T, RecvError> {
-        poll_fn(|cx| match self.inner.lock().unwrap().try_recv() {
-            Ok(value) => Poll::Ready(Ok(value)),
-            Err(TryRecvError::Disconnected) => Poll::Ready(Err(RecvError {})),
-            Err(TryRecvError::Empty) => {
-                let new_waker = cx.waker();
-                if self
-                    .waker
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_none_or(|current_waker| !current_waker.will_wake(new_waker))
-                {
-                    self.waker.lock().unwrap().replace(new_waker.clone());
-                }
-                Poll::Pending
+    pub fn recv(&self) -> impl Future<Output = Result<T, RecvError>> {
+        poll_fn(|cx| {
+            let mut current_waker = self.waker.lock().unwrap();
+            let new_waker = cx.waker();
+            if current_waker
+                .as_ref()
+                .is_none_or(|current_waker| !current_waker.will_wake(new_waker))
+            {
+                current_waker.replace(new_waker.clone());
+            }
+
+            match self.inner.lock().unwrap().try_recv() {
+                Ok(value) => Poll::Ready(Ok(value)),
+                Err(TryRecvError::Disconnected) => Poll::Ready(Err(RecvError {})),
+                Err(TryRecvError::Empty) => Poll::Pending,
             }
         })
-        .await
     }
 
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
@@ -76,12 +73,10 @@ impl<T> Sender<T> {
 mod tests {
     use crate::async_io::driver::IO;
     use crate::async_io::mpsc::channel;
-    use crate::async_io::runtime::{select, select_pair, spawn, Runtime, SelectResult};
-    use std::pin::{Pin, pin};
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
+    use crate::async_io::runtime::{Runtime, SelectResult, select, select_pair};
+    use std::pin::pin;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn wait_for_receive() -> Result<(), Box<dyn std::error::Error>> {
@@ -140,7 +135,7 @@ mod tests {
         let received =
             runtime.block_on(async move { select_pair(receiver1.recv(), receiver2.recv()).await });
 
-        assert_eq!(SelectResult::Second(Ok(2)), received);
+        assert_eq!(SelectResult::B(Ok(2)), received);
         thread_handle.join().unwrap();
         Ok(())
     }

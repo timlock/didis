@@ -220,6 +220,9 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
         let response = client.send(subscribe_cmd).await?;
         assert_eq!(Value::Null, response);
 
+        let response = client.receive().await?;
+        assert!(response.is_empty());
+
         let published = client.published();
         assert_eq!(2, published.len());
         assert_eq!(
@@ -246,6 +249,8 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
         let response = client.send(publish_cmd).await?;
         assert_eq!(Value::Integer(1), response);
 
+        client.receive().await?;
+
         let published = client.published();
         assert_eq!(1, published.len());
         assert_eq!(
@@ -263,6 +268,8 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
         ]);
         let response = client.send(unsubscribe_cmd).await?;
         assert_eq!(Value::Null, response);
+
+        client.receive().await?;
 
         let published = client.published();
         assert_eq!(2, published.len());

@@ -2,13 +2,14 @@ use crate::async_io::driver::{Driver, IO};
 use log::warn;
 use std::cell::RefCell;
 use std::future::poll_fn;
+use std::marker::PhantomData;
 use std::pin::{Pin, pin};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
-use std::thread;
 use std::thread::Thread;
 use std::time::Duration;
+use std::{mem, thread};
 
 thread_local! {
     pub static CURRENT: RefCell<Option<Executor> > =  RefCell::new(None) ;
@@ -215,29 +216,51 @@ pub async fn select<T>(futures: &mut [Pin<&mut impl Future<Output = T>>]) -> T {
 
 #[derive(Debug, Hash, PartialEq, PartialOrd, Eq, Ord)]
 pub enum SelectResult<A, B> {
-    First(A),
-    Second(B),
+    A(A),
+    B(B),
 }
-pub async fn select_pair<A, B>(
-    first: impl Future<Output = A>,
-    second: impl Future<Output = B>,
-) -> SelectResult<A, B> {
-    let mut first_pinned = pin!(first);
-    let mut second_pinned = pin!(second);
+pub async fn select_pair<A: Future, B: Future>(a: A, b: B) -> SelectResult<A::Output, B::Output> {
+    let mut first_pinned = pin!(a);
+    let mut second_pinned = pin!(b);
     poll_fn(|cx| {
         match first_pinned.as_mut().poll(cx) {
-            Poll::Ready(result) => return Poll::Ready(SelectResult::First(result)),
+            Poll::Ready(result) => return Poll::Ready(SelectResult::A(result)),
             Poll::Pending => {}
         }
 
         match second_pinned.as_mut().poll(cx) {
-            Poll::Ready(result) => return Poll::Ready(SelectResult::Second(result)),
+            Poll::Ready(result) => return Poll::Ready(SelectResult::B(result)),
             Poll::Pending => {}
         }
 
         Poll::Pending
     })
     .await
+}
+
+pub async fn select_without_drop<A: Future + Unpin, B: Future + Unpin>(
+    mut a: A,
+    mut b: B,
+) -> SelectResult<(A::Output, B), (B::Output, A)> {
+    let result = poll_fn(|cx| {
+        match Pin::new(&mut a).poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(SelectResult::A(result)),
+            Poll::Pending => {}
+        }
+
+        match Pin::new(&mut b).poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(SelectResult::B(result)),
+            Poll::Pending => {}
+        }
+
+        Poll::Pending
+    })
+    .await;
+
+    match result {
+        SelectResult::A(result) => SelectResult::A((result, b)),
+        SelectResult::B(result) => SelectResult::B((result, a)),
+    }
 }
 
 pub enum SelectTripleResult<A, B, C> {

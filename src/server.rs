@@ -1,11 +1,12 @@
 use crate::async_io::buf::BufWriter;
 use crate::async_io::mpsc::{Receiver, Sender, channel};
 use crate::async_io::runtime::{
-    SelectTripleResult, select_triple, spawn,
+    SelectResult, SelectTripleResult,
+    select_triple, select_without_drop, spawn,
 };
 use crate::async_io::slice::{AsSlice, AsSliceMut};
 use crate::async_io::{AsyncAccept, AsyncRead, AsyncWrite};
-use crate::command::{Command, Parser};
+use crate::command::Parser;
 use crate::controller::Controller;
 use crate::pubsub::Message;
 use crate::resp::Value;
@@ -25,7 +26,7 @@ pub const BUFFER_SIZE: usize = 4096;
 
 pub struct Server {
     address: SocketAddr,
-    connections: HashMap<u64, Connection>,
+    connections: HashMap<u64, Sender<Value>>,
     controller: Arc<Mutex<Controller>>,
     pub_sub_receiver: Receiver<Message>,
     stop_sender: Sender<()>,
@@ -126,6 +127,9 @@ impl Server {
         let client_id = self.id_counter;
         self.id_counter += 1;
 
+        let (sender, receiver) = channel();
+        self.connections.insert(client_id, sender);
+
         info!("New client connected with id {}", client_id);
 
         spawn(async move {
@@ -133,65 +137,87 @@ impl Server {
 
             let mut client = Connection::new(client_id, stream);
 
+            let mut receive_fut = client.tcp_stream.async_read(buffer_in.slice_mut(..));
+            let mut pub_sub_fut = receiver.recv();
+
             loop {
-                let (received, buffer) = client
-                    .buf_writer
-                    .get_mut()
-                    .async_read(buffer_in.slice_mut(..))
-                    .await;
-                let received = received?;
-                if received == 0 {
-                    info!("Closed connection {address:?}");
-                    return io::Result::Ok(());
-                }
-                buffer_in = buffer.into_inner();
+                match select_without_drop(receive_fut, pub_sub_fut).await {
+                    SelectResult::A(((received, buffer), other_fut)) => {
+                        let received = received?;
+                        if received == 0 {
+                            info!("Closed connection {address:?}");
+                            return io::Result::Ok(());
+                        }
 
-                info!("Received {} bytes from client", received);
+                        info!("Received {} bytes from client", received);
 
-                let commands = client.command_parser.parse_all(&buffer_in[..received]);
+                        let commands = client.command_parser.parse_all(&buffer[..received]);
 
-                for command in commands {
-                    let response = match command {
-                        Ok(command) => {
-                            let start = Instant::now();
-                            info!("Received command: {}", command);
-                            if let Some(response) = controller
-                                .lock()
-                                .unwrap()
-                                .handle_command(client_id, command)
-                            {
-                                info!("Sending response {response} took {:?}", start.elapsed());
+                        for command in commands {
+                            let response = match command {
+                                Ok(command) => {
+                                    let start = Instant::now();
+                                    info!("Received command: {}", command);
+                                    if let Some(response) = controller
+                                        .lock()
+                                        .unwrap()
+                                        .handle_command(client_id, command)
+                                    {
+                                        info!(
+                                            "Sending response {response} took {:?}",
+                                            start.elapsed()
+                                        );
 
-                                Some(response.to_bytes())
-                            } else {
-                                info!("Took {:?}", start.elapsed());
-                                None
+                                        Some(response.to_bytes())
+                                    } else {
+                                        info!("Took {:?}", start.elapsed());
+                                        None
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("Received faulty command: {:?}", err);
+                                    Some(Value::SimpleError(err.to_string()).to_bytes())
+                                }
+                            };
+                            if let Some(response) = response {
+                                let (result, buf) =
+                                    client.buf_writer.async_write_all(response.slice(..)).await;
+                                result?;
                             }
                         }
-                        Err(err) => {
-                            warn!("Received faulty command: {:?}", err);
-                            Some(Value::SimpleError(err.to_string()).to_bytes())
-                        }
-                    };
-                    if let Some(response) = response {
-                        let (result, buf) =
-                            client.buf_writer.async_write_all(response.slice(..)).await;
-                        result?;
+                        
+                        client.buf_writer.flush().await?;
+
+                        buffer_in = buffer.into_inner();
+                        receive_fut = client.tcp_stream.async_read(buffer_in.slice_mut(..));
+                        pub_sub_fut = other_fut;
                     }
-                }
-                client.buf_writer.flush().await?;
+                    SelectResult::B((value, other_fut)) => {
+                        pub_sub_fut = receiver.recv();
+                        receive_fut = other_fut;
+
+                        let value = match value {
+                            Ok(value) => value,
+                            Err(RecvError) => {
+                                warn!("pub sub sender got closed");
+                                continue;
+                            }
+                        };
+                        let bytes = value.to_bytes().slice(..);
+
+                        let (result, buf) = client.buf_writer.async_write_all(bytes).await;
+                        result?;
+                        client.buf_writer.flush().await?;
+                    }
+                };
             }
         });
     }
 
     async fn publish_messages(&mut self, message: Message) -> io::Result<()> {
-        let mut bytes = message.value.to_bytes().slice(..);
-
         for receiver_id in &message.receivers {
             if let Some(connection) = self.connections.get_mut(receiver_id) {
-                let (result, buf) = connection.buf_writer.async_write_all(bytes).await;
-                bytes = buf;
-                result?;
+                connection.send(message.value.clone()).unwrap();
             }
         }
 
@@ -226,14 +252,16 @@ struct Connection {
     id: u64,
     command_parser: Parser,
     buf_writer: BufWriter<TcpStream>,
+    tcp_stream: TcpStream,
 }
 
 impl Connection {
     fn new(id: u64, tcp_stream: TcpStream) -> Self {
         Self {
             id,
-            buf_writer: BufWriter::new(tcp_stream),
+            buf_writer: BufWriter::new(tcp_stream.try_clone().unwrap()),
             command_parser: Default::default(),
+            tcp_stream,
         }
     }
 }
