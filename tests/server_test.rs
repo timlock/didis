@@ -7,12 +7,12 @@ use didis::resp::Value;
 use didis::server::{BUFFER_SIZE, Server, ServerHandle};
 use log::Level;
 use std::borrow::Cow;
+use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex, Once};
 use std::time::Duration;
-use std::io;
 
 static INIT: Once = Once::new();
 
@@ -192,7 +192,7 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd).await?;
-        assert_eq!(Value::BulkString(String::from(large_value)), response);
+        assert_eq!(Value::BulkString(large_value), response);
 
         server_handle.stop();
         task_handle.await?;

@@ -1,17 +1,12 @@
-use crate::async_io::driver::DriverOS;
 use crate::async_io::runtime::CURRENT;
-use std::{error, io};
-use std::fmt::{Display, Formatter};
-use std::future::poll_fn;
+use crate::async_io::slice::{Slice, SliceMut};
+use crate::async_io::{AsyncAccept, AsyncRead, AsyncWrite};
+use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::task::Poll;
 
-pub trait AsyncAccept {
-    fn async_accept(&self) -> impl Future<Output=io::Result<(TcpStream, SocketAddr)>>;
-}
 
 impl AsyncAccept for TcpListener {
-    fn async_accept(&self) -> impl Future<Output=io::Result<(TcpStream, SocketAddr)>> {
+    fn async_accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> {
         CURRENT.with_borrow(|executor| {
             executor
                 .as_ref()
@@ -23,15 +18,9 @@ impl AsyncAccept for TcpListener {
     }
 }
 
-pub trait AsyncReceive {
-    fn async_receive(&self, buf: Box<[u8]>)
-                     -> impl Future<Output=(io::Result<usize>, Box<[u8]>)>;
-}
-impl AsyncReceive for TcpStream {
-    fn async_receive(
-        &self,
-        buf: Box<[u8]>,
-    ) -> impl Future<Output=(io::Result<usize>, Box<[u8]>)> {
+
+impl AsyncRead for TcpStream {
+    fn async_read(&self, buf: SliceMut) -> impl Future<Output = (io::Result<usize>, SliceMut)> {
         CURRENT.with_borrow(|executor| {
             executor
                 .as_ref()
@@ -43,27 +32,17 @@ impl AsyncReceive for TcpStream {
     }
 }
 
-pub trait AsyncSend {
-    fn async_send(
-        &self,
-        buf: Box<[u8]>,
-        len: usize,
-    ) -> impl Future<Output=(io::Result<usize>, Box<[u8]>)>;
-}
 
-impl AsyncSend for TcpStream {
-    fn async_send(
-        &self,
-        buf: Box<[u8]>,
-        len: usize,
-    ) -> impl Future<Output=(io::Result<(usize)>, Box<[u8]>)> {
+
+impl AsyncWrite for TcpStream {
+    fn async_write(&mut self, buf: Slice) -> impl Future<Output = (io::Result<(usize)>, Slice)> {
         CURRENT.with_borrow(|executor| {
             executor
                 .as_ref()
                 .unwrap()
                 .driver
                 .borrow_mut()
-                .send(self.try_clone().unwrap(), buf, len)
+                .send(self.try_clone().unwrap(), buf)
         })
     }
 }
@@ -73,6 +52,7 @@ mod tests {
     use super::*;
     use crate::async_io::driver::IO;
     use crate::async_io::runtime::{Runtime, spawn};
+    use crate::async_io::slice::{AsSlice, AsSliceMut};
     use std::error;
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::str::FromStr;
@@ -116,24 +96,24 @@ mod tests {
                 eprintln!("Sending hello to server");
                 let sent = b"hello";
                 let (len, buf) = socket
-                    .async_send(sent.to_vec().into_boxed_slice(), sent.len())
+                    .async_write(sent.to_vec().slice(..sent.len()))
                     .await;
                 assert_eq!(sent.len(), len.unwrap());
 
                 eprintln!("Waiting for response from server");
                 let received = Box::new([0u8; 5]);
-                let (len, received) = socket.async_receive(received).await;
+                let (len, received) = socket.async_read(received.slice_mut(..)).await;
                 assert_eq!(sent.len(), len.unwrap());
 
                 eprintln!("Received {:?} from server", received);
                 assert_eq!(sent.as_slice(), received.to_vec().as_slice());
             });
 
-            let (stream, _) = handle.await?;
+            let (mut stream, _) = handle.await?;
             eprintln!("Client connected");
 
             let buf = Box::new([0u8; 1024]);
-            let (len, buf) = stream.async_receive(buf).await;
+            let (len, buf) = stream.async_read(buf.slice_mut(..)).await;
             let len = len?;
             eprintln!("Received {len} bytes from client");
             assert_eq!(5, len);
@@ -141,7 +121,7 @@ mod tests {
 
             let mut buf = Box::new([0u8; 1024]);
             buf[..5].copy_from_slice(b"hello");
-            let (sent, buf) = stream.async_send(buf, 5).await;
+            let (sent, buf) = stream.async_write(buf.slice(..5)).await;
             eprintln!("Sent {} bytes to client", sent?);
             Ok(())
         })

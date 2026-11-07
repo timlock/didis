@@ -6,6 +6,7 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use crate::async_io::driver::{Completion, DriverOS, Task, TaskHandle};
+use crate::async_io::slice::{Slice, SliceMut};
 use std::collections::VecDeque;
 use std::io;
 use std::mem::zeroed;
@@ -14,7 +15,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
 //TODO use provided buffers https://manpages.ubuntu.com/manpages/resolute/man7/io_uring_provided_buffers.7.html
 
 impl From<&io_uring_cqe> for Completion {
@@ -23,7 +23,7 @@ impl From<&io_uring_cqe> for Completion {
         let task = unsafe { Box::from_raw(task_ptr) };
 
         match *task {
-            Task::Accept(_,task_handle) => {
+            Task::Accept(_, task_handle) => {
                 if cqe.res < 0 {
                     return Completion::Accept(
                         Err(io::Error::from_raw_os_error(-cqe.res)),
@@ -36,7 +36,7 @@ impl From<&io_uring_cqe> for Completion {
                     Err(err) => Completion::Accept(Err(err), task_handle),
                 }
             }
-            Task::Receive(_,received, task_handle) => {
+            Task::Receive(_, received, task_handle) => {
                 if cqe.res < 0 {
                     return Completion::Receive(
                         received,
@@ -46,7 +46,7 @@ impl From<&io_uring_cqe> for Completion {
                 }
                 Completion::Receive(received, Ok(cqe.res as _), task_handle)
             }
-            Task::Send(_,sent, _, task_handle) => {
+            Task::Send(_, sent, task_handle) => {
                 if cqe.res < 0 {
                     return Completion::Send(
                         sent,
@@ -55,7 +55,7 @@ impl From<&io_uring_cqe> for Completion {
                     );
                 }
 
-                Completion::Receive(sent, Ok(cqe.res as _), task_handle)
+                Completion::Send(sent, Ok(cqe.res as _), task_handle)
             }
         }
     }
@@ -133,7 +133,8 @@ impl DriverOS for IO {
 
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
-            self.pending.push_back(Task::Accept(listener, handle.clone()));
+            self.pending
+                .push_back(Task::Accept(listener, handle.clone()));
             return handle;
         }
 
@@ -148,11 +149,7 @@ impl DriverOS for IO {
         handle
     }
 
-    fn receive(
-        &mut self,
-        socket: TcpStream,
-        mut buffer: Box<[u8]>,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+    fn send(&mut self, socket: TcpStream, slice: Slice) -> TaskHandle<(io::Result<usize>, Slice)> {
         let handle = TaskHandle {
             result: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
@@ -161,29 +158,28 @@ impl DriverOS for IO {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
             self.pending
-                .push_back(Task::Receive(socket, buffer, handle.clone()));
+                .push_back(Task::Send(socket, slice, handle.clone()));
             return handle;
         }
 
         let fd = socket.as_raw_fd();
-        let buf_ptr = buffer.as_mut_ptr();
-        let buf_len = buffer.len();
-        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer, handle.clone())));
+        let slice_len = slice.len();
+        let slice_ptr = slice.as_ptr();
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, slice, handle.clone())));
 
         unsafe {
-            io_uring_prep_recv(sqe, fd, buf_ptr as _, buf_len, 0);
+            io_uring_prep_send(sqe, fd, slice_ptr as _, slice_len, 0);
             (*sqe).user_data = task_ptr as _;
         }
 
         handle
     }
 
-    fn send(
+    fn receive(
         &mut self,
         socket: TcpStream,
-        buffer: Box<[u8]>,
-        len: usize,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        mut slice_mut: SliceMut,
+    ) -> TaskHandle<(io::Result<usize>, SliceMut)> {
         let handle = TaskHandle {
             result: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
@@ -192,17 +188,17 @@ impl DriverOS for IO {
         let sqe = unsafe { io_uring_get_sqe(&mut self.ring) };
         if sqe.is_null() {
             self.pending
-                .push_back(Task::Send(socket, buffer, len, handle.clone()));
+                .push_back(Task::Receive(socket, slice_mut, handle.clone()));
             return handle;
         }
 
         let fd = socket.as_raw_fd();
-        let mut buffer = buffer;
-        let buf_ptr = buffer.as_mut_ptr();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, len, handle.clone())));
+        let slice_ptr = slice_mut.as_mut_ptr();
+        let slice_len = slice_mut.len();
+        let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, slice_mut, handle.clone())));
 
         unsafe {
-            io_uring_prep_send(sqe, fd, buf_ptr as _, len, 0);
+            io_uring_prep_recv(sqe, fd, slice_ptr as _, slice_len, 0);
             (*sqe).user_data = task_ptr as _;
         }
 

@@ -11,6 +11,8 @@ use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use crate::async_io::driver::{Completion, DriverOS, Task, TaskHandle};
+use crate::async_io::slice::{Slice, SliceMut};
 
 impl From<Task> for Completion {
     fn from(value: Task) -> Self {
@@ -23,8 +25,8 @@ impl From<Task> for Completion {
                 let n = socket.read(buf.as_mut());
                 Completion::Receive( buf, n, handle)
             }
-            Task::Send(mut socket, mut buf, len,handle) => {
-                let n = socket.write(&mut buf[..len]);
+            Task::Send(mut socket, buf, len,handle) => {
+                let n = socket.write(&buf[..len]);
                 Completion::Send( buf, n, handle)
             }
         }
@@ -117,8 +119,8 @@ impl DriverOS for IO {
     fn receive(
         &mut self,
         socket: TcpStream,
-        mut buffer: Box<[u8]>,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        buffer: SliceMut,
+    ) -> TaskHandle<(io::Result<usize>, SliceMut)> {
         let handle = TaskHandle {
             result: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
@@ -143,16 +145,15 @@ impl DriverOS for IO {
     fn send(
         &mut self,
         socket: TcpStream,
-        buffer: Box<[u8]>,
-        len: usize,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        buffer: Slice,
+    ) -> TaskHandle<(io::Result<usize>, Slice)> {
         let handle = TaskHandle {
             result: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
         };
         
         let fd = socket.as_raw_fd();
-        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, len, handle.clone())));
+        let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, handle.clone())));
 
         let event = kevent {
             ident: fd as usize,

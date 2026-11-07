@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let io = IO::new(256)?;
     let runtime = Runtime::new(io);
     runtime.block_on(async {
-        logger::init(Level::Warn)?;
+        logger::init(Level::Info)?;
         let address = SocketAddr::from_str("127.0.0.1:6379")?;
 
         let mut server = Server::new(address);

@@ -1,3 +1,4 @@
+use crate::async_io::mpsc::{Receiver, Sender, channel};
 use crate::command::Command;
 use crate::dictionary::{Dictionary, Error};
 use crate::pubsub::{ChannelStore, Message};
@@ -13,20 +14,24 @@ use std::{fs, io, process};
 pub struct Controller {
     dictionary: Dictionary,
     channel_store: ChannelStore,
-    messages: VecDeque<Message>,
+    messages_sender: Sender<Message>,
     background_jobs: JobQueue,
     last_save: SystemTime,
 }
 
 impl Controller {
-    pub fn new(last_save: SystemTime) -> Controller {
-        Controller {
-            dictionary: Dictionary::default(),
-            channel_store: ChannelStore::default(),
-            messages: VecDeque::default(),
-            background_jobs: JobQueue::default(),
-            last_save,
-        }
+    pub fn new(last_save: SystemTime) -> (Controller, Receiver<Message>) {
+        let (messages_sender, messages_receiver) = channel();
+        (
+            Controller {
+                dictionary: Dictionary::default(),
+                channel_store: ChannelStore::default(),
+                messages_sender,
+                background_jobs: JobQueue::default(),
+                last_save,
+            },
+            messages_receiver,
+        )
     }
     pub fn handle_command(&mut self, client_id: u64, command: Command) -> Option<ValOrRef<'_>> {
         let result: ValOrRef = match command {
@@ -145,7 +150,9 @@ impl Controller {
 
                     let message =
                         Message::subscribe(subscribers, channel, subscribed_channels as i64);
-                    self.messages.push_back(message);
+                    self.messages_sender
+                        .send(message)
+                        .expect("Pub Sub queue should be alive as long as the server");
                 }
                 return None;
             }
@@ -162,7 +169,10 @@ impl Controller {
                         channel.into_owned(),
                         subscribed_channels as i64,
                     );
-                    self.messages.push_back(message);
+
+                    self.messages_sender
+                        .send(message)
+                        .expect("Pub Sub queue should be alive as long as the server");
                 }
                 return None;
             }
@@ -173,7 +183,9 @@ impl Controller {
 
                 let message =
                     Message::publish(subscribers, channel.into_owned(), message.into_owned());
-                self.messages.push_back(message);
+                self.messages_sender
+                    .send(message)
+                    .expect("Pub Sub queue should be alive as long as the server");
 
                 Value::Integer(subscribers_len).into()
             }
@@ -204,13 +216,6 @@ impl Controller {
 
     pub fn remove_client(&mut self, client_id: &u64) {
         self.channel_store.remove_client(*client_id);
-    }
-
-    pub fn has_messages(&self) -> bool {
-        !self.messages.is_empty()
-    }
-    pub fn messages(&mut self) -> Vec<Message> {
-        self.messages.drain(..).collect()
     }
 
     pub fn restore_from_snapshot(&mut self, snapshot_path: &str) -> Result<(), Error> {

@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
+use crate::async_io::slice::{Slice, SliceMut};
 
 pub struct Driver {
     inner: IO,
@@ -34,16 +35,15 @@ impl Driver {
     pub fn send(
         &mut self,
         socket: TcpStream,
-        buffer: Box<[u8]>,
-        len: usize,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
-        self.inner.send(socket, buffer, len)
+        slice: Slice,
+    ) -> TaskHandle<(io::Result<usize>, Slice)> {
+        self.inner.send(socket, slice)
     }
     pub fn receive(
         &mut self,
         socket: TcpStream,
-        buffer: Box<[u8]>,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)> {
+        buffer: SliceMut,
+    ) -> TaskHandle<(io::Result<usize>, SliceMut)> {
         self.inner.receive(socket, buffer)
     }
     pub fn poll(&mut self) -> io::Result<()> {
@@ -70,14 +70,13 @@ pub trait DriverOS {
     fn send(
         &mut self,
         socket: TcpStream,
-        buffer: Box<[u8]>,
-        len: usize,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)>;
+        buffer: Slice,
+    ) -> TaskHandle<(io::Result<usize>, Slice)>;
     fn receive(
         &mut self,
         socket: TcpStream,
-        buffer: Box<[u8]>,
-    ) -> TaskHandle<(io::Result<usize>, Box<[u8]>)>;
+        buffer: SliceMut,
+    ) -> TaskHandle<(io::Result<usize>, SliceMut)>;
     fn poll(&mut self) -> io::Result<Vec<Completion>>;
     fn poll_timeout(&mut self, duration: Duration) -> io::Result<Vec<Completion>>;
 }
@@ -88,14 +87,14 @@ pub enum Completion {
         TaskHandle<io::Result<(TcpStream, SocketAddr)>>,
     ),
     Send(
-        Box<[u8]>,
+        Slice,
         io::Result<usize>,
-        TaskHandle<(io::Result<usize>, Box<[u8]>)>,
+        TaskHandle<(io::Result<usize>, Slice)>,
     ),
     Receive(
-        Box<[u8]>,
+        SliceMut,
         io::Result<usize>,
-        TaskHandle<(io::Result<usize>, Box<[u8]>)>,
+        TaskHandle<(io::Result<usize>, SliceMut)>,
     ),
 }
 
@@ -122,14 +121,13 @@ enum Task {
     Accept(TcpListener, TaskHandle<io::Result<(TcpStream, SocketAddr)>>),
     Send(
         TcpStream,
-        Box<[u8]>,
-        usize,
-        TaskHandle<(io::Result<usize>, Box<[u8]>)>,
+        Slice,
+        TaskHandle<(io::Result<usize>, Slice)>,
     ),
     Receive(
         TcpStream,
-        Box<[u8]>,
-        TaskHandle<(io::Result<usize>, Box<[u8]>)>,
+        SliceMut,
+        TaskHandle<(io::Result<usize>, SliceMut)>,
     ),
 }
 
@@ -171,12 +169,14 @@ impl<T> Future for TaskHandle<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::async_io::slice::AsSlice;
+use super::*;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::str::FromStr;
     use std::time::Duration;
     use std::{error, thread};
+    use crate::async_io::slice::AsSliceMut;
 
     #[test]
     fn accept() -> Result<(), Box<dyn error::Error>> {
@@ -238,7 +238,7 @@ mod tests {
         eprintln!("Client connected");
 
         let buf = Box::new([0u8; 1024]);
-        io.receive(socket.try_clone()?, buf);
+        io.receive(socket.try_clone()?, buf.slice_mut(..));
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (buf, len) = match results.remove(0) {
             Completion::Receive(buf, len, _) => (buf, len?),
@@ -250,7 +250,7 @@ mod tests {
 
         let mut buf = Box::new([0u8; 1024]);
         buf[..5].copy_from_slice(b"hello");
-        io.send(socket.try_clone()?, buf, 5);
+        io.send(socket.try_clone()?, buf.slice(..5));
         results = io.poll_timeout(Duration::from_secs(1))?;
         let (_, len) = match results.remove(0) {
             Completion::Send(buf, len, _) => (buf, len?),

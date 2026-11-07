@@ -240,6 +240,41 @@ pub async fn select_pair<A, B>(
     .await
 }
 
+pub enum SelectTripleResult<A, B, C> {
+    A(A),
+    B(B),
+    C(C),
+}
+
+pub async fn select_triple<A, B, C>(
+    a: impl Future<Output = A>,
+    b: impl Future<Output = B>,
+    c: impl Future<Output = C>,
+) -> SelectTripleResult<A, B, C> {
+    let mut a_pinned = pin!(a);
+    let mut b_pinned = pin!(b);
+    let mut c_pinned = pin!(c);
+    poll_fn(|cx| {
+        match a_pinned.as_mut().poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(SelectTripleResult::A(result)),
+            Poll::Pending => {}
+        }
+
+        match b_pinned.as_mut().poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(SelectTripleResult::B(result)),
+            Poll::Pending => {}
+        }
+
+        match c_pinned.as_mut().poll(cx) {
+            Poll::Ready(result) => return Poll::Ready(SelectTripleResult::C(result)),
+            Poll::Pending => {}
+        }
+
+        Poll::Pending
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::async_io::driver::IO;

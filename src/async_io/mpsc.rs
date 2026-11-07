@@ -3,6 +3,7 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::{RecvError, SendError};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
+use log::info;
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let (inner_sender, inner_receiver) = std::sync::mpsc::channel();
@@ -45,6 +46,10 @@ impl<T> Receiver<T> {
             }
         })
         .await
+    }
+
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.inner.lock().unwrap().try_recv()
     }
 }
 

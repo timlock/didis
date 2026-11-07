@@ -1,14 +1,16 @@
+use crate::async_io::buf::BufWriter;
 use crate::async_io::mpsc::{Receiver, Sender, channel};
-use crate::async_io::net::{AsyncAccept, AsyncReceive, AsyncSend};
-use crate::async_io::runtime::{select_pair, spawn, SelectResult};
-use crate::command::Parser;
+use crate::async_io::runtime::{
+    SelectTripleResult, select_triple, spawn,
+};
+use crate::async_io::slice::{AsSlice, AsSliceMut};
+use crate::async_io::{AsyncAccept, AsyncRead, AsyncWrite};
+use crate::command::{Command, Parser};
 use crate::controller::Controller;
+use crate::pubsub::Message;
 use crate::resp::Value;
 use log::{error, info, warn};
-use std::cmp::min;
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
@@ -25,6 +27,7 @@ pub struct Server {
     address: SocketAddr,
     connections: HashMap<u64, Connection>,
     controller: Arc<Mutex<Controller>>,
+    pub_sub_receiver: Receiver<Message>,
     stop_sender: Sender<()>,
     stop_receiver: Receiver<()>,
     is_listening_sender: Option<Sender<()>>,
@@ -35,10 +38,13 @@ impl Server {
     pub fn new(address: SocketAddr) -> Self {
         let (stop_sender, stop_receiver) = channel();
 
+        let (controller, pub_sub_receiver) = Controller::new(SystemTime::now());
+
         Self {
             address,
             connections: Default::default(),
-            controller: Arc::new(Mutex::new(Controller::new(SystemTime::now()))),
+            controller: Arc::new(Mutex::new(controller)),
+            pub_sub_receiver,
             is_listening_sender: None,
             stop_sender,
             stop_receiver,
@@ -74,82 +80,33 @@ impl Server {
         }
 
         loop {
-            let select_result = select_pair(listener.async_accept(), self.stop_receiver.recv()).await;
-            let accept_result = match select_result{
-                SelectResult::First(accept_result) => {accept_result}
-                SelectResult::Second(Err(RecvError)) => {
-                    warn!("server handle got dropped");
-                    continue;
+            match select_triple(
+                listener.async_accept(),
+                self.stop_receiver.recv(),
+                self.pub_sub_receiver.recv(),
+            )
+            .await
+            {
+                SelectTripleResult::A(accept_result) => {
+                    let (stream, address) = accept_result?;
+                    self.handle_connection(stream, address);
                 }
-                SelectResult::Second(Ok(())) => {
+                SelectTripleResult::B(Err(RecvError)) => {
+                    warn!("server handle got dropped");
+                }
+                SelectTripleResult::B(Ok(())) => {
                     info!("Server stopped");
                     return Ok(());
                 }
-            };
-            let (stream, address) = accept_result?;
-
-            let client_id = self.id_counter;
-            self.id_counter += 1;
-            let controller = self.controller.clone();
-
-            info!("New client connected with id {}", client_id);
-
-            spawn(async move {
-                let mut buffer_in: Box<[u8]> = Box::new([0u8; BUFFER_SIZE]);
-                let buffer_out: Box<[u8]> = Box::new([0u8; BUFFER_SIZE]);
-
-                let mut client =
-                    Connection::new(client_id, stream.try_clone()?, None, Some(buffer_out));
-
-                loop {
-                    let (received, buffer) = client.tcp_stream.async_receive(buffer_in).await;
-                    let received = received?;
-                    if received == 0 {
-                        info!("Closed connection {stream:?}");
-                        return io::Result::Ok(());
-                    }
-                    buffer_in = buffer;
-
-                    info!("Received {} bytes from client", received);
-
-                    let commands = client.command_parser.parse_all(&buffer_in[..received]);
-
-                    for command in commands {
-                        let response = match command {
-                            Ok(command) => {
-                                let start = Instant::now();
-                                info!("Received command: {}", command);
-                                if let Some(response) = controller
-                                    .lock()
-                                    .unwrap()
-                                    .handle_command(client_id, command)
-                                {
-                                    info!("Sending response {response} took {:?}", start.elapsed());
-
-                                    response.to_bytes()
-                                } else {
-                                    info!("Took {:?}", start.elapsed());
-                                    Default::default()
-                                }
-                            }
-                            Err(err) => {
-                                warn!("Received faulty command: {:?}", err);
-                                Value::SimpleError(err.to_string()).to_bytes()
-                            }
-                        };
-                        client.send(response);
-                    }
-                    client.flush().await?;
+                SelectTripleResult::C(Err(RecvError)) => {
+                    warn!("pub sub sender got dropped");
                 }
-            });
-
-            //TODO move to async channel
-            if self.controller.lock().unwrap().has_messages() {
-                self.publish_messages()?;
-            }
+                SelectTripleResult::C(Ok(message)) => {
+                    self.publish_messages(message).await?;
+                }
+            };
 
             self.controller.lock().unwrap().do_jobs()?;
-
         }
     }
 
@@ -160,41 +117,81 @@ impl Server {
         ServerHandle {
             is_listening: false,
             is_listening_receiver: rx,
-            stop_sender: self.stop_sender.clone()
+            stop_sender: self.stop_sender.clone(),
         }
     }
 
-    fn handle_send(
-        &mut self,
-        stream: TcpStream,
-        buffer_out: Box<[u8]>,
-        sent: usize,
-        client_id: u64,
-    ) {
-        let connection = self.connections.get_mut(&client_id).unwrap_or_else(|| {
-            panic!(
-                "Send data to unknown socket with file descriptor: {}",
-                stream.as_raw_fd()
-            )
+    fn handle_connection(&mut self, stream: TcpStream, address: SocketAddr) {
+        let controller = self.controller.clone();
+        let client_id = self.id_counter;
+        self.id_counter += 1;
+
+        info!("New client connected with id {}", client_id);
+
+        spawn(async move {
+            let mut buffer_in = vec![0u8; BUFFER_SIZE];
+
+            let mut client = Connection::new(client_id, stream);
+
+            loop {
+                let (received, buffer) = client
+                    .buf_writer
+                    .get_mut()
+                    .async_read(buffer_in.slice_mut(..))
+                    .await;
+                let received = received?;
+                if received == 0 {
+                    info!("Closed connection {address:?}");
+                    return io::Result::Ok(());
+                }
+                buffer_in = buffer.into_inner();
+
+                info!("Received {} bytes from client", received);
+
+                let commands = client.command_parser.parse_all(&buffer_in[..received]);
+
+                for command in commands {
+                    let response = match command {
+                        Ok(command) => {
+                            let start = Instant::now();
+                            info!("Received command: {}", command);
+                            if let Some(response) = controller
+                                .lock()
+                                .unwrap()
+                                .handle_command(client_id, command)
+                            {
+                                info!("Sending response {response} took {:?}", start.elapsed());
+
+                                Some(response.to_bytes())
+                            } else {
+                                info!("Took {:?}", start.elapsed());
+                                None
+                            }
+                        }
+                        Err(err) => {
+                            warn!("Received faulty command: {:?}", err);
+                            Some(Value::SimpleError(err.to_string()).to_bytes())
+                        }
+                    };
+                    if let Some(response) = response {
+                        let (result, buf) =
+                            client.buf_writer.async_write_all(response.slice(..)).await;
+                        result?;
+                    }
+                }
+                client.buf_writer.flush().await?;
+            }
         });
-
-        info!(
-            "Sent {} bytes to client, remaining bytes {}",
-            sent, connection.buffer_out_len
-        );
-
-        connection.handle_sent(sent, buffer_out);
     }
 
-    fn publish_messages(&mut self) -> io::Result<()> {
-        let messages = self.controller.lock().unwrap().messages();
-        for message in messages {
-            let bytes = message.value.to_bytes();
+    async fn publish_messages(&mut self, message: Message) -> io::Result<()> {
+        let mut bytes = message.value.to_bytes().slice(..);
 
-            for receiver_id in &message.receivers {
-                if let Some(connection) = self.connections.get_mut(receiver_id) {
-                    connection.send(bytes.clone());
-                }
+        for receiver_id in &message.receivers {
+            if let Some(connection) = self.connections.get_mut(receiver_id) {
+                let (result, buf) = connection.buf_writer.async_write_all(bytes).await;
+                bytes = buf;
+                result?;
             }
         }
 
@@ -227,77 +224,16 @@ impl ServerHandle {
 
 struct Connection {
     id: u64,
-    remaining_out: Vec<u8>,
-    buffer_out_len: usize,
     command_parser: Parser,
-    buffer_in: Option<Box<[u8]>>,
-    buffer_out: Option<Box<[u8]>>,
-    tcp_stream: TcpStream,
+    buf_writer: BufWriter<TcpStream>,
 }
 
 impl Connection {
-    fn new(
-        id: u64,
-        tcp_stream: TcpStream,
-        buffer_in: Option<Box<[u8]>>,
-        buffer_out: Option<Box<[u8]>>,
-    ) -> Self {
+    fn new(id: u64, tcp_stream: TcpStream) -> Self {
         Self {
             id,
-            tcp_stream,
-            remaining_out: Default::default(),
-            buffer_out_len: 0,
+            buf_writer: BufWriter::new(tcp_stream),
             command_parser: Default::default(),
-            buffer_in,
-            buffer_out,
         }
-    }
-
-    fn handle_sent(&mut self, sent: usize, mut buffer_out: Box<[u8]>) {
-        if self.buffer_out_len > 0 {
-            buffer_out.copy_within(sent..self.buffer_out_len, 0);
-            self.buffer_out_len -= sent;
-        }
-
-        if !self.remaining_out.is_empty() && self.buffer_out_len < buffer_out.len() {
-            let to_copy = min(
-                buffer_out.len() - self.buffer_out_len,
-                self.remaining_out.len(),
-            );
-            let copy_range = self.buffer_out_len..(self.buffer_out_len + to_copy);
-
-            buffer_out[copy_range].copy_from_slice(self.remaining_out.drain(..to_copy).as_slice());
-
-            self.buffer_out_len += to_copy;
-        }
-
-        self.buffer_out = Some(buffer_out);
-    }
-
-    fn send(&mut self, mut response: Vec<u8>) {
-        match &mut self.buffer_out {
-            Some(buffer) => {
-                let to_send = min(buffer.len() - self.buffer_out_len, response.len());
-
-                buffer[self.buffer_out_len..self.buffer_out_len + to_send]
-                    .copy_from_slice(response.drain(..to_send).as_slice());
-                self.remaining_out.extend_from_slice(response.as_slice());
-                self.buffer_out_len += to_send;
-            }
-            None => self.remaining_out.extend_from_slice(response.as_slice()),
-        }
-    }
-
-    async fn flush(&mut self) -> io::Result<()> {
-        if self.buffer_out_len > 0
-            && let Some(buffer_out) = self.buffer_out.take()
-        {
-            let (sent, buffer_out) = self
-                .tcp_stream
-                .async_send(buffer_out, self.buffer_out_len)
-                .await;
-            self.handle_sent(sent?, buffer_out);
-        }
-        Ok(())
     }
 }
