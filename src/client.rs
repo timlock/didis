@@ -3,10 +3,10 @@ use crate::async_io::{AsyncRead, AsyncWrite};
 use crate::command::Command;
 use crate::resp;
 use crate::resp::Value;
-use std::net::TcpStream;
+use std::io;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Instant;
 
-//todo make client async
 pub struct Client {
     tcp_stream: TcpStream,
     resp_parser: resp::Parser,
@@ -14,12 +14,15 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(tcp_stream: TcpStream) -> Self {
-        Self {
+    pub fn connect(address: &SocketAddr) -> io::Result<Client> {
+        let tcp_stream = TcpStream::connect(&address)?;
+        tcp_stream.set_nonblocking(true)?;
+
+        Ok(Client {
             tcp_stream,
             resp_parser: resp::Parser::default(),
             published: Vec::new(),
-        }
+        })
     }
 
     pub async fn send(&mut self, command: Command<'_>) -> Result<Value, resp::Error> {

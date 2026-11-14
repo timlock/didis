@@ -8,11 +8,10 @@ use didis::server::{BUFFER_SIZE, Server, ServerHandle};
 use log::Level;
 use std::borrow::Cow;
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex, Once};
-use std::time::Duration;
 
 static INIT: Once = Once::new();
 
@@ -57,8 +56,7 @@ fn set_value() -> Result<(), Box<dyn std::error::Error>> {
         let (address, server_handle, task_handle) = launch_server().await;
 
         println!("Connecting to server on {}", address);
-        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-        let mut client = Client::new(stream);
+        let mut client = Client::connect(&address)?;
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd).await?;
@@ -102,8 +100,7 @@ fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
         let (address, server_handle, task_handle) = launch_server().await;
 
         println!("Connecting to server on {}", address);
-        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-        let mut client = Client::new(stream);
+        let mut client = Client::connect(&address)?;
 
         let cmd_batch = vec![
             Command::Set {
@@ -167,8 +164,7 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
         let (address, server_handle, task_handle) = launch_server().await;
 
         println!("Connecting to server on {}", address);
-        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-        let mut client = Client::new(stream);
+        let mut client = Client::connect(&address)?;
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd).await?;
@@ -210,8 +206,7 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
         let (address, server_handle, task_handle) = launch_server().await;
 
         println!("Connecting to server on {}", address);
-        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-        let mut client = Client::new(stream);
+        let mut client = Client::connect(&address)?;
 
         let subscribe_cmd = Command::Subscribe(vec![
             Cow::Owned(String::from("first")),
@@ -306,8 +301,7 @@ fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
         let (address, server_handle, task_handle) = launch_server().await;
 
         println!("Connecting to server on {}", address);
-        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-        let mut client = Client::new(stream);
+        let mut client = Client::connect(&address)?;
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd).await?;
@@ -363,8 +357,7 @@ fn list() -> Result<(), Box<dyn std::error::Error>> {
         let (address, server_handle, task_handle) = launch_server().await;
 
         println!("Connecting to server on {}", address);
-        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-        let mut client = Client::new(stream);
+        let mut client = Client::connect(&address)?;
 
         let get_cmd = Command::Get(Cow::Owned(String::from("Key")));
         let response = client.send(get_cmd).await?;

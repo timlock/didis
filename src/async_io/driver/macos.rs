@@ -1,6 +1,8 @@
-use crate::async_io::{DriverOS, Completion, Task, TaskHandle};
+use crate::async_io::driver::{Completion, DriverOS, Task, TaskHandle};
+use crate::async_io::slice::{Slice, SliceMut};
 use libc::{
-    close, kevent, kqueue, timespec, EVFILT_READ, EVFILT_WRITE, EV_ADD, EV_CLEAR, EV_ONESHOT,
+    EVFILT_READ, EVFILT_WRITE,
+    EV_ADD, EV_CLEAR, EV_ONESHOT, close, kevent, kqueue, timespec,
 };
 use std::collections::VecDeque;
 use std::io;
@@ -11,29 +13,25 @@ use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::async_io::driver::{Completion, DriverOS, Task, TaskHandle};
-use crate::async_io::slice::{Slice, SliceMut};
 
 impl From<Task> for Completion {
     fn from(value: Task) -> Self {
         match value {
-            Task::Accept(socket,handle) => {
+            Task::Accept(socket, handle) => {
                 let result = socket.accept();
                 Completion::Accept(result, handle)
             }
             Task::Receive(mut socket, mut buf, handle) => {
                 let n = socket.read(buf.as_mut());
-                Completion::Receive( buf, n, handle)
+                Completion::Receive(buf, n, handle)
             }
-            Task::Send(mut socket, buf, len,handle) => {
-                let n = socket.write(&buf[..len]);
-                Completion::Send( buf, n, handle)
+            Task::Send(mut socket, buf, handle) => {
+                let n = socket.write(&buf[..]);
+                Completion::Send(buf, n, handle)
             }
         }
     }
 }
-
-
 
 pub struct IO {
     kqueue: c_int,
@@ -94,12 +92,12 @@ impl IO {
 }
 
 impl DriverOS for IO {
-    fn accept(&mut self, socket: TcpListener) -> TaskHandle<io::Result<(TcpStream, SocketAddr)>>{
+    fn accept(&mut self, socket: TcpListener) -> TaskHandle<io::Result<(TcpStream, SocketAddr)>> {
         let handle = TaskHandle {
             result: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
         };
-        
+
         let fd = socket.as_raw_fd();
         let task_ptr = Box::into_raw(Box::new(Task::Accept(socket, handle.clone())));
 
@@ -125,7 +123,7 @@ impl DriverOS for IO {
             result: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
         };
-        
+
         let fd = socket.as_raw_fd();
         let task_ptr = Box::into_raw(Box::new(Task::Receive(socket, buffer, handle.clone())));
 
@@ -142,16 +140,12 @@ impl DriverOS for IO {
         handle.clone()
     }
 
-    fn send(
-        &mut self,
-        socket: TcpStream,
-        buffer: Slice,
-    ) -> TaskHandle<(io::Result<usize>, Slice)> {
+    fn send(&mut self, socket: TcpStream, buffer: Slice) -> TaskHandle<(io::Result<usize>, Slice)> {
         let handle = TaskHandle {
             result: Arc::new(Mutex::new(None)),
             waker: Arc::new(Mutex::new(None)),
         };
-        
+
         let fd = socket.as_raw_fd();
         let task_ptr = Box::into_raw(Box::new(Task::Send(socket, buffer, handle.clone())));
 
