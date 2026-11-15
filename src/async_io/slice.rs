@@ -87,6 +87,20 @@ impl AsSlice for Slice {
     }
 }
 
+
+
+impl AsSlice for SliceMut{
+    fn slice(self, range: impl RangeBounds<usize>) -> Slice
+    where
+        Self: Sized
+    {
+        Slice {
+            range: sub_range(range, self.range),
+            buf: self.buf,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SliceMut {
     buf: Vec<u8>,

@@ -281,6 +281,7 @@ impl Controller {
         Ok(true)
     }
 
+    // TODO make async
     pub fn do_jobs(&mut self) -> io::Result<()> {
         while let Some(result) = self.background_jobs.pop_if_done() {
             result?;

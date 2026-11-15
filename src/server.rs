@@ -4,14 +4,15 @@ use crate::async_io::runtime::spawn;
 use crate::async_io::select::{
     SelectResult, SelectTripleResult, select_triple, select_without_drop,
 };
-use crate::async_io::slice::{AsSlice, AsSliceMut};
+use crate::async_io::slice::{AsSlice, AsSliceMut, SliceMut};
 use crate::async_io::{AsyncAccept, AsyncRead, AsyncWrite};
-use crate::command::Parser;
+use crate::command::{Command, Parser};
 use crate::controller::Controller;
 use crate::dictionary;
 use crate::pubsub::Message;
-use crate::resp::Value;
+use crate::resp::{ValOrRef, Value};
 use log::{error, info, warn};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::RecvError;
 use std::sync::{Arc, Mutex};
@@ -27,7 +28,7 @@ pub const BUFFER_SIZE: usize = 4096;
 
 pub struct Server {
     address: SocketAddr,
-    connections: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
+    connections: Arc<Mutex<HashMap<u64, Sender<SliceMut>>>>,
     controller: Arc<Mutex<Controller>>,
     pub_sub_receiver: Receiver<Message>,
     stop_sender: Sender<()>,
@@ -81,6 +82,73 @@ impl Server {
             warn!("Could not signal observers that server is listening: {err}");
         }
 
+        let controller = self.controller.clone();
+        let connections = self.connections.clone();
+        let (command_sender, command_receiver) = channel::<(u64, SliceMut)>();
+        spawn(async move {
+            let mut parsers: HashMap<u64, Parser> = HashMap::new();
+            loop {
+                let (sender_id, mut slice) = match command_receiver.recv().await {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                let parser = parsers.entry(sender_id).or_default();
+                let commands = parser.parse_all(&slice);
+                let mut responses = Vec::new();
+                for command in commands {
+                    let start = Instant::now();
+                    let response = match command {
+                        Ok(command) => {
+                            info!("Received command: {}", command);
+
+                            if let Some(response) = controller
+                                .lock()
+                                .unwrap()
+                                .handle_command(sender_id, command)
+                            {
+                                info!("Sending response {response}",);
+
+                                Some(response.to_value())
+                            } else {
+                                None
+                            }
+                        }
+                        Err(err) => {
+                            warn!("Received faulty command: {:?}", err);
+                            Some(Value::SimpleError(err.to_string()))
+                        }
+                    };
+
+                    info!("Handling command took {:?}", start.elapsed());
+
+                    if let Some(response) = response {
+                        responses.push((response));
+                    }
+                }
+
+                // TODO simplify and use buffer pool
+                if let Some(s) = connections.lock().unwrap().get(&sender_id) {
+                    let mut buffer = slice.into_inner();
+                    let mut n = 0;
+                    for response in responses {
+                        let mut bytes = response.to_bytes();
+                        if bytes.len() + n > buffer.len() {
+                            let _ = s.send(buffer.slice_mut(..));
+                            buffer = vec![0; BUFFER_SIZE];
+                            n = 0;
+                        }
+                        let mut section = &mut buffer[n..];
+                        n += section.write(bytes.as_slice()).unwrap();
+                    }
+
+                    if n > 0 {
+                        let _ = s.send(buffer.slice_mut(..n));
+                    }
+                }
+            }
+        });
+
         loop {
             match select_triple(
                 listener.async_accept(),
@@ -91,25 +159,32 @@ impl Server {
             {
                 SelectTripleResult::A(accept_result) => {
                     let (stream, address) = accept_result?;
-                    self.handle_connection(stream, address);
+                    self.handle_connection(stream, address, command_sender.clone());
                 }
                 SelectTripleResult::B(Err(RecvError)) => {
                     warn!("server handle got dropped");
                 }
                 SelectTripleResult::B(Ok(())) => {
-                    info!("Server stopped");
-                    return Ok(());
+                    break;
                 }
                 SelectTripleResult::C(Err(RecvError)) => {
                     warn!("pub sub sender got dropped");
                 }
                 SelectTripleResult::C(Ok(message)) => {
-                    self.publish_messages(message).await?;
+                    // TODO check if this can be moved to the command handler thread
+                    self.publish_messages(message).await;
                 }
             };
 
-            self.controller.lock().unwrap().do_jobs()?;
+            let result = self.controller.lock().unwrap().do_jobs();
+            if let Err(err) = result {
+                warn!("Job failed {err}");
+            }
         }
+
+        info!("Server stopped");
+
+        Ok(())
     }
 
     pub fn handle(&mut self) -> ServerHandle {
@@ -123,7 +198,12 @@ impl Server {
         }
     }
 
-    fn handle_connection(&mut self, stream: TcpStream, address: SocketAddr) {
+    fn handle_connection(
+        &mut self,
+        stream: TcpStream,
+        address: SocketAddr,
+        command_sender: Sender<(u64, SliceMut)>,
+    ) {
         let controller = self.controller.clone();
         let client_id = self.id_counter;
         self.id_counter += 1;
@@ -137,7 +217,6 @@ impl Server {
 
         spawn(async move {
             let mut buffer_in = vec![0u8; BUFFER_SIZE];
-            let mut command_parser = Parser::default();
             let mut buf_writer = BufWriter::new(stream.try_clone().unwrap());
 
             let mut receive_fut = stream.async_read(buffer_in.slice_mut(..));
@@ -145,7 +224,7 @@ impl Server {
 
             loop {
                 match select_without_drop(receive_fut, pub_sub_fut).await {
-                    SelectResult::A(((received, buffer), pending_fut)) => {
+                    SelectResult::A(((received, mut buffer), pending_fut)) => {
                         let received = received?;
                         if received == 0 {
                             info!("Closed connection {address:?}");
@@ -156,38 +235,13 @@ impl Server {
 
                         info!("Received {} bytes from client", received);
 
-                        let commands = command_parser.parse_all(&buffer[..received]);
+                        command_sender
+                            .send((client_id, buffer.slice_mut(..received)))
+                            .unwrap();
+                        buffer = receiver.recv().await.unwrap();
 
-                        for command in commands {
-                            let start = Instant::now();
-                            let response = match command {
-                                Ok(command) => {
-                                    info!("Received command: {}", command);
-                                    if let Some(response) = controller
-                                        .lock()
-                                        .unwrap()
-                                        .handle_command(client_id, command)
-                                    {
-                                        info!("Sending response {response}",);
-
-                                        Some(response.to_bytes())
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!("Received faulty command: {:?}", err);
-                                    Some(Value::SimpleError(err.to_string()).to_bytes())
-                                }
-                            };
-
-                            info!("Handling command took {:?}", start.elapsed());
-                            if let Some(response) = response {
-                                let (result, buf) =
-                                    buf_writer.async_write_all(response.slice(..)).await;
-                                result?;
-                            }
-                        }
+                        let (result, buffer) = buf_writer.async_write_all(buffer.slice(..)).await;
+                        result?;
 
                         buf_writer.flush().await?;
 
@@ -206,10 +260,8 @@ impl Server {
                                 continue;
                             }
                         };
-                        info!("Publishing message {} to client {}", value, client_id);
-                        let bytes = value.to_bytes().slice(..);
 
-                        let (result, buf) = buf_writer.async_write_all(bytes).await;
+                        let (result, buf) = buf_writer.async_write_all(value.slice(..)).await;
                         result?;
                         buf_writer.flush().await?;
                     }
@@ -218,14 +270,12 @@ impl Server {
         });
     }
 
-    async fn publish_messages(&mut self, message: Message) -> io::Result<()> {
+    async fn publish_messages(&mut self, message: Message) {
         for receiver_id in &message.receivers {
             if let Some(connection) = self.connections.lock().unwrap().get_mut(receiver_id) {
-                let _ = connection.send(message.value.clone()); // receiver might have disconnected already
+                let _ = connection.send(message.value.clone().to_bytes().slice_mut(..)); // receiver might have disconnected already
             }
         }
-
-        Ok(())
     }
 }
 

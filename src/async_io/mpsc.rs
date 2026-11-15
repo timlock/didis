@@ -50,7 +50,6 @@ impl<T> Receiver<T> {
     }
 }
 
-#[derive(Clone)]
 pub struct Sender<T> {
     inner: std::sync::mpsc::Sender<T>,
     receiver_waker: Arc<Mutex<Option<Waker>>>,
@@ -63,6 +62,15 @@ impl<T> Sender<T> {
             waker.wake_by_ref();
         }
         Ok(())
+    }
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Sender {
+            inner : self.inner.clone(),
+            receiver_waker: self.receiver_waker.clone(),
+        }
     }
 }
 
