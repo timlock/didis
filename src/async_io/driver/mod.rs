@@ -10,20 +10,21 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use crate::async_io::driver::macos::*;
 
+use crate::async_io::slice::{Slice, SliceMut};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
-use crate::async_io::slice::{Slice, SliceMut};
 
 pub struct Driver {
     inner: IO,
 }
 impl Driver {
-    pub fn new(driver_os: IO) -> Driver {
-        Driver { inner: driver_os }
+    pub fn new(queue_depth: usize) -> io::Result<Driver> {
+        let io = IO::new(queue_depth)?;
+        Ok(Driver { inner: io })
     }
 
     pub fn accept(
@@ -54,7 +55,7 @@ impl Driver {
 
         Ok(())
     }
-    
+
     pub fn poll_timeout(&mut self, duration: Duration) -> io::Result<()> {
         let completions = self.inner.poll_timeout(duration)?;
         for completion in completions {
@@ -67,11 +68,7 @@ impl Driver {
 
 pub trait DriverOS {
     fn accept(&mut self, listener: TcpListener) -> TaskHandle<io::Result<(TcpStream, SocketAddr)>>;
-    fn send(
-        &mut self,
-        socket: TcpStream,
-        buffer: Slice,
-    ) -> TaskHandle<(io::Result<usize>, Slice)>;
+    fn send(&mut self, socket: TcpStream, buffer: Slice) -> TaskHandle<(io::Result<usize>, Slice)>;
     fn receive(
         &mut self,
         socket: TcpStream,
@@ -119,11 +116,7 @@ impl Completion {
 
 enum Task {
     Accept(TcpListener, TaskHandle<io::Result<(TcpStream, SocketAddr)>>),
-    Send(
-        TcpStream,
-        Slice,
-        TaskHandle<(io::Result<usize>, Slice)>,
-    ),
+    Send(TcpStream, Slice, TaskHandle<(io::Result<usize>, Slice)>),
     Receive(
         TcpStream,
         SliceMut,
@@ -169,14 +162,14 @@ impl<T> Future for TaskHandle<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::async_io::slice::AsSlice;
-use super::*;
+    use crate::async_io::slice::AsSliceMut;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::str::FromStr;
     use std::time::Duration;
     use std::{error, thread};
-    use crate::async_io::slice::AsSliceMut;
 
     #[test]
     fn accept() -> Result<(), Box<dyn error::Error>> {

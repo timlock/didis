@@ -59,21 +59,18 @@ pub struct Sender<T> {
 impl<T> Sender<T> {
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         self.inner.send(value)?;
-        self.receiver_waker
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .wake_by_ref();
+        if let Some(waker) = self.receiver_waker.lock().unwrap().as_ref() {
+            waker.wake_by_ref();
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::async_io::driver::IO;
     use crate::async_io::mpsc::channel;
-    use crate::async_io::runtime::{Runtime, SelectResult, select, select_pair};
+    use crate::async_io::runtime::{Runtime, spawn};
+    use crate::async_io::select::{SelectResult, select, select_pair};
     use std::pin::pin;
     use std::thread;
     use std::time::Duration;
@@ -81,7 +78,7 @@ mod tests {
     #[test]
     fn wait_for_receive() -> Result<(), Box<dyn std::error::Error>> {
         let (sender, receiver) = channel();
-        let runtime = Runtime::new(IO::new(256)?);
+        let runtime = Runtime::new(256, 0)?;
 
         let thread_handle = thread::spawn(move || {
             thread::sleep(Duration::from_secs(1));
@@ -96,11 +93,29 @@ mod tests {
     }
 
     #[test]
+    fn receive_from_current_thread() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = Runtime::new(256, 0)?;
+
+        let received = runtime.block_on(async move {
+            let (sender, receiver) = channel();
+            spawn(async move {
+                thread::sleep(Duration::from_secs(1));
+                sender.send(1).unwrap();
+            })
+            .await;
+            receiver.recv().await
+        });
+
+        assert_eq!(Ok(1), received);
+        Ok(())
+    }
+
+    #[test]
     fn select_receive() -> Result<(), Box<dyn std::error::Error>> {
         let (sender1, receiver1) = channel();
         let (sender2, receiver2) = channel();
         let (sender3, receiver3) = channel();
-        let runtime = Runtime::new(IO::new(256)?);
+        let runtime = Runtime::new(256, 0)?;
 
         let thread_handle = thread::spawn(move || {
             thread::sleep(Duration::from_secs(1));
@@ -125,7 +140,7 @@ mod tests {
     fn select_pair_receive() -> Result<(), Box<dyn std::error::Error>> {
         let (sender1, receiver1) = channel::<i32>();
         let (sender2, receiver2) = channel();
-        let runtime = Runtime::new(IO::new(256)?);
+        let runtime = Runtime::new(256, 0)?;
 
         let thread_handle = thread::spawn(move || {
             thread::sleep(Duration::from_secs(1));

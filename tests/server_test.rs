@@ -1,13 +1,11 @@
-use didis::async_io::driver::IO;
 use didis::async_io::runtime::{Runtime, TaskHandle, spawn};
 use didis::client::Client;
 use didis::command::{Command, OverwriteRule};
-use didis::logger;
 use didis::resp::Value;
 use didis::server::{BUFFER_SIZE, Server, ServerHandle};
+use didis::{dictionary, logger};
 use log::Level;
 use std::borrow::Cow;
-use std::io;
 use std::net::SocketAddr;
 use std::ops::AddAssign;
 use std::str::FromStr;
@@ -29,7 +27,7 @@ fn next_port() -> u64 {
     *guard
 }
 
-async fn launch_server() -> (SocketAddr, ServerHandle, TaskHandle<io::Result<()>>) {
+async fn launch_server() -> (SocketAddr, ServerHandle, TaskHandle<Result<(), dictionary::Error>>) {
     let address = SocketAddr::from_str(format!("127.0.0.1:{}", next_port()).as_str()).unwrap();
     let mut server = Server::new(address);
     let mut server_handle = server.handle();
@@ -51,7 +49,7 @@ async fn launch_server() -> (SocketAddr, ServerHandle, TaskHandle<io::Result<()>
 fn set_value() -> Result<(), Box<dyn std::error::Error>> {
     initialize();
 
-    let runtime = Runtime::new(IO::new(256)?);
+    let runtime = Runtime::new(256,0)?;
     runtime.block_on(async {
         let (address, server_handle, task_handle) = launch_server().await;
 
@@ -95,7 +93,7 @@ fn set_value() -> Result<(), Box<dyn std::error::Error>> {
 fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
     initialize();
 
-    let runtime = Runtime::new(IO::new(256)?);
+    let runtime = Runtime::new(256,0)?;
     runtime.block_on(async {
         let (address, server_handle, task_handle) = launch_server().await;
 
@@ -159,7 +157,7 @@ fn set_value_batch() -> Result<(), Box<dyn std::error::Error>> {
 fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
     initialize();
 
-    let runtime = Runtime::new(IO::new(256)?);
+    let runtime = Runtime::new(256,0)?;
     runtime.block_on(async {
         let (address, server_handle, task_handle) = launch_server().await;
 
@@ -197,11 +195,12 @@ fn set_large_value() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+//TODO test sometimes blocks between send unsubscribe and receive message
 #[test]
 fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
     initialize();
 
-    let runtime = Runtime::new(IO::new(256)?);
+    let runtime = Runtime::new(256,0)?;
     runtime.block_on(async {
         let (address, server_handle, task_handle) = launch_server().await;
 
@@ -296,7 +295,7 @@ fn publish_message() -> Result<(), Box<dyn std::error::Error>> {
 fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
     initialize();
 
-    let runtime = Runtime::new(IO::new(256)?);
+    let runtime = Runtime::new(256,0)?;
     runtime.block_on(async {
         let (address, server_handle, task_handle) = launch_server().await;
 
@@ -352,7 +351,7 @@ fn increment_value() -> Result<(), Box<dyn std::error::Error>> {
 fn list() -> Result<(), Box<dyn std::error::Error>> {
     initialize();
 
-    let runtime = Runtime::new(IO::new(256)?);
+    let runtime = Runtime::new(256,0)?;
     runtime.block_on(async {
         let (address, server_handle, task_handle) = launch_server().await;
 

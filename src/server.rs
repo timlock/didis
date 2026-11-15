@@ -1,12 +1,14 @@
 use crate::async_io::buf::BufWriter;
 use crate::async_io::mpsc::{Receiver, Sender, channel};
-use crate::async_io::runtime::{
-    SelectResult, SelectTripleResult, select_triple, select_without_drop, spawn,
+use crate::async_io::runtime::spawn;
+use crate::async_io::select::{
+    SelectResult, SelectTripleResult, select_triple, select_without_drop,
 };
 use crate::async_io::slice::{AsSlice, AsSliceMut};
 use crate::async_io::{AsyncAccept, AsyncRead, AsyncWrite};
 use crate::command::Parser;
 use crate::controller::Controller;
+use crate::dictionary;
 use crate::pubsub::Message;
 use crate::resp::Value;
 use log::{error, info, warn};
@@ -25,7 +27,7 @@ pub const BUFFER_SIZE: usize = 4096;
 
 pub struct Server {
     address: SocketAddr,
-    connections: HashMap<u64, Sender<Value>>,
+    connections: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
     controller: Arc<Mutex<Controller>>,
     pub_sub_receiver: Receiver<Message>,
     stop_sender: Sender<()>,
@@ -52,7 +54,7 @@ impl Server {
         }
     }
 
-    pub async fn run(&mut self) -> io::Result<()> {
+    pub async fn run(&mut self) -> Result<(), dictionary::Error> {
         if fs::exists("save.rdb")? {
             info!("Loading save.rdb file");
             if let Err(err) = self
@@ -62,7 +64,7 @@ impl Server {
                 .restore_from_snapshot("save.rdb")
             {
                 error!("Failed to restore database from save.rdb {err}");
-                return Ok(());
+                return Err(err);
             }
 
             info!("Restored database from save.rdb");
@@ -127,7 +129,9 @@ impl Server {
         self.id_counter += 1;
 
         let (sender, receiver) = channel();
-        self.connections.insert(client_id, sender);
+        self.connections.lock().unwrap().insert(client_id, sender);
+
+        let connections = self.connections.clone();
 
         info!("New client connected with id {}", client_id);
 
@@ -145,7 +149,8 @@ impl Server {
                         let received = received?;
                         if received == 0 {
                             info!("Closed connection {address:?}");
-                            //TODO remove client from connections hash map
+                            connections.lock().unwrap().remove(&client_id);
+                            controller.lock().unwrap().remove_client(&client_id);
                             return io::Result::Ok(());
                         }
 
@@ -201,6 +206,7 @@ impl Server {
                                 continue;
                             }
                         };
+                        info!("Publishing message {} to client {}", value, client_id);
                         let bytes = value.to_bytes().slice(..);
 
                         let (result, buf) = buf_writer.async_write_all(bytes).await;
@@ -214,8 +220,8 @@ impl Server {
 
     async fn publish_messages(&mut self, message: Message) -> io::Result<()> {
         for receiver_id in &message.receivers {
-            if let Some(connection) = self.connections.get_mut(receiver_id) {
-                connection.send(message.value.clone()).unwrap();
+            if let Some(connection) = self.connections.lock().unwrap().get_mut(receiver_id) {
+                let _ = connection.send(message.value.clone()); // receiver might have disconnected already
             }
         }
 

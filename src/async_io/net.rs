@@ -7,8 +7,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 
 impl AsyncAccept for TcpListener {
     fn async_accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> {
-        CURRENT.with_borrow(|executor| {
-            executor
+        CURRENT.with_borrow(|ctx| {
+            ctx
                 .as_ref()
                 .unwrap()
                 .driver
@@ -21,8 +21,8 @@ impl AsyncAccept for TcpListener {
 
 impl AsyncRead for TcpStream {
     fn async_read(&self, buf: SliceMut) -> impl Future<Output = (io::Result<usize>, SliceMut)> {
-        CURRENT.with_borrow(|executor| {
-            executor
+        CURRENT.with_borrow(|ctx| {
+            ctx
                 .as_ref()
                 .unwrap()
                 .driver
@@ -36,8 +36,8 @@ impl AsyncRead for TcpStream {
 
 impl AsyncWrite for TcpStream {
     fn async_write(&mut self, buf: Slice) -> impl Future<Output = (io::Result<(usize)>, Slice)> {
-        CURRENT.with_borrow(|executor| {
-            executor
+        CURRENT.with_borrow(|ctx| {
+            ctx
                 .as_ref()
                 .unwrap()
                 .driver
@@ -50,7 +50,6 @@ impl AsyncWrite for TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_io::driver::IO;
     use crate::async_io::runtime::{Runtime, spawn};
     use crate::async_io::slice::{AsSlice, AsSliceMut};
     use std::error;
@@ -60,7 +59,7 @@ mod tests {
 
     #[test]
     fn accept() -> Result<(), Box<dyn error::Error>> {
-        let runtime = Runtime::new(IO::new(256)?);
+        let runtime = Runtime::new(256,0)?;
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:8000")?;
             listener.set_nonblocking(true)?;
@@ -80,7 +79,7 @@ mod tests {
 
     #[test]
     fn echo() -> Result<(), Box<dyn error::Error>> {
-        let runtime = Runtime::new(IO::new(256)?);
+        let runtime = Runtime::new(256,0)?;
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:8001")?;
             listener.set_nonblocking(true)?;
