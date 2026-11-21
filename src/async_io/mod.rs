@@ -9,6 +9,7 @@ pub mod net;
 pub mod runtime;
 pub mod slice;
 pub mod select;
+pub mod mutex;
 
 pub trait AsyncAccept {
     fn async_accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>>;
